@@ -1524,6 +1524,7 @@ class ICTStrategy:
           5. Minimum R:R fallback
         """
         tp_candidates = []
+        risk = entry * 0.015  # Fallback risk
 
         # HTF likidite
         htf_liquidity = []
@@ -2372,9 +2373,9 @@ class ICTStrategy:
             if b_signal:
                 # B-tier'ı zorla WATCH yap (hiçbir zaman SIGNAL olmamalı)
                 b_signal["action"] = "WATCH"
+                parts = [s for s in ['DISP' if has_displacement else '', 'FVG' if has_fvg else '', 'MTF' if has_mtf else '', 'OB' if has_ob else ''] if s]
                 b_signal["watch_reason"] = (
-                    f"B-tier: Sweep yok — "
-                    f"{'|'.join(c for c in [has_displacement and 'DISP', has_fvg and 'FVG', has_mtf and 'MTF', has_ob and 'OB'] if c)}"
+                    f"B-tier: Sweep yok — {'|'.join(parts)}"
                     f" | Trade için sweep + displacement gerekli"
                 )
                 return b_signal
