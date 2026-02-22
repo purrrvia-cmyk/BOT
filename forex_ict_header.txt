@@ -1,0 +1,21 @@
+﻿# =====================================================
+# ICT Forex/Commodities  TAM UYUMLU ICT Analiz Motoru
+# =====================================================
+# Inner Circle Trader (ICT) metodolojisinin TUM temel
+# kavramlarini iceren profesyonel sinyal motoru.
+#
+# ICT Kavramlari (Tam Uygulama):
+#   1.  Market Structure  BOS / CHoCH / Internal vs External
+#   2.  Order Blocks (OB)  Mitigation tracking dahil
+#   3.  Breaker Blocks  Basarisiz OB ler
+#   4.  Fair Value Gaps (FVG)  CE (Consequent Encroachment)
+#   5.  Displacement  Buyuk momentum mumlari
+#   6.  Liquidity  BSL / SSL / Equal H-L / Inducement
+#   7.  Premium / Discount + Equilibrium
+#   8.  OTE  Optimal Trade Entry (Fib 0.618-0.786)
+#   9.  Kill Zones  Asian / London / NY / Silver Bullet
+#   10. Power of 3 (AMD)  Accumulation, Manipulation, Distribution
+#   11. Judas Swing  Sahte kirilim tespiti
+#   12. Daily Bias  HTF yon teyidi
+#   13. Session Profile  Asian range analizi
+# =====================================================
