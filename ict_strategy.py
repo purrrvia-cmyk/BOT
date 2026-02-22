@@ -635,7 +635,7 @@ class ICTStrategy:
 
         # ATR tabanlı dinamik displacement threshold
         atr = self._calc_atr(df, period=14)
-        atr_multiplier = 1.5  # Mum gövdesi en az 1.5 × ATR olmalı
+        atr_multiplier = self.params.get("displacement_atr_multiplier", 1.2)  # Config'den oku
 
         # Fallback: ATR hesaplanamadıysa sabit threshold kullan
         min_size_pct = self.params["displacement_min_size_pct"]
@@ -878,7 +878,7 @@ class ICTStrategy:
     #  BÖLÜM 12 — GATE 2: LIQUIDITY SWEEP (Likidite Avı)
     # =================================================================
 
-    def _find_sweep_event(self, df, bias, lookback=20):
+    def _find_sweep_event(self, df, bias, lookback=30):
         """
         ★ GATE 2 — Likidite Avı (Stop Hunt) Tespiti.
 
@@ -891,8 +891,8 @@ class ICTStrategy:
         SHORT bias → Fiyat eski bir Swing High'ın ÜSTÜNE fitil atar ve
                       ALTINDA kapanır (stop hunt → smart money satış)
 
-        lookback=20 (15m'de ~5 saat): Daha eski sweep'ler "soğumuş" olur,
-        kurumsal aktiviteyle zamansal ilişkisi zayıflar.
+        lookback=30 (15m'de ~7.5 saat): Sweep'ler biraz daha eskiyebilir,
+        20 mum (5 saat) çok kısıtlayıcıydı — geçerli sweep'ler kaçıyordu.
 
         Returns: {"swept_level": float, "sweep_candle_idx": int, ...}
                  veya None (sweep yok)
@@ -937,8 +937,8 @@ class ICTStrategy:
                             )
                             if is_major:
                                 sweep_quality = min(2.5, sweep_quality + 0.4)
-                            # Minimum kalite filtresi: düşük kalite sweep kabul edilmez
-                            if sweep_quality >= 1.0:
+                            # Minimum kalite filtresi: 0.7 (1.0 çok katıydı, geçerli sweep'ler kaçıyordu)
+                            if sweep_quality >= 0.7:
                                 return {
                                     "swept_level": sw_price,
                                     "sweep_candle_idx": i,
@@ -969,8 +969,8 @@ class ICTStrategy:
                             )
                             if is_major:
                                 sweep_quality = min(2.5, sweep_quality + 0.4)
-                            # Minimum kalite filtresi: düşük kalite sweep kabul edilmez
-                            if sweep_quality >= 1.0:
+                            # Minimum kalite filtresi: 0.7 (1.0 çok katıydı, geçerli sweep'ler kaçıyordu)
+                            if sweep_quality >= 0.7:
                                 return {
                                     "swept_level": sw_price,
                                     "sweep_candle_idx": i,
@@ -1272,6 +1272,7 @@ class ICTStrategy:
         min_body_ratio = self.params.get("displacement_min_body_ratio", 0.7)
         min_size_pct = self.params.get("displacement_min_size_pct", 0.005)
         atr = self._calc_atr(df, period=14)
+        atr_multiplier = self.params.get("displacement_atr_multiplier", 1.2)
         displacement = None
 
         for i in range(sweep_idx + 1, min(sweep_idx + max_lookahead + 1, n)):
@@ -1284,9 +1285,9 @@ class ICTStrategy:
 
             body_ratio = body / total_range
 
-            # ★ ATR-Normalized: gövde >= 1.5 × ATR VEYA sabit threshold
+            # ★ ATR-Normalized: gövde >= atr_multiplier × ATR VEYA sabit threshold
             is_disp = body_ratio >= min_body_ratio and (
-                (atr > 0 and body >= atr * 1.5) or
+                (atr > 0 and body >= atr * atr_multiplier) or
                 (body / mid_price >= min_size_pct)
             )
 
@@ -2053,7 +2054,7 @@ class ICTStrategy:
         """
         Güven skoru (0-100).
         Confluence score'ın gerçekçi düzeltmesi.
-        Bonus enflasyonu YOKTUR — skor gerçek kaliteyi yansıtır.
+        Cezalar hafifletildi — score zaten bileşen eksikliklerini yansıtıyor.
         """
         base = analysis["confluence_score"]
         components = analysis.get("components", [])
@@ -2065,20 +2066,20 @@ class ICTStrategy:
         if "UNICORN_SETUP" in components:
             bonus += 5   # OB+FVG geometrik çakışma
 
-        # Eksik kritik bileşen cezaları
+        # Eksik kritik bileşen cezaları (hafifletildi — score zaten yansıtıyor)
         penalty = 0
         if "DISPLACEMENT" not in components:
-            penalty += 10
+            penalty += 5   # (10→5: score zaten -8 veriyor)
         if "FVG" not in components:
-            penalty += 8
+            penalty += 4   # (8→4: FVG zamanlama meselesi)
         if "LIQUIDITY_SWEEP" not in components:
-            penalty += 10
+            penalty += 6   # (10→6: sweep en kritik)
         if "HTF_CONFIRMATION" not in components:
-            penalty += 8
+            penalty += 5   # (8→5: HTF yoksa zaten score düşük)
 
         # Premium/Discount uyumsuzluğu
         if "DISCOUNT_ZONE" not in components and "PREMIUM_ZONE" not in components:
-            penalty += 5
+            penalty += 3   # (5→3: zone soft signal)
 
         # ★ WEAKENING_TREND cezası — 15m momentum zayıflıyorsa güvenilmez
         penalties_list = analysis.get("penalties", [])
@@ -2543,9 +2544,10 @@ class ICTStrategy:
                            action="WATCH", watch_reason=""):
         """WATCH sinyalleri için ortak dict oluşturucu.
         
-        DİKKAT: Bu metod ICT gate'lerini GEÇMEMİŞ sinyaller içindir.
-        quality_tier = "POTENTIAL" → trade_manager'da ASLA trade açılmaz.
-        Sadece bilgilendirme amaçlı WATCH'a alınabilir.
+        Tier ataması bileşen kalitesine göre yapılır:
+        - LIQUIDITY_SWEEP + DISPLACEMENT varsa → A (sweep bulunmuş)
+        - HTF + 3+ destekleyiciler varsa → B (güçlü yapısal)
+        - Aksi halde → POTENTIAL
         """
         # Basit SL/TP tahmini (WATCH için yaklaşık — trade'e dönüşmeyecek)
         structure = analysis.get("structure", {})
@@ -2564,6 +2566,31 @@ class ICTStrategy:
         rr_ratio = reward / risk if risk > 0 else 1.0
 
         session = self.get_session_info()
+        
+        # ── Dinamik tier ataması: Bileşen kalitesine göre ──
+        components = analysis.get("components", [])
+        has_sweep = "LIQUIDITY_SWEEP" in components
+        has_displacement = "DISPLACEMENT" in components
+        has_htf = "HTF_CONFIRMATION" in components
+        has_mss = "SWEEP_MSS_A_PLUS" in components
+        has_structure = "MARKET_STRUCTURE" in components
+        has_ob = "ORDER_BLOCK" in components
+        has_fvg = "FVG" in components
+        has_mtf = "MTF_CONFIRMATION" in components
+        has_zone = "DISCOUNT_ZONE" in components or "PREMIUM_ZONE" in components
+        
+        if has_sweep and has_mss:
+            quality_tier = "A+"
+        elif has_sweep and has_displacement:
+            quality_tier = "A"
+        elif has_sweep and has_htf:
+            # Sweep + HTF = güçlü temel, displacement bekleniyor
+            support_count = sum([has_displacement, has_structure, has_ob, has_fvg, has_mtf, has_zone])
+            quality_tier = "B" if support_count >= 2 else "B"
+        elif has_htf and sum([has_displacement, has_structure, has_ob, has_fvg, has_mtf]) >= 2:
+            quality_tier = "B"
+        else:
+            quality_tier = "POTENTIAL"
 
         result = {
             "symbol": symbol,
@@ -2574,7 +2601,7 @@ class ICTStrategy:
             "current_price": round(current_price, 8),
             "confluence_score": analysis.get("confluence_score", 0),
             "confidence": confidence,
-            "components": analysis.get("components", []),
+            "components": components,
             "penalties": analysis.get("penalties", []),
             "session": session.get("label", ""),
             "rr_ratio": round(rr_ratio, 2),
@@ -2585,9 +2612,8 @@ class ICTStrategy:
             "action": action,
             "watch_reason": watch_reason,
             "analysis": analysis,
-            # ── KRİTİK: Gate'leri geçmemiş → POTENTIAL tier
-            # trade_manager bu tier ile ASLA trade açmaz
-            "quality_tier": "POTENTIAL",
+            # ── Dinamik tier: bileşen kalitesine göre (artık sabit POTENTIAL değil)
+            "quality_tier": quality_tier,
             "htf_bias": analysis.get("htf_bias", "?"),
         }
 

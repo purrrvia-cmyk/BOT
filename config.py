@@ -52,7 +52,7 @@ ICT_PARAMS = {
     
     # Sinyal Üretimi
     "min_confluence_score": 55,     # Minimum confluent skor (0-100) — 50→55: daha seçici
-    "min_confidence": 62,           # Minimum güven skoru (0-100) — 55→62: kayıp filtreleme
+    "min_confidence": 55,           # Minimum güven skoru (0-100) — 62→55: daha fazla sinyal alınması
     
     # Risk Yönetimi
     "default_sl_pct": 0.015,       # Varsayılan stop loss (%1.5)
@@ -67,8 +67,9 @@ ICT_PARAMS = {
     "patience_confirm_threshold": 0.6,  # Onay eşiği
     
     # Displacement
-    "displacement_min_body_ratio": 0.6,  # Displacement mumu min gövde oranı (0.7→0.6: daha fazla displacement tespit edilir)
-    "displacement_min_size_pct": 0.003,  # Min displacement boyutu (%0.3) (0.5→0.3: daha hassas)
+    "displacement_min_body_ratio": 0.5,  # Displacement mumu min gövde oranı (0.6→0.5: daha fazla displacement yakalanır)
+    "displacement_min_size_pct": 0.002,  # Min displacement boyutu (%0.2) (0.3→0.2: daha hassas)
+    "displacement_atr_multiplier": 1.2,  # ATR çarpanı (1.5→1.2: daha fazla displacement yakalanır)
 }
 
 # Limit Emir Ayarları
@@ -90,14 +91,15 @@ OPTIMIZER_CONFIG = {
 OPTIMIZER_PARAM_BOUNDS = {
     "swing_lookback": (3, 7),
     "fvg_min_size_pct": (0.0005, 0.003),
-    "displacement_min_body_ratio": (0.45, 0.75),
+    "displacement_min_body_ratio": (0.4, 0.65),
     "liquidity_equal_tolerance": (0.0005, 0.002),
     "ob_body_ratio_min": (0.3, 0.6),
-    "min_confidence": (40, 80),
-    "min_confluence_score": (35, 75),
+    "min_confidence": (55, 72),
+    "min_confluence_score": (45, 65),
     "default_sl_pct": (0.008, 0.025),
     "default_tp_ratio": (1.5, 3.0),
-    "displacement_min_size_pct": (0.002, 0.006),
+    "displacement_min_size_pct": (0.001, 0.004),
+    "displacement_atr_multiplier": (1.0, 1.8),
     "ob_max_age_candles": (15, 40),
 }
 

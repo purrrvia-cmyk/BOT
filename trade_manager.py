@@ -864,24 +864,51 @@ class TradeManager:
                     
                     if signal_result and signal_result.get("action") in ("SIGNAL", "WATCH"):
                         quality_tier = signal_result.get("quality_tier", "?")
-                        
-                        # ══ TİER KAPISI: Sadece A+ ve A tier trade açabilir ══
-                        # B-tier (sweep yok) ve ? (gate'ler geçmemiş) reddedilir
-                        if quality_tier not in ("A+", "A"):
-                            logger.info(
-                                f"⏭️ {symbol} Tier-{quality_tier} → trade açılmadı. "
-                                f"5m onay geçti ama ICT kalitesi yetersiz "
-                                f"(sadece A+ ve A tier trade açar)."
-                            )
-                            expire_watchlist_item(
-                                item["id"],
-                                reason=f"Tier-{quality_tier} — ICT gate'leri geçmemiş, trade açılmadı"
-                            )
-                            continue
-                        
-                        # ══ SKOR KAPISI: Promosyonda da minimum skor kontrolü ══
                         promo_score = signal_result.get("confluence_score", 0)
                         promo_conf = signal_result.get("confidence", 0)
+                        
+                        # ══ KALİTE KAPISI: Tier + Skor birleşik değerlendirme ══
+                        # A+/A tier → direkt geçer (tüm 4 gate geçmiş)
+                        # B tier → skor yeterliyse 5m onay ile geçer (sweep+HTF var)
+                        # POTENTIAL → daha yüksek eşik gerekli
+                        # NOT: 5m onay zaten sinyal kalitesini doğruluyor.
+                        if quality_tier not in ("A+", "A"):
+                            if quality_tier == "B":
+                                # B-tier: sweep+HTF var, skor kontrolü yeterli
+                                # 5m onay + sweep = güçlü doğrulama
+                                if promo_score >= min_confluence * 0.85:
+                                    logger.info(
+                                        f"✅ {symbol} Tier-B → 5m onaylı, "
+                                        f"skor yeterli (score={promo_score}) → trade'e devam"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"⏭️ {symbol} Tier-B → skor yetersiz ({promo_score})"
+                                    )
+                                    expire_watchlist_item(
+                                        item["id"],
+                                        reason=f"Tier-B — skor yetersiz ({promo_score})"
+                                    )
+                                    continue
+                            else:
+                                # POTENTIAL tier: hem skor hem güven gerekli
+                                if promo_score >= min_confluence and promo_conf >= min_confidence * 0.85:
+                                    logger.info(
+                                        f"✅ {symbol} Tier-{quality_tier} → 5m onaylı, "
+                                        f"skor+güven yeterli ({promo_score}/{promo_conf}) → trade'e devam"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"⏭️ {symbol} Tier-{quality_tier} → skor/güven yetersiz "
+                                        f"({promo_score}/{promo_conf})"
+                                    )
+                                    expire_watchlist_item(
+                                        item["id"],
+                                        reason=f"Tier-{quality_tier} — skor/güven yetersiz ({promo_score}/{promo_conf})"
+                                    )
+                                    continue
+                        
+                        # ══ SKOR KAPISI: Promosyonda da minimum skor kontrolü ══
                         promo_min_score = min_confluence * 0.5  # En az %50'si
                         if promo_score < promo_min_score:
                             logger.info(
