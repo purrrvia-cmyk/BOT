@@ -173,6 +173,17 @@ class TradeManager:
                 logger.info(f"⏭️ {signal['symbol']} için zaten aktif/bekleyen işlem var, atlanıyor.")
                 return {"status": "REJECTED", "reason": "Aktif/bekleyen işlem mevcut"}
 
+        # Aynı yönde max işlem kontrolü (4/4 LONG kaybetme riski azaltma)
+        max_same_dir = int(self._param("max_same_direction_trades") or 2)
+        direction = signal.get("direction", "LONG")
+        same_dir_count = sum(
+            1 for s in active_signals
+            if s.get("direction") == direction and s["status"] in ("ACTIVE", "WAITING")
+        )
+        if same_dir_count >= max_same_dir:
+            logger.warning(f"⛔ Aynı yönde ({direction}) max {max_same_dir} işlem limiti → reddedildi")
+            return {"status": "REJECTED", "reason": f"Max {direction} işlem limiti ({max_same_dir})"}
+
         # Cooldown kontrolü: Sadece KAPANMIŞ işlemler (WON/LOST/CANCELLED) için
         # Watchlist expire ve bekleyen sinyaller cooldown'a dahil DEĞİL
         recent_history = get_signal_history(30)
@@ -616,7 +627,16 @@ class TradeManager:
 
     def _manage_long_sl(self, signal_id, symbol, entry_price, current_price,
                          stop_loss, take_profit, state, effective_sl):
-        """LONG pozisyon için Breakeven ve Trailing SL yönetimi."""
+        """LONG pozisyon için Progresif Breakeven ve Trailing SL yönetimi.
+        
+        3 seviyeli koruma:
+          %25 → Erken koruma: SL'yi entry'nin hemen altına taşı (zarar azaltma)
+          %40 → Breakeven: SL'yi entry+buffer'a taşı (kayıpsız garanti)
+          %60 → Trailing: SL'yi kârın %50'sinde tut (kâr kilit)
+        
+        TRUTH trade analizi: %74 TP'ye ulaştı ama breakeven yoktu.
+        Erken koruma (%25) bu tür durumları önler.
+        """
         total_distance = take_profit - entry_price
         current_progress = current_price - entry_price
 
@@ -630,14 +650,23 @@ class TradeManager:
                     state["trailing_sl"] = trailing
                     effective_sl = max(effective_sl, trailing)
                     if not state.get("trailing_logged"):
-                        logger.info(f"📈 #{signal_id} {symbol} TRAILING SL: {trailing:.6f}")
+                        logger.info(f"📈 #{signal_id} {symbol} TRAILING SL: {trailing:.6f} (progress: {progress_pct:.0%})")
                         state["trailing_logged"] = True
 
             # %40 → Breakeven (SL'yi entry+buffer'a taşı)
             elif progress_pct >= 0.40 and not state["breakeven_moved"]:
                 state["breakeven_moved"] = True
                 effective_sl = entry_price * 1.001
-                logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f}")
+                logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
+
+            # %25 → Erken koruma (SL'yi entry'nin hemen altına taşı — zarar minimize)
+            elif progress_pct >= 0.25 and not state.get("early_protect"):
+                state["early_protect"] = True
+                # SL'yi entry'nin %0.2 altına taşı (neredeyse beraberlik)
+                early_sl = entry_price * 0.998
+                if early_sl > stop_loss:  # Sadece iyileştirme yapıyorsa
+                    effective_sl = early_sl
+                    logger.info(f"🛡️ #{signal_id} {symbol} ERKEN KORUMA: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
 
             if state["trailing_sl"]:
                 effective_sl = max(effective_sl, state["trailing_sl"])
@@ -646,7 +675,7 @@ class TradeManager:
 
     def _manage_short_sl(self, signal_id, symbol, entry_price, current_price,
                           stop_loss, take_profit, state, effective_sl):
-        """SHORT pozisyon için Breakeven ve Trailing SL yönetimi."""
+        """SHORT pozisyon için Progresif Breakeven ve Trailing SL yönetimi."""
         total_distance = entry_price - take_profit
         current_progress = entry_price - current_price
 
@@ -660,14 +689,22 @@ class TradeManager:
                     state["trailing_sl"] = trailing
                     effective_sl = min(effective_sl, trailing)
                     if not state.get("trailing_logged"):
-                        logger.info(f"📉 #{signal_id} {symbol} TRAILING SL: {trailing:.6f}")
+                        logger.info(f"📉 #{signal_id} {symbol} TRAILING SL: {trailing:.6f} (progress: {progress_pct:.0%})")
                         state["trailing_logged"] = True
 
             # %40 → Breakeven
             elif progress_pct >= 0.40 and not state["breakeven_moved"]:
                 state["breakeven_moved"] = True
                 effective_sl = entry_price * 0.999
-                logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f}")
+                logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
+
+            # %25 → Erken koruma
+            elif progress_pct >= 0.25 and not state.get("early_protect"):
+                state["early_protect"] = True
+                early_sl = entry_price * 1.002
+                if early_sl < stop_loss:  # Sadece iyileştirme yapıyorsa
+                    effective_sl = early_sl
+                    logger.info(f"🛡️ #{signal_id} {symbol} ERKEN KORUMA: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
 
             if state["trailing_sl"]:
                 effective_sl = min(effective_sl, state["trailing_sl"])

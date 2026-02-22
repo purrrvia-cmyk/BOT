@@ -57,9 +57,10 @@ ICT_PARAMS = {
     # Risk Yönetimi
     "default_sl_pct": 0.015,       # Varsayılan stop loss (%1.5)
     "default_tp_ratio": 2.0,       # TP/SL oranı (Risk-Reward)
-    "max_concurrent_trades": 5,    # Maksimum eşzamanlı işlem
+    "max_concurrent_trades": 3,    # Maksimum eşzamanlı işlem (5→3: risk azaltma)
+    "max_same_direction_trades": 2,  # Aynı yönde max işlem (tümü LONG/SHORT olmasın)
     "min_sl_distance_pct": 0.008,  # Minimum SL mesafesi (%0.8) - noise koruması
-    "signal_cooldown_minutes": 10, # Aynı coinde sinyal arası bekleme (dakika) — sadece kapanmış işlemler
+    "signal_cooldown_minutes": 15, # Aynı coinde sinyal arası bekleme (dakika) — 10→15
     
     # Sabırlı Mod
     "patience_watch_candles": 3,    # Sinyal öncesi izlenecek mum sayısı

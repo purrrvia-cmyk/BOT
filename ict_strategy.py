@@ -2261,7 +2261,14 @@ class ICTStrategy:
             price_at_fvg = entry_fvg["low"] * 0.998 <= current_price <= entry_fvg["high"] * 1.002
         else:
             price_at_fvg = entry_fvg["low"] * 0.998 <= current_price <= entry_fvg["high"] * 1.002
-        entry_mode = "MARKET" if price_at_fvg else "LIMIT"
+
+        # ★ MARKET order sadece A+ tier + MSS onaylı setup'larda
+        # ORDI/ETC/TRUTH kaybetme analizi: 3/4 MARKET order kayma ile kötü giriş yaptı
+        # LIMIT order her zaman FVG CE'sine kesin giriş sağlar
+        if price_at_fvg and confirmation["mss_confirmed"]:
+            entry_mode = "MARKET"  # A+ tier, MSS onaylı → MARKET kabul edilir
+        else:
+            entry_mode = "LIMIT"   # Diğer tüm durumlar → LIMIT (daha güvenli giriş)
 
         # Confluence ve confidence hesapla (HTF bias'ı override olarak gönder)
         analysis = self.calculate_confluence(df, multi_tf_data, override_direction=bias)
