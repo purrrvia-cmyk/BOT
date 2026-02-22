@@ -623,8 +623,8 @@ class TradeManager:
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %75 → Trailing SL (kârın %50'sini koru)
-            if progress_pct >= 0.75:
+            # %60 → Trailing SL (kârın %50'sini koru)
+            if progress_pct >= 0.60:
                 trailing = entry_price + (current_progress * 0.50)
                 if state["trailing_sl"] is None or trailing > state["trailing_sl"]:
                     state["trailing_sl"] = trailing
@@ -633,8 +633,8 @@ class TradeManager:
                         logger.info(f"📈 #{signal_id} {symbol} TRAILING SL: {trailing:.6f}")
                         state["trailing_logged"] = True
 
-            # %50 → Breakeven (SL'yi entry+buffer'a taşı)
-            elif progress_pct >= 0.50 and not state["breakeven_moved"]:
+            # %40 → Breakeven (SL'yi entry+buffer'a taşı)
+            elif progress_pct >= 0.40 and not state["breakeven_moved"]:
                 state["breakeven_moved"] = True
                 effective_sl = entry_price * 1.001
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f}")
@@ -653,8 +653,8 @@ class TradeManager:
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %75 → Trailing SL
-            if progress_pct >= 0.75:
+            # %60 → Trailing SL
+            if progress_pct >= 0.60:
                 trailing = entry_price - (current_progress * 0.50)
                 if state["trailing_sl"] is None or trailing < state["trailing_sl"]:
                     state["trailing_sl"] = trailing
@@ -663,8 +663,8 @@ class TradeManager:
                         logger.info(f"📉 #{signal_id} {symbol} TRAILING SL: {trailing:.6f}")
                         state["trailing_logged"] = True
 
-            # %50 → Breakeven
-            elif progress_pct >= 0.50 and not state["breakeven_moved"]:
+            # %40 → Breakeven
+            elif progress_pct >= 0.40 and not state["breakeven_moved"]:
                 state["breakeven_moved"] = True
                 effective_sl = entry_price * 0.999
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f}")
@@ -725,14 +725,17 @@ class TradeManager:
             potential_sl = item.get("potential_sl", 0)
             current_5m_price = last_candle["close"]
             
-            # ── 1) Yön kontrolü: 5m yapısal trend (NEUTRAL artık geçmez) ──
+            # ── 1) Yön kontrolü: 5m yapısal trend ──
+            # 5m'de tam yapısal trend nadiren oluşur, bu yüzden:
+            #   - Doğru yön veya NEUTRAL → geçer
+            #   - Sadece net ters trend → fail
             structure_5m = strategy_engine.detect_market_structure(watch_df)
             trend_5m = structure_5m.get("trend", "NEUTRAL")
             
             if expected_direction == "LONG":
-                direction_ok = trend_5m in ["BULLISH", "WEAKENING_BEAR"]
+                direction_ok = trend_5m not in ["BEARISH"]  # BULLISH, WEAKENING_BEAR, WEAKENING_BULL, NEUTRAL hepsi OK
             else:
-                direction_ok = trend_5m in ["BEARISH", "WEAKENING_BULL"]
+                direction_ok = trend_5m not in ["BULLISH"]  # BEARISH, WEAKENING_BULL, WEAKENING_BEAR, NEUTRAL hepsi OK
             
             # ── 2) Ranging kontrolü ──
             market_ok = not strategy_engine.detect_ranging_market(watch_df)
@@ -752,12 +755,12 @@ class TradeManager:
             else:
                 price_ok = last_candle["close"] < last_candle["open"]  # Kesin kırmızı
             
-            # ── 4) Hacim doğrulaması: zayıf hacimli mumları reddet ──
+            # ── 4) Hacim doğrulaması: çok zayıf hacimli mumları reddet ──
             vol_series = watch_df.tail(20)["volume"]
             avg_vol = vol_series.mean() if len(vol_series) > 0 else 0
             current_vol = last_candle.get("volume", 0)
-            # Hacim, ortalamanın en az %80'i olmalı
-            volume_ok = current_vol >= avg_vol * 0.8 if avg_vol > 0 else True
+            # Hacim, ortalamanın en az %40'ı olmalı (5m mumlar genelde düşük hacimli)
+            volume_ok = current_vol >= avg_vol * 0.4 if avg_vol > 0 else True
             
             # ── 5) Entry bölgesi mesafe kontrolü ──
             # Fiyat, potansiyel entry'den max %2 uzakta olmalı
@@ -787,17 +790,15 @@ class TradeManager:
             
             # ── Onay kararı ──
             # Zorunlu: level_ok (SL ihlali → zaten erken expire)
-            # Zorunlu: body_ok (doji geçmesin)
             # Zorunlu: entry_near_ok (fiyat entry'den çok uzaklaşmışsa onaylama)
-            # Esnek: direction_ok VEYA (price_ok VE volume_ok)
-            #   → Trend uyumluysa direkt onay
-            #   → Trend NEUTRAL ama güçlü mum + yüksek hacim varsa yine onay
+            # Esnek: direction_ok (5m'de sadece ters trend fail)
+            # Esnek: price_ok VEYA body_ok (mum yönü doğru VEYA gövde yeterli)
+            # Esnek: volume_ok esnek (%40) — 5m mumlar genelde düşük hacimli
             candle_confirmed = all([
                 level_ok,
-                body_ok,
                 entry_near_ok,
-                market_ok or price_ok,
-                direction_ok or (price_ok and volume_ok),
+                direction_ok,
+                price_ok or body_ok,
             ])
             if candle_confirmed:
                 confirmation_count += 1

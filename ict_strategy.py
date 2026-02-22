@@ -867,10 +867,10 @@ class ICTStrategy:
                 logger.debug(f"  ⚠️ 4H Bearish ama Extreme Discount ({htf_pd['premium_level']:.0f}%)")
             return {**result_base, "bias": "SHORT", "htf_trend": "BEARISH", "weak": False}
 
-        elif structure["trend"] == "WEAKENING_BEAR":
-            return {**result_base, "bias": "LONG", "htf_trend": "WEAKENING_BEAR", "weak": True}
-        elif structure["trend"] == "WEAKENING_BULL":
-            return {**result_base, "bias": "SHORT", "htf_trend": "WEAKENING_BULL", "weak": True}
+        elif structure["trend"] in ("WEAKENING_BEAR", "WEAKENING_BULL"):
+            # WEAKENING trendler güvenilmez — net yapı kırılımı yok → İŞLEM YAPILMAZ
+            logger.debug(f"  ⚠️ 4H trend WEAKENING ({structure['trend']}) — net yön yok, atlanıyor")
+            return None
 
         return None  # NEUTRAL → NET YÖN YOK → İŞLEM YAPILMAZ
 
@@ -937,15 +937,17 @@ class ICTStrategy:
                             )
                             if is_major:
                                 sweep_quality = min(2.5, sweep_quality + 0.4)
-                            return {
-                                "swept_level": sw_price,
-                                "sweep_candle_idx": i,
-                                "sweep_wick": candle["low"],
-                                "sweep_type": "SSL_SWEEP",
-                                "swing_index": sw_idx,
-                                "sweep_quality": sweep_quality,
-                                "major_level": is_major,
-                            }
+                            # Minimum kalite filtresi: düşük kalite sweep kabul edilmez
+                            if sweep_quality >= 1.0:
+                                return {
+                                    "swept_level": sw_price,
+                                    "sweep_candle_idx": i,
+                                    "sweep_wick": candle["low"],
+                                    "sweep_type": "SSL_SWEEP",
+                                    "swing_index": sw_idx,
+                                    "sweep_quality": sweep_quality,
+                                    "major_level": is_major,
+                                }
 
         elif bias == "SHORT":
             # SHORT → BSL (Buy-Side Liquidity) avı → eski swing high üstüne fitil
@@ -967,15 +969,17 @@ class ICTStrategy:
                             )
                             if is_major:
                                 sweep_quality = min(2.5, sweep_quality + 0.4)
-                            return {
-                                "swept_level": sw_price,
-                                "sweep_candle_idx": i,
-                                "sweep_wick": candle["high"],
-                                "sweep_type": "BSL_SWEEP",
-                                "swing_index": sw_idx,
-                                "sweep_quality": sweep_quality,
-                                "major_level": is_major,
-                            }
+                            # Minimum kalite filtresi: düşük kalite sweep kabul edilmez
+                            if sweep_quality >= 1.0:
+                                return {
+                                    "swept_level": sw_price,
+                                    "sweep_candle_idx": i,
+                                    "sweep_wick": candle["high"],
+                                    "sweep_type": "BSL_SWEEP",
+                                    "swing_index": sw_idx,
+                                    "sweep_quality": sweep_quality,
+                                    "major_level": is_major,
+                                }
 
         return None
 
@@ -1590,8 +1594,8 @@ class ICTStrategy:
             else:
                 return entry - (risk * min_rr)
 
-        # Minimum 2.0 R:R sağlayan hedefleri filtrele + HTF öncelikli seçim
-        min_reward = risk * 2.0
+        # Minimum 1.5 R:R sağlayan hedefleri filtrele + HTF öncelikli seçim
+        min_reward = risk * 1.5
 
         if bias == "LONG":
             valid = [(n, p) for n, p in tp_candidates if (p - entry) >= min_reward]
@@ -2020,24 +2024,17 @@ class ICTStrategy:
             score += 3
             components.append("TRIPLE_TF_ALIGNMENT")
 
-        # === NON-LINEAR CONFLUENCE ÇARPANI ===
-        # Çekirdek gate'ler (Sweep + MSS) birlikte varsa → toplam skoru güçlendir
-        # Bu sayede sekonder bileşenler tek başına yüksek skor üretemez
-        if "LIQUIDITY_SWEEP" in components and "SWEEP_MSS_A_PLUS" in components:
-            score = round(score * 1.20)
-            components.append("CORE_GATE_MULTIPLIER")
-        elif "HTF_CONFIRMATION" in components and "LIQUIDITY_SWEEP" in components and "DISPLACEMENT" in components:
-            score = round(score * 1.15)
-            components.append("HTF_SWEEP_DISP_MULTIPLIER")
+        # === TRIPLE TF ALIGNMENT (bonus zaten yukarıda eklendi) ===
+        # NOT: Non-linear çarpanlar (CORE_GATE_MULTIPLIER vb.) KALDIRILDI.
+        # Skor enflasyonuna neden olup confidence'u anlamsız kılıyordu.
+        # Tüm gate'ler eşit ağırlıkta değerlendirilir.
 
         # Normalize (0-100)
-        # Teorik max (multiplier öncesi): HTF(25) + Sweep(35 cap) + Disp(15)
+        # Teorik max: HTF(25) + Sweep(35 cap) + Disp(15)
         #   + FVG(15) + Structure(10) + MTF(10) + MTF_OB(5) + MTF_FVG(3)
         #   + PD(7) + OTE(3) + Session(8) + OB(5) + Breaker(5) + MSS(10)
         #   + Triple_TF(3) + VolDisp(5) + Unicorn(8) + HTF_PD_Zone(5) = 177
-        # Non-linear multiplier(×1.2) = 177 * 1.2 = ~212
-        # Ranging cezası ve diğer penaltiler max'ı düşürmez (min 0 koruması var)
-        max_possible = 212
+        max_possible = 177
         score = max(0, score)
         confluence_score = min(100, round((score / max_possible) * 100, 1))
 
@@ -2054,59 +2051,33 @@ class ICTStrategy:
     def _calculate_confidence(self, analysis):
         """
         Güven skoru (0-100).
-        Confluence score + gate kalitesi + ceza sistemi.
+        Confluence score'ın gerçekçi düzeltmesi.
+        Bonus enflasyonu YOKTUR — skor gerçek kaliteyi yansıtır.
         """
         base = analysis["confluence_score"]
-        bonus = 0
-        penalty = 0
         components = analysis.get("components", [])
 
-        # Çoklu bileşen bonusu
-        comp_count = len(components)
-        if comp_count >= 6:
-            bonus += 12
-        elif comp_count >= 4:
-            bonus += 8
-        elif comp_count >= 3:
-            bonus += 4
-
-        # Gate bazlı bonuslar
-        if "HTF_CONFIRMATION" in components:
-            bonus += 5
-        if "LIQUIDITY_SWEEP" in components:
-            bonus += 5
-        if "DISPLACEMENT" in components:
-            bonus += 5
-        if "FVG" in components:
-            bonus += 3
+        # Küçük kalite bonusu (max +10)
+        bonus = 0
         if "SWEEP_MSS_A_PLUS" in components:
-            bonus += 10  # A+ setup → en güçlü sinyal
-        if "KILLZONE_ACTIVE" in components:
-            bonus += 3
-        if "BREAKER_BLOCK" in components:
-            bonus += 3
-        if "TRIPLE_TF_ALIGNMENT" in components:
-            bonus += 5
+            bonus += 5   # A+ setup (sweep + MSS)
         if "UNICORN_SETUP" in components:
-            bonus += 8  # OB+FVG çakışma → çok yüksek güven
+            bonus += 5   # OB+FVG geometrik çakışma
 
-        # Cezalar
-        # NOT: Confluence'da zaten uygulanan cezalar burada tekrarlanmaz
-        # (double-count engeli). Sadece confluence'da olmayan cezalar eklenir.
-        # Confluence'da zaten olan: NO_DISPLACEMENT(-8), RANGING(-15),
-        #   HTF_BIAS_BLOCK(-15), WEAKENING_TREND(-7)
-        if "ORDER_BLOCK" not in components and "FVG" not in components:
+        # Eksik kritik bileşen cezaları
+        penalty = 0
+        if "DISPLACEMENT" not in components:
+            penalty += 10
+        if "FVG" not in components:
             penalty += 8
-        if "DISCOUNT_ZONE" not in components and "PREMIUM_ZONE" not in components and "OTE" not in components:
-            penalty += 5
+        if "LIQUIDITY_SWEEP" not in components:
+            penalty += 10
+        if "HTF_CONFIRMATION" not in components:
+            penalty += 8
 
-        # HTF weak flag: WEAKENING variantlarda hafif ceza
-        htf_result = analysis.get("htf_result")
-        if htf_result and htf_result.get("weak"):
+        # Premium/Discount uyumsuzluğu
+        if "DISCOUNT_ZONE" not in components and "PREMIUM_ZONE" not in components:
             penalty += 5
-
-        # Session cezası zaten confluence'da uygulandığı için
-        # confidence'da tekrar uygulanmaz (double-count engeli).
 
         confidence = max(0, min(100, base + bonus - penalty))
         return round(confidence, 1)
@@ -2271,17 +2242,17 @@ class ICTStrategy:
             return None
 
         rr_ratio = reward / risk
-        if rr_ratio < 2.0:
+        if rr_ratio < 1.5:
             return None
 
         # SL mesafesi kontrolleri
         sl_distance_pct = risk / entry
         atr_val = self._calc_atr(df, 14)
-        min_sl_by_atr = atr_val / entry if atr_val > 0 and entry > 0 else 0.003
-        effective_min_sl = max(0.003, min_sl_by_atr)
+        min_sl_by_atr = atr_val / entry if atr_val > 0 and entry > 0 else 0.008
+        effective_min_sl = max(0.008, min_sl_by_atr)
         if sl_distance_pct < effective_min_sl:
             return None  # SL ATR floor altında → volatilitede vurulur
-        if sl_distance_pct > 0.06:
+        if sl_distance_pct > 0.05:
             return None  # SL çok uzak → risk çok yüksek
 
         # Entry modu: Fiyat FVG bölgesinde mi?
@@ -2471,11 +2442,11 @@ class ICTStrategy:
             return None
 
         rr_ratio = reward / risk
-        if rr_ratio < 2.0:
+        if rr_ratio < 1.5:
             return None
 
         sl_distance_pct = risk / entry
-        if sl_distance_pct < 0.003 or sl_distance_pct > 0.06:
+        if sl_distance_pct < 0.008 or sl_distance_pct > 0.05:
             return None
 
         # Entry modu

@@ -60,6 +60,13 @@ bot_state = {
     "errors": []
 }
 
+# ── Başlangıçta optimizer parametrelerini sınırlar içine zorla ──
+try:
+    self_optimizer.enforce_bounds_on_startup()
+    logger.info("✅ Optimizer parametreleri sınırlar içine alındı (startup reset)")
+except Exception as e:
+    logger.warning(f"⚠️ Optimizer startup reset hatası: {e}")
+
 scan_lock = threading.Lock()
 
 

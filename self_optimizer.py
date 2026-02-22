@@ -27,7 +27,7 @@ from database import (
     get_confluence_profitability_analysis, get_entry_mode_performance,
     get_htf_bias_accuracy
 )
-from config import ICT_PARAMS, OPTIMIZER_CONFIG
+from config import ICT_PARAMS, OPTIMIZER_CONFIG, OPTIMIZER_PARAM_BOUNDS
 
 logger = logging.getLogger("ICT-Bot.Optimizer")
 
@@ -46,9 +46,51 @@ class SelfOptimizer:
     def __init__(self):
         self.learning_rate = OPTIMIZER_CONFIG["learning_rate"]
         self.max_change = OPTIMIZER_CONFIG["max_param_change_pct"]
-        self.min_trades = OPTIMIZER_CONFIG["min_trades_for_optimization"]
+        self.min_trades = max(OPTIMIZER_CONFIG["min_trades_for_optimization"], 10)  # Min 10 trade
         self.target_win_rate = OPTIMIZER_CONFIG["win_rate_target"]
         self.optimization_history = []
+
+    def _save_with_bounds(self, param_name, new_val, default_val):
+        """
+        Parametre kaydet (OPTIMIZER_PARAM_BOUNDS ile sınırlandır).
+        Death spiral koruması: Parametre asla tanımlı sınırların dışına çıkamaz.
+        """
+        bounds = OPTIMIZER_PARAM_BOUNDS.get(param_name)
+        if bounds:
+            min_b, max_b = bounds
+            old_val = new_val
+            new_val = max(min_b, min(max_b, new_val))
+            if new_val != old_val:
+                logger.info(f"🛡️ {param_name} bounds clamp: {old_val} → {new_val} (sınır: {min_b}-{max_b})")
+        save_bot_param(param_name, new_val, default_val)
+        return new_val
+
+    def enforce_bounds_on_startup(self):
+        """
+        Başlangıçta tüm DB parametrelerini kontrol et.
+        Sınır dışındaki değerleri varsayılanlara sıfırla.
+        Death spiral sonrası kurtarma mekanizması.
+        """
+        all_params = get_all_bot_params()
+        reset_count = 0
+        for param_name, current_val in all_params.items():
+            bounds = OPTIMIZER_PARAM_BOUNDS.get(param_name)
+            if bounds is None:
+                continue
+            min_b, max_b = bounds
+            if current_val < min_b or current_val > max_b:
+                default = ICT_PARAMS.get(param_name, current_val)
+                logger.warning(
+                    f"🔄 {param_name} sınır dışı: {current_val} → {default} "
+                    f"(izin: {min_b}-{max_b})"
+                )
+                save_bot_param(param_name, default, default)
+                reset_count += 1
+        if reset_count:
+            logger.info(f"🔄 {reset_count} parametre sınır dışında bulundu ve sıfırlandı")
+        else:
+            logger.info("✅ Tüm optimizer parametreleri sınırlar içinde")
+        return reset_count
 
     def run_optimization(self):
         """
@@ -154,7 +196,7 @@ class SelfOptimizer:
             return None
 
         # Uygula ve logla
-        save_bot_param("min_confidence", new_threshold, ICT_PARAMS["min_confidence"])
+        self._save_with_bounds("min_confidence", new_threshold, ICT_PARAMS["min_confidence"])
         add_optimization_log(
             "min_confidence", current_threshold, new_threshold, reason,
             stats["win_rate"], stats["win_rate"], stats["total_trades"]
@@ -258,7 +300,8 @@ class SelfOptimizer:
             if abs(new_val - current_val) < current_val * 0.01:
                 continue
 
-            save_bot_param(param_name, new_val, ICT_PARAMS[param_name])
+            # Bounds kontrolü (death spiral koruması)
+            new_val = self._save_with_bounds(param_name, new_val, ICT_PARAMS[param_name])
             add_optimization_log(
                 param_name, current_val, new_val, reason,
                 stats["win_rate"], stats["win_rate"], stats["total_trades"]
@@ -321,6 +364,11 @@ class SelfOptimizer:
             return changes
 
         save_bot_param("min_confluence_score", new_val, ICT_PARAMS["min_confluence_score"])
+        # Bounds kontrolü
+        bounds = OPTIMIZER_PARAM_BOUNDS.get("min_confluence_score")
+        if bounds:
+            new_val = max(bounds[0], min(bounds[1], new_val))
+            save_bot_param("min_confluence_score", new_val, ICT_PARAMS["min_confluence_score"])
         add_optimization_log(
             "min_confluence_score", current_min, new_val, reason,
             stats["win_rate"], stats["win_rate"], stats["total_trades"]
@@ -375,7 +423,7 @@ class SelfOptimizer:
             new_sl = round(new_sl, 4)
 
             if abs(new_sl - current_sl) > 0.0005:
-                save_bot_param("default_sl_pct", new_sl, ICT_PARAMS["default_sl_pct"])
+                new_sl = self._save_with_bounds("default_sl_pct", new_sl, ICT_PARAMS["default_sl_pct"])
                 reason = f"Kayıp oranı yüksek ({loss_rate:.0%}), SL genişletiliyor"
                 add_optimization_log(
                     "default_sl_pct", current_sl, new_sl, reason,
@@ -391,11 +439,11 @@ class SelfOptimizer:
         # RR oranı ayarlama
         if avg_win > 0 and avg_loss > 0:
             actual_rr = avg_win / avg_loss
-            if actual_rr < 1.5 and current_tp_ratio < 3.5:
-                new_tp_ratio = min(current_tp_ratio + 0.2, 4.0)
+            if actual_rr < 1.5 and current_tp_ratio < 3.0:
+                new_tp_ratio = min(current_tp_ratio + 0.2, 3.0)
                 new_tp_ratio = round(new_tp_ratio, 1)
 
-                save_bot_param("default_tp_ratio", new_tp_ratio, ICT_PARAMS["default_tp_ratio"])
+                new_tp_ratio = self._save_with_bounds("default_tp_ratio", new_tp_ratio, ICT_PARAMS["default_tp_ratio"])
                 reason = f"Gerçek RR düşük ({actual_rr:.1f}), TP oranı artırılıyor"
                 add_optimization_log(
                     "default_tp_ratio", current_tp_ratio, new_tp_ratio, reason,
@@ -550,10 +598,10 @@ class SelfOptimizer:
             if low_conf_ratio > 0.4:
                 current = get_bot_param("min_confidence", ICT_PARAMS["min_confidence"])
                 # Küçük adımlarla artır (agresif değil, ideal)
-                new_val = min(85, current + self.learning_rate * 15)
+                new_val = min(80, current + self.learning_rate * 15)
                 new_val = round(new_val, 1)
                 if new_val - current >= 1.0:
-                    save_bot_param("min_confidence", new_val, ICT_PARAMS["min_confidence"])
+                    new_val = self._save_with_bounds("min_confidence", new_val, ICT_PARAMS["min_confidence"])
                     reason = (f"Kayıpların %{low_conf_ratio*100:.0f}'i düşük güvenli — "
                              f"eşik {current} → {new_val}")
                     add_optimization_log("min_confidence", current, new_val, reason,
@@ -577,9 +625,9 @@ class SelfOptimizer:
                                        ICT_PARAMS["displacement_min_body_ratio"])
                 # Displacement parametresini sıkılaştırmak yerine, confluence eşiğini hafif artır
                 current_conf = get_bot_param("min_confluence_score", ICT_PARAMS["min_confluence_score"])
-                new_conf = min(80, current_conf + 1.0)
+                new_conf = min(75, current_conf + 1.0)
                 if new_conf > current_conf:
-                    save_bot_param("min_confluence_score", new_conf, ICT_PARAMS["min_confluence_score"])
+                    new_conf = self._save_with_bounds("min_confluence_score", new_conf, ICT_PARAMS["min_confluence_score"])
                     reason = (f"Kayıpların %{disp_missing/total_losses*100:.0f}'inde DISPLACEMENT eksik — "
                              f"confluence {current_conf} → {new_conf}")
                     add_optimization_log("min_confluence_score", current_conf, new_conf, reason,
@@ -612,7 +660,7 @@ class SelfOptimizer:
             new_sl = max(0.008, current_sl * 0.92)
             new_sl = round(new_sl, 4)
             if abs(new_sl - current_sl) > 0.001:
-                save_bot_param("default_sl_pct", new_sl, ICT_PARAMS["default_sl_pct"])
+                new_sl = self._save_with_bounds("default_sl_pct", new_sl, ICT_PARAMS["default_sl_pct"])
                 reason = (f"Ortalama kayıp %{loss_info['avg_loss_pct']:.1f} çok yüksek — "
                          f"SL {current_sl} → {new_sl}")
                 add_optimization_log("default_sl_pct", current_sl, new_sl, reason,
