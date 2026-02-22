@@ -46,7 +46,7 @@ class SelfOptimizer:
     def __init__(self):
         self.learning_rate = OPTIMIZER_CONFIG["learning_rate"]
         self.max_change = OPTIMIZER_CONFIG["max_param_change_pct"]
-        self.min_trades = max(OPTIMIZER_CONFIG["min_trades_for_optimization"], 10)  # Min 10 trade
+        self.min_trades = OPTIMIZER_CONFIG["min_trades_for_optimization"]  # Config'den al (varsayılan: 5)
         self.target_win_rate = OPTIMIZER_CONFIG["win_rate_target"]
         self.optimization_history = []
 
@@ -122,6 +122,14 @@ class SelfOptimizer:
             }
 
         changes = []
+
+        # ★ ACİL MOD: Win rate %0 ve 3+ kayıp → agresif düzeltme
+        current_wr = stats["win_rate"] / 100
+        if current_wr == 0.0 and stats["losing_trades"] >= 3:
+            emergency_changes = self._emergency_mode(stats)
+            changes.extend(emergency_changes)
+            if emergency_changes:
+                logger.warning(f"🚨 ACİL MOD: %0 win rate, {stats['losing_trades']} kayıp → {len(emergency_changes)} acil düzeltme")
 
         # 1. Win Rate bazlı güven eşiği ayarlama
         wr_change = self._optimize_confidence_threshold(stats)
@@ -674,6 +682,58 @@ class SelfOptimizer:
         # Ders özetini logla
         for lesson in loss_info.get("lesson_summary", []):
             logger.info(f"📝 Optimizer Ders: {lesson}")
+
+        return changes
+
+
+    def _emergency_mode(self, stats):
+        """
+        🚨 ACİL MOD — %0 win rate ile ardışık kayıplarda tetiklenir.
+        Normal öğrenme hızının 3x'i ile agresif düzeltme yapar:
+        - min_confidence'ı %5 artır
+        - min_confluence_score'u %5 artır
+        - MARKET emirleri tamamen durdur (threshold yükselt)
+        Bu mod, bot kayıp döngüsünden çıkana kadar her döngüde çalışır.
+        """
+        changes = []
+        emergency_lr = self.learning_rate * 3  # 3x agresif
+
+        # 1. min_confidence'ı agresif artır
+        current_conf = get_bot_param("min_confidence", ICT_PARAMS["min_confidence"])
+        new_conf = min(78, current_conf + 5)
+        new_conf = self._save_with_bounds("min_confidence", new_conf, ICT_PARAMS["min_confidence"])
+        if new_conf > current_conf:
+            reason = f"🚨 ACİL: %0 WR, {stats['losing_trades']} kayıp → confidence {current_conf} → {new_conf}"
+            add_optimization_log("min_confidence", current_conf, new_conf, reason,
+                                stats["win_rate"], stats["win_rate"], stats["total_trades"])
+            changes.append({"param": "min_confidence", "old": current_conf,
+                           "new": new_conf, "reason": reason})
+            logger.warning(f"🚨 {reason}")
+
+        # 2. min_confluence_score'u agresif artır
+        current_score = get_bot_param("min_confluence_score", ICT_PARAMS["min_confluence_score"])
+        new_score = min(72, current_score + 5)
+        new_score = self._save_with_bounds("min_confluence_score", new_score, ICT_PARAMS["min_confluence_score"])
+        if new_score > current_score:
+            reason = f"🚨 ACİL: %0 WR → confluence {current_score} → {new_score}"
+            add_optimization_log("min_confluence_score", current_score, new_score, reason,
+                                stats["win_rate"], stats["win_rate"], stats["total_trades"])
+            changes.append({"param": "min_confluence_score", "old": current_score,
+                           "new": new_score, "reason": reason})
+            logger.warning(f"🚨 {reason}")
+
+        # 3. SL mesafesini artır (kayma koruması)
+        current_sl = get_bot_param("default_sl_pct", ICT_PARAMS["default_sl_pct"])
+        if current_sl < 0.02:
+            new_sl = min(0.02, current_sl * 1.15)
+            new_sl = round(new_sl, 4)
+            new_sl = self._save_with_bounds("default_sl_pct", new_sl, ICT_PARAMS["default_sl_pct"])
+            if new_sl > current_sl:
+                reason = f"🚨 ACİL: SL mesafesi artırılıyor {current_sl} → {new_sl}"
+                add_optimization_log("default_sl_pct", current_sl, new_sl, reason,
+                                    stats["win_rate"], stats["win_rate"], stats["total_trades"])
+                changes.append({"param": "default_sl_pct", "old": current_sl,
+                               "new": new_sl, "reason": reason})
 
         return changes
 

@@ -51,8 +51,8 @@ ICT_PARAMS = {
     "liquidity_min_touches": 2,          # Minimum dokunma sayısı
     
     # Sinyal Üretimi
-    "min_confluence_score": 50,     # Minimum confluent skor (0-100)
-    "min_confidence": 55,           # Minimum güven skoru (0-100)
+    "min_confluence_score": 55,     # Minimum confluent skor (0-100) — 50→55: daha seçici
+    "min_confidence": 62,           # Minimum güven skoru (0-100) — 55→62: kayıp filtreleme
     
     # Risk Yönetimi
     "default_sl_pct": 0.015,       # Varsayılan stop loss (%1.5)
@@ -80,7 +80,7 @@ MAX_TRADE_DURATION_HOURS = 8  # Aktif işlem max yaşam süresi (saat)
 # Optimizer Parametreleri
 OPTIMIZER_CONFIG = {
     "min_trades_for_optimization": 5,    # Optimizasyon için minimum işlem sayısı (10→5: daha hızlı öğrenme)
-    "optimization_interval_minutes": 30, # Optimizasyon aralığı (dakika)
+    "optimization_interval_minutes": 15, # Optimizasyon aralığı (dakika) — 30→15: daha hızlı öğrenme
     "learning_rate": 0.05,              # Öğrenme hızı
     "max_param_change_pct": 0.15,       # Tek seferde max parametre değişimi (%15)
     "win_rate_target": 0.60,            # Hedef kazanma oranı (%60)

@@ -1717,8 +1717,8 @@ class ICTStrategy:
             score += 10
             components.append("MARKET_STRUCTURE")
         elif structure["trend"] in ["WEAKENING_BULL", "WEAKENING_BEAR"]:
-            score += 3
-            penalties.append("WEAKENING_TREND(-7)")
+            score -= 5
+            penalties.append("WEAKENING_TREND(-15)")
 
         # === HTF BIAS (4H) ===
         htf_bias_block = False
@@ -2079,6 +2079,11 @@ class ICTStrategy:
         # Premium/Discount uyumsuzluğu
         if "DISCOUNT_ZONE" not in components and "PREMIUM_ZONE" not in components:
             penalty += 5
+
+        # ★ WEAKENING_TREND cezası — 15m momentum zayıflıyorsa güvenilmez
+        penalties_list = analysis.get("penalties", [])
+        if any("WEAKENING_TREND" in p for p in penalties_list):
+            penalty += 8
 
         confidence = max(0, min(100, base + bonus - penalty))
         return round(confidence, 1)
