@@ -1261,25 +1261,25 @@ class ForexICTEngine:
                     bear_score += 5
                     reasons_bear.append(f"Silver Bullet + FVG confluence")
 
-        # 12. AMD Pattern (10 puan)
+        # 12. AMD Pattern (15 puan — arttirildi)
         if amd:
             if amd["direction"] == "LONG":
-                bull_score += 10
+                bull_score += 15
                 confluence_count["bull"] += 1
                 reasons_bull.append(f"AMD Bullish pattern (Manipulation -> Distribution)")
             elif amd["direction"] == "SHORT":
-                bear_score += 10
+                bear_score += 15
                 confluence_count["bear"] += 1
                 reasons_bear.append(f"AMD Bearish pattern (Manipulation -> Distribution)")
 
-        # 13. Judas Swing (10 puan)
+        # 13. Judas Swing (15 puan — arttirildi)
         if judas:
             if judas["type"] == "BULLISH_JUDAS":
-                bull_score += 10
+                bull_score += 15
                 confluence_count["bull"] += 1
                 reasons_bull.append(f"Judas Swing: sahte dusus -> gercek yukselis")
             elif judas["type"] == "BEARISH_JUDAS":
-                bear_score += 10
+                bear_score += 15
                 confluence_count["bear"] += 1
                 reasons_bear.append(f"Judas Swing: sahte yukselis -> gercek dusus")
 
@@ -1321,24 +1321,64 @@ class ForexICTEngine:
             bear_score += 5
             reasons_bear.append(f"RSI asiri alim ({indicators['rsi']:.1f})")
 
+        # ══════════════════════════════════════════════════════
+        #  FILTRELER & CEZALAR (v2 — backtest optimizasyonu)
+        # ══════════════════════════════════════════════════════
+
+        # F1. Kill Zone disi ceza (-10 puan dominant tarafa)
+        #     Backtest: KZ disi sinyaller dusuk kaliteli
+        if not kill["is_kill_zone"]:
+            if bull_score > bear_score:
+                bull_score -= 10
+                reasons_bull.append("Kill Zone disinda — sinyal guvenilirligi dusuk")
+            elif bear_score > bull_score:
+                bear_score -= 10
+                reasons_bear.append("Kill Zone disinda — sinyal guvenilirligi dusuk")
+
+        # F2. Premium/Discount celiskisi cezasi
+        #     Backtest: Premium'da LONG, Discount'ta SHORT kaybettiriyor
+        if pd_zone["zone"] == "PREMIUM" and pd_zone["zone_pct"] > 75:
+            bull_score -= 15
+            reasons_bull.append(f"Premium bolgede ALIS riski yuksek (%{pd_zone['zone_pct']})")
+        elif pd_zone["zone"] == "DISCOUNT" and pd_zone["zone_pct"] > 75:
+            bear_score -= 15
+            reasons_bear.append(f"Discount bolgede SATIS riski yuksek (%{pd_zone['zone_pct']})")
+
+        # F3. Daily Bias celiskisi cezasi
+        #     Backtest: HTF trendine ters sinyaller basarisiz
+        if daily_bias["bias"] == "BEARISH" and bull_score > bear_score:
+            bull_score -= 10
+            reasons_bull.append("Gunluk trend dususte — ALIS riskli")
+        elif daily_bias["bias"] == "BULLISH" and bear_score > bull_score:
+            bear_score -= 10
+            reasons_bear.append("Gunluk trend yukseliste — SATIS riskli")
+
+        # F4. RSI asiri bolge celiskisi cezasi
+        if indicators["rsi"] > 75 and bull_score > bear_score:
+            bull_score -= 10
+            reasons_bull.append(f"RSI asiri alim ({indicators['rsi']:.0f}) — geri cekilme riski")
+        elif indicators["rsi"] < 25 and bear_score > bull_score:
+            bear_score -= 10
+            reasons_bear.append(f"RSI asiri satim ({indicators['rsi']:.0f}) — toparlanma riski")
+
         # ── SINYAL KARARI ──
         net_score = bull_score - bear_score
         max_conf = max(confluence_count["bull"], confluence_count["bear"])
 
-        # Confluence sayisi + skor birlikte degerlendirilir
-        if net_score >= 50 and confluence_count["bull"] >= 4:
+        # Confluence sayisi + skor birlikte degerlendirilir (v2 — esikler yukseltildi)
+        if net_score >= 55 and confluence_count["bull"] >= 5:
             signal = "STRONG_LONG"
             label = "GUCLU ALIS"
             desc = "ICT tam confluence: Market Structure + OB + FVG + Displacement uyumlu"
-        elif net_score >= 25 and confluence_count["bull"] >= 3:
+        elif net_score >= 30 and confluence_count["bull"] >= 3:
             signal = "LONG"
             label = "ALIS"
             desc = "ICT gostergeleri alis yonunu destekliyor"
-        elif net_score <= -50 and confluence_count["bear"] >= 4:
+        elif net_score <= -55 and confluence_count["bear"] >= 5:
             signal = "STRONG_SHORT"
             label = "GUCLU SATIS"
             desc = "ICT tam confluence: Market Structure + OB + FVG + Displacement uyumlu"
-        elif net_score <= -25 and confluence_count["bear"] >= 3:
+        elif net_score <= -30 and confluence_count["bear"] >= 3:
             signal = "SHORT"
             label = "SATIS"
             desc = "ICT gostergeleri satis yonunu destekliyor"
@@ -1375,43 +1415,43 @@ class ForexICTEngine:
                 ob_bottom = last_ob.get("bottom")
 
         if signal in ("STRONG_LONG", "LONG"):
-            # LONG SL: en yakın swing low veya OB alt sınırının altı
-            atr_sl = cur_price - atr * 1.5
-            swing_sl = recent_swing_low - atr * 0.2  # swing low'un biraz altı
+            # LONG SL: en yakın swing low veya OB alt sınırının altı (v2: daha sıkı SL)
+            atr_sl = cur_price - atr * 1.2   # 1.5 → 1.2 (sıkılaştırıldı)
+            swing_sl = recent_swing_low - atr * 0.15  # 0.2 → 0.15
             candidates = [atr_sl, swing_sl]
             if ob_bottom:
                 candidates.append(ob_bottom - atr * 0.1)
             sl = round(max(candidates), 5)  # en yakın (en yüksek) SL
             # SL çok yakınsa ATR bazlıyı kullan
-            if abs(cur_price - sl) < atr * 0.5:
+            if abs(cur_price - sl) < atr * 0.4:
                 sl = round(atr_sl, 5)
 
             risk = abs(cur_price - sl)
-            tp1 = round(cur_price + risk * 1.5, 5)   # R:R 1:1.5
-            tp2 = round(cur_price + risk * 2.5, 5)   # R:R 1:2.5
+            tp1 = round(cur_price + risk * 1.8, 5)   # 1.5 → 1.8 (optimize edildi)
+            tp2 = round(cur_price + risk * 3.0, 5)   # 2.5 → 3.0 (artırıldı)
             rr1 = round(abs(tp1 - cur_price) / risk, 2) if risk > 0 else 0
             rr2 = round(abs(tp2 - cur_price) / risk, 2) if risk > 0 else 0
             sl_tp = {"sl": sl, "tp1": tp1, "tp2": tp2, "direction": "LONG",
-                     "rr1": rr1, "rr2": rr2, "method": "swing+ATR"}
+                     "rr1": rr1, "rr2": rr2, "method": "swing+ATR v2"}
 
         elif signal in ("STRONG_SHORT", "SHORT"):
-            # SHORT SL: en yakın swing high veya OB üst sınırının üstü
-            atr_sl = cur_price + atr * 1.5
-            swing_sl = recent_swing_high + atr * 0.2  # swing high'un biraz üstü
+            # SHORT SL: en yakın swing high veya OB üst sınırının üstü (v2: daha sıkı SL)
+            atr_sl = cur_price + atr * 1.2   # 1.5 → 1.2 (sıkılaştırıldı)
+            swing_sl = recent_swing_high + atr * 0.15  # 0.2 → 0.15
             candidates = [atr_sl, swing_sl]
             if ob_top:
                 candidates.append(ob_top + atr * 0.1)
             sl = round(min(candidates), 5)  # en yakın (en düşük) SL
-            if abs(sl - cur_price) < atr * 0.5:
+            if abs(sl - cur_price) < atr * 0.4:
                 sl = round(atr_sl, 5)
 
             risk = abs(sl - cur_price)
-            tp1 = round(cur_price - risk * 1.5, 5)
-            tp2 = round(cur_price - risk * 2.5, 5)
+            tp1 = round(cur_price - risk * 1.8, 5)   # 1.5 → 1.8 (optimize edildi)
+            tp2 = round(cur_price - risk * 3.0, 5)   # 2.5 → 3.0 (artırıldı)
             rr1 = round(abs(cur_price - tp1) / risk, 2) if risk > 0 else 0
             rr2 = round(abs(cur_price - tp2) / risk, 2) if risk > 0 else 0
             sl_tp = {"sl": sl, "tp1": tp1, "tp2": tp2, "direction": "SHORT",
-                     "rr1": rr1, "rr2": rr2, "method": "swing+ATR"}
+                     "rr1": rr1, "rr2": rr2, "method": "swing+ATR v2"}
 
         # ── ICT TEKNIK YORUM METNI ──
         commentary = self._generate_commentary(
