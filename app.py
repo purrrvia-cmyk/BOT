@@ -2,9 +2,6 @@
 # ICT Trading Bot - Ana Flask Uygulaması
 # =====================================================
 
-import eventlet
-eventlet.monkey_patch()
-
 import logging
 import time
 import json
@@ -13,7 +10,7 @@ from datetime import datetime
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
 from flask_cors import CORS
-# NOT: APScheduler eventlet monkey_patch ile uyumsuz — kendi döngümüzü kullanıyoruz
+# NOT: APScheduler threading ile uyumsuz olabilir — kendi döngümüzü kullanıyoruz
 # from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import (
@@ -48,7 +45,7 @@ logger = logging.getLogger("ICT-Bot")
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "ict-bot-secret-2024"
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # Bot durumu
 bot_state = {
@@ -209,29 +206,33 @@ def run_optimizer():
         logger.error(f"Optimizasyon hatası: {e}")
 
 
-# ── Eventlet-uyumlu zamanlayıcı (APScheduler yerine) ──
+# ── Threading-based zamanlayıcı (eventlet yerine) ──
 _scheduler_threads = []
 
-def _eventlet_loop(func, interval_seconds, job_id):
-    """Eventlet green thread ile periyodik görev çalıştır."""
+def _scheduler_loop(func, interval_seconds, job_id):
+    """Daemon thread ile periyodik görev çalıştır."""
     # İlk çalıştırmayı atla — api_start zaten tetikliyor
-    eventlet.sleep(interval_seconds)
+    time.sleep(interval_seconds)
     while bot_state.get("running", False):
         try:
             func()
         except Exception as e:
             logger.error(f"Scheduler job '{job_id}' hata: {e}")
-        eventlet.sleep(interval_seconds)
+        time.sleep(interval_seconds)
     logger.info(f"Scheduler job '{job_id}' durduruldu (bot stopped)")
 
 def start_scheduler_jobs():
-    """Tüm periyodik görevleri eventlet green thread olarak başlat."""
+    """Tüm periyodik görevleri daemon thread olarak başlat."""
     global _scheduler_threads
-    _scheduler_threads = [
-        eventlet.spawn(_eventlet_loop, scan_markets, SCAN_INTERVAL_SECONDS, "scan_markets"),
-        eventlet.spawn(_eventlet_loop, check_trades, TRADE_CHECK_INTERVAL, "check_trades"),
-        eventlet.spawn(_eventlet_loop, run_optimizer, OPTIMIZER_CONFIG["optimization_interval_minutes"] * 60, "run_optimizer"),
-    ]
+    _scheduler_threads = []
+    for func, interval, job_id in [
+        (scan_markets, SCAN_INTERVAL_SECONDS, "scan_markets"),
+        (check_trades, TRADE_CHECK_INTERVAL, "check_trades"),
+        (run_optimizer, OPTIMIZER_CONFIG["optimization_interval_minutes"] * 60, "run_optimizer"),
+    ]:
+        t = threading.Thread(target=_scheduler_loop, args=(func, interval, job_id), daemon=True)
+        t.start()
+        _scheduler_threads.append(t)
     logger.info(f"✅ Scheduler başlatıldı: tarama={SCAN_INTERVAL_SECONDS}s, trade_check={TRADE_CHECK_INTERVAL}s")
 
 def stop_scheduler_jobs():
@@ -285,9 +286,9 @@ def api_start():
     bot_state["running"] = True
 
     # İlk taramayı hemen yap, sonra döngü devralır
-    eventlet.spawn(scan_markets)
+    threading.Thread(target=scan_markets, daemon=True).start()
 
-    # Eventlet green thread döngülerini başlat
+    # Thread döngülerini başlat
     start_scheduler_jobs()
 
     logger.info("🚀 Bot başlatıldı!")
@@ -2572,23 +2573,25 @@ if os.environ.get("RENDER"):
         """Gunicorn worker başladığında botu otomatik başlat"""
         if not bot_state["running"]:
             bot_state["running"] = True
-            # Eventlet-native scheduler loop'ları başlat
+            # Thread-based scheduler loop'ları başlat
             start_scheduler_jobs()
-            # Self-ping için ayrı eventlet loop
+            # Self-ping için ayrı thread
             def _self_ping_loop():
                 while bot_state.get("running", False):
                     try:
                         self_ping()
                     except Exception as e:
                         logger.error(f"Self-ping hata: {e}")
-                    eventlet.sleep(600)  # 10 dakika
-            _scheduler_threads.append(eventlet.spawn(_self_ping_loop))
+                    time.sleep(600)  # 10 dakika
+            t = threading.Thread(target=_self_ping_loop, daemon=True)
+            t.start()
+            _scheduler_threads.append(t)
             # İlk taramayı hemen başlat
-            eventlet.spawn(scan_markets)
+            threading.Thread(target=scan_markets, daemon=True).start()
             logger.info("🚀 Bot Render'da otomatik başlatıldı! (Self-ping aktif)")
 
     # İlk request'te değil, uygulama başlarken çalıştır
-    eventlet.spawn_after(5, auto_start_bot)
+    threading.Timer(5, auto_start_bot).start()
 
 
 if __name__ == "__main__":
@@ -2604,5 +2607,15 @@ if __name__ == "__main__":
     coins = data_fetcher.get_high_volume_coins(force_refresh=True)
     logger.info(f"  Başlangıç: {len(coins)} coin (min ${MIN_VOLUME_USDT:,.0f} hacim) tespit edildi")
     logger.info("=" * 60)
+
+    # Lokal modda otomatik başlat (5 sn sonra)
+    def _local_auto_start():
+        time.sleep(5)
+        if not bot_state["running"]:
+            bot_state["running"] = True
+            start_scheduler_jobs()
+            threading.Thread(target=scan_markets, daemon=True).start()
+            logger.info("🚀 Bot lokal olarak otomatik başlatıldı!")
+    threading.Thread(target=_local_auto_start, daemon=True).start()
 
     socketio.run(app, host=HOST, port=PORT, debug=DEBUG)

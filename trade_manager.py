@@ -80,7 +80,9 @@ class TradeManager:
                     if be_moved:
                         self._trade_state[sid] = {
                             "breakeven_moved": True,
-                            "trailing_sl": sl
+                            "trailing_sl": sl,
+                            "breakeven_sl": sl,  # ★ FIX: BE SL değerini de sakla
+                            "early_protect_sl": None,
                         }
                         logger.info(f"♻️ {sig.get('symbol','?')} trade state restored: BE=True, SL={sl}")
             if self._trade_state:
@@ -517,13 +519,18 @@ class TradeManager:
                 pass
 
         # Seviye doğrulama (ters SL/TP eski sinyalleri temizle)
-        if direction == "LONG" and (stop_loss >= entry_price or take_profit <= entry_price):
+        # ★ FIX: Breakeven/trailing yapılmış trade'lerde SL >= entry normaldir
+        # Bu durumda ters seviye kontrolü atlanmalı
+        state = self._trade_state.get(signal_id, {"breakeven_moved": False, "trailing_sl": None})
+        is_be_trade = state.get("breakeven_moved", False)
+
+        if direction == "LONG" and not is_be_trade and (stop_loss >= entry_price or take_profit <= entry_price):
             logger.warning(f"⚠️ #{signal_id} {symbol} LONG ters seviyeler - iptal")
             update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
             self._trade_state.pop(signal_id, None)
             result["status"] = "CANCELLED"
             return result
-        elif direction == "SHORT" and (stop_loss <= entry_price or take_profit >= entry_price):
+        elif direction == "SHORT" and not is_be_trade and (stop_loss <= entry_price or take_profit >= entry_price):
             logger.warning(f"⚠️ #{signal_id} {symbol} SHORT ters seviyeler - iptal")
             update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
             self._trade_state.pop(signal_id, None)
@@ -531,7 +538,6 @@ class TradeManager:
             return result
 
         # Breakeven / Trailing SL hesaplama
-        state = self._trade_state.get(signal_id, {"breakeven_moved": False, "trailing_sl": None})
         effective_sl = stop_loss
 
         if direction == "LONG":
@@ -634,8 +640,8 @@ class TradeManager:
           %40 → Breakeven: SL'yi entry+buffer'a taşı (kayıpsız garanti)
           %60 → Trailing: SL'yi kârın %50'sinde tut (kâr kilit)
         
-        TRUTH trade analizi: %74 TP'ye ulaştı ama breakeven yoktu.
-        Erken koruma (%25) bu tür durumları önler.
+        FIX: Breakeven SL değeri state'te saklanır.
+        Fiyat geri çekildiğinde BE koruması KAYBOLMAZ.
         """
         total_distance = take_profit - entry_price
         current_progress = current_price - entry_price
@@ -656,20 +662,28 @@ class TradeManager:
             # %40 → Breakeven (SL'yi entry+buffer'a taşı)
             elif progress_pct >= 0.40 and not state["breakeven_moved"]:
                 state["breakeven_moved"] = True
-                effective_sl = entry_price * 1.001
+                be_sl = entry_price * 1.001
+                state["breakeven_sl"] = be_sl  # ★ BE fiyatını state'e kaydet
+                effective_sl = be_sl
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
 
             # %25 → Erken koruma (SL'yi entry'nin hemen altına taşı — zarar minimize)
             elif progress_pct >= 0.25 and not state.get("early_protect"):
                 state["early_protect"] = True
-                # SL'yi entry'nin %0.2 altına taşı (neredeyse beraberlik)
                 early_sl = entry_price * 0.998
-                if early_sl > stop_loss:  # Sadece iyileştirme yapıyorsa
+                if early_sl > stop_loss:
                     effective_sl = early_sl
+                    state["early_protect_sl"] = early_sl  # Erken koruma fiyatını sakla
                     logger.info(f"🛡️ #{signal_id} {symbol} ERKEN KORUMA: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
 
-            if state["trailing_sl"]:
-                effective_sl = max(effective_sl, state["trailing_sl"])
+        # ★ FIX: Her zaman en iyi SL seviyesini kullan (trailing > be > early_protect > original)
+        # Bu sayede fiyat geri çekildiğinde koruma KAYBOLMAZ
+        if state.get("trailing_sl"):
+            effective_sl = max(effective_sl, state["trailing_sl"])
+        if state.get("breakeven_sl"):
+            effective_sl = max(effective_sl, state["breakeven_sl"])
+        if state.get("early_protect_sl"):
+            effective_sl = max(effective_sl, state["early_protect_sl"])
 
         return effective_sl
 
@@ -695,19 +709,27 @@ class TradeManager:
             # %40 → Breakeven
             elif progress_pct >= 0.40 and not state["breakeven_moved"]:
                 state["breakeven_moved"] = True
-                effective_sl = entry_price * 0.999
+                be_sl = entry_price * 0.999
+                state["breakeven_sl"] = be_sl  # ★ BE fiyatını state'e kaydet
+                effective_sl = be_sl
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
 
             # %25 → Erken koruma
             elif progress_pct >= 0.25 and not state.get("early_protect"):
                 state["early_protect"] = True
                 early_sl = entry_price * 1.002
-                if early_sl < stop_loss:  # Sadece iyileştirme yapıyorsa
+                if early_sl < stop_loss:
                     effective_sl = early_sl
+                    state["early_protect_sl"] = early_sl
                     logger.info(f"🛡️ #{signal_id} {symbol} ERKEN KORUMA: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
 
-            if state["trailing_sl"]:
-                effective_sl = min(effective_sl, state["trailing_sl"])
+        # ★ FIX: Her zaman en iyi SL seviyesini kullan (SHORT için min)
+        if state.get("trailing_sl"):
+            effective_sl = min(effective_sl, state["trailing_sl"])
+        if state.get("breakeven_sl"):
+            effective_sl = min(effective_sl, state["breakeven_sl"])
+        if state.get("early_protect_sl"):
+            effective_sl = min(effective_sl, state["early_protect_sl"])
 
         return effective_sl
 

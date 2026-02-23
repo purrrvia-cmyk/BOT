@@ -704,16 +704,27 @@ class ICTStrategy:
         current_price = df["close"].iloc[-1]
 
         fib_range = high_price - low_price
-        ote_high = low_price + fib_range * 0.786
-        ote_low = low_price + fib_range * 0.618
+        # OTE = Fibonacci RETRACEMENT 0.618-0.786
+        # LONG pullback: OTE discount bölgesi
+        ote_long_high = high_price - fib_range * 0.618  # = %38.2 seviyesi
+        ote_long_low = high_price - fib_range * 0.786   # = %21.4 seviyesi
+        # SHORT pullback: OTE premium bölgesi
+        ote_short_low = low_price + fib_range * 0.618   # = %61.8 seviyesi
+        ote_short_high = low_price + fib_range * 0.786   # = %78.6 seviyesi
 
         zone = "PREMIUM" if current_price > equilibrium else "DISCOUNT"
+        in_ote_long = ote_long_low <= current_price <= ote_long_high
+        in_ote_short = ote_short_low <= current_price <= ote_short_high
 
         return {
             "high": high_price, "low": low_price,
             "equilibrium": equilibrium, "current_price": current_price,
-            "zone": zone, "ote_high": ote_high, "ote_low": ote_low,
-            "in_ote": ote_low <= current_price <= ote_high,
+            "zone": zone,
+            "ote_high": ote_long_high, "ote_low": ote_long_low,
+            "ote_short_high": ote_short_high, "ote_short_low": ote_short_low,
+            "in_ote": in_ote_long,
+            "in_ote_long": in_ote_long,
+            "in_ote_short": in_ote_short,
             "premium_level": round(
                 (current_price - low_price) / (high_price - low_price) * 100, 1
             ) if high_price != low_price else 50
@@ -867,10 +878,20 @@ class ICTStrategy:
                 logger.debug(f"  ⚠️ 4H Bearish ama Extreme Discount ({htf_pd['premium_level']:.0f}%)")
             return {**result_base, "bias": "SHORT", "htf_trend": "BEARISH", "weak": False}
 
-        elif structure["trend"] in ("WEAKENING_BEAR", "WEAKENING_BULL"):
-            # WEAKENING trendler güvenilmez — net yapı kırılımı yok → İŞLEM YAPILMAZ
-            logger.debug(f"  ⚠️ 4H trend WEAKENING ({structure['trend']}) — net yön yok, atlanıyor")
-            return None
+        elif structure["trend"] == "WEAKENING_BEAR":
+            # 4H WEAKENING_BEAR = düşüş trendi zayıflıyor → potansiyel LONG dönüş
+            # ICT'de en iyi reversal setup'lar WEAKENING'den gelir
+            if htf_pd and htf_pd["premium_level"] > 75:
+                result_base["htf_extreme"] = True
+                logger.debug(f"  ⚠️ 4H Weakening Bear ama Extreme Premium ({htf_pd['premium_level']:.0f}%)")
+            return {**result_base, "bias": "LONG", "htf_trend": "WEAKENING_BEAR", "weak": True}
+
+        elif structure["trend"] == "WEAKENING_BULL":
+            # 4H WEAKENING_BULL = yükseliş trendi zayıflıyor → potansiyel SHORT dönüş
+            if htf_pd and htf_pd["premium_level"] < 25:
+                result_base["htf_extreme"] = True
+                logger.debug(f"  ⚠️ 4H Weakening Bull ama Extreme Discount ({htf_pd['premium_level']:.0f}%)")
+            return {**result_base, "bias": "SHORT", "htf_trend": "WEAKENING_BULL", "weak": True}
 
         return None  # NEUTRAL → NET YÖN YOK → İŞLEM YAPILMAZ
 
@@ -913,33 +934,42 @@ class ICTStrategy:
         # 15m veride ~96 mum = 1 gün. Son 96-192 arası = önceki gün
         major_levels = self._calc_major_levels(df)
 
+        # ★ FIX: Tüm sweep adaylarını topla, en yüksek kaliteliyi seç
+        # Eski kod ilk bulunan sweep'i döndürüyordu — minor sweep'ler
+        # major level sweep'lerden önce gelip yetersiz setup oluşturuyordu.
+        # Ayrıca sweep arama penceresi genişletildi: swing 200 mum eski bile olsa,
+        # sweep mumunun SON lookback mum içinde olması yeterli.
+        all_sweeps = []
+        sweep_recency = lookback  # Sweep mumunun güncelliği
+
         if bias == "LONG":
             # LONG → SSL (Sell-Side Liquidity) avı → eski swing low altına fitil
-            for sw in reversed(swing_lows):
+            for sw in swing_lows:
                 sw_price = sw["price"]
                 sw_idx = sw["index"]
-                # Sweep sonraki mumlarda olmalı
-                for i in range(sw_idx + 1, min(sw_idx + lookback + 1, n)):
+                # EN GÜNCEL sweep'i bul: SON mumdan geriye doğru ara
+                for i in range(n - 1, sw_idx, -1):
                     candle = df.iloc[i]
                     # Wick sw_price altına inip, close sw_price üstünde mi?
                     if candle["low"] < sw_price and candle["close"] > sw_price:
-                        # Sweep çok eski olmamalı
-                        if n - 1 - i <= lookback:
-                            # === SWEEP KALİTE SKORU ===
+                        # Sweep mumu SON 'sweep_recency' mum İÇİNDE olmalı (güncellik)
+                        if n - 1 - i <= sweep_recency:
                             sweep_quality = self._calc_sweep_quality(
                                 sw_price, candle, i, n, bias,
                                 liquidity_levels, has_volume, avg_volume,
                                 session_quality, df=df
                             )
-                            # ── Major Level Bonusu ──
                             is_major = self._is_major_level_sweep(
                                 sw_price, bias, major_levels
                             )
                             if is_major:
                                 sweep_quality = min(2.5, sweep_quality + 0.4)
-                            # Minimum kalite filtresi: 0.7 (1.0 çok katıydı, geçerli sweep'ler kaçıyordu)
+                            # Eski swing seviyelerinin sweep'leri daha değerli
+                            swing_age = n - 1 - sw_idx
+                            if swing_age > 50:
+                                sweep_quality = min(2.5, sweep_quality + 0.2)
                             if sweep_quality >= 0.7:
-                                return {
+                                all_sweeps.append({
                                     "swept_level": sw_price,
                                     "sweep_candle_idx": i,
                                     "sweep_wick": candle["low"],
@@ -947,18 +977,19 @@ class ICTStrategy:
                                     "swing_index": sw_idx,
                                     "sweep_quality": sweep_quality,
                                     "major_level": is_major,
-                                }
+                                })
+                        break  # Bu swing için en güncel sweep bulundu, sonraki swing'e geç
 
         elif bias == "SHORT":
             # SHORT → BSL (Buy-Side Liquidity) avı → eski swing high üstüne fitil
-            for sw in reversed(swing_highs):
+            for sw in swing_highs:
                 sw_price = sw["price"]
                 sw_idx = sw["index"]
-                for i in range(sw_idx + 1, min(sw_idx + lookback + 1, n)):
+                # EN GÜNCEL sweep'i bul: SON mumdan geriye doğru ara
+                for i in range(n - 1, sw_idx, -1):
                     candle = df.iloc[i]
-                    # Wick sw_price üstüne çıkıp, close sw_price altında mı?
                     if candle["high"] > sw_price and candle["close"] < sw_price:
-                        if n - 1 - i <= lookback:
+                        if n - 1 - i <= sweep_recency:
                             sweep_quality = self._calc_sweep_quality(
                                 sw_price, candle, i, n, bias,
                                 liquidity_levels, has_volume, avg_volume,
@@ -969,9 +1000,11 @@ class ICTStrategy:
                             )
                             if is_major:
                                 sweep_quality = min(2.5, sweep_quality + 0.4)
-                            # Minimum kalite filtresi: 0.7 (1.0 çok katıydı, geçerli sweep'ler kaçıyordu)
+                            swing_age = n - 1 - sw_idx
+                            if swing_age > 50:
+                                sweep_quality = min(2.5, sweep_quality + 0.2)
                             if sweep_quality >= 0.7:
-                                return {
+                                all_sweeps.append({
                                     "swept_level": sw_price,
                                     "sweep_candle_idx": i,
                                     "sweep_wick": candle["high"],
@@ -979,7 +1012,14 @@ class ICTStrategy:
                                     "swing_index": sw_idx,
                                     "sweep_quality": sweep_quality,
                                     "major_level": is_major,
-                                }
+                                })
+                        break  # Bu swing için en güncel sweep bulundu
+
+        # En yüksek kaliteli sweep'i döndür
+        if all_sweeps:
+            best_sweep = max(all_sweeps, key=lambda x: x["sweep_quality"])
+            logger.debug(f"  Sweep: {len(all_sweeps)} aday bulundu, en iyi: Q={best_sweep['sweep_quality']:.2f} ({best_sweep['sweep_type']})")
+            return best_sweep
 
         return None
 
@@ -1430,7 +1470,7 @@ class ICTStrategy:
     #  BÖLÜM 15 — YAPISAL STOP LOSS HESAPLAMA
     # =================================================================
 
-    def _calc_structural_sl(self, df, sweep, bias, structure):
+    def _calc_structural_sl(self, df, sweep, bias, structure, entry_price=None):
         """
         Yapısal (Structural) Stop Loss hesaplama.
         SABIT YÜZDE KULLANILMAZ — her zaman piyasa yapısına göre hesaplanır.
@@ -1461,17 +1501,25 @@ class ICTStrategy:
             if structure["last_swing_low"]:
                 candidates.append(("SWING_LOW", structure["last_swing_low"]["price"] * 0.997))
 
-            # En yakın (entry'ye en yakın) geçerli SL'yi seç
+            # En anlamlı yapısal seviyeyi seç (sweep wick > swept level > swing)
+            # ATR buffer: minimum volatilite koruması
             valid = [(name, price) for name, price in candidates if price > 0]
             if not valid:
                 return None
 
-            # En yakın olanı seç (unnecessarily geniş SL'den kaçın)
-            best = max(valid, key=lambda x: x[1])
+            # Öncelik sırası: SWEEP_WICK (en güvenilir) > SWEPT_LEVEL > SWING_LOW
+            priority = {"SWEEP_WICK": 1, "SWEPT_LEVEL": 2, "SWING_LOW": 3}
+            best = min(valid, key=lambda x: priority.get(x[0], 99))
 
-            # NOT: ATR floor KALDIRILDI — yapısal SL'yi bozarak genişletmek yanlış.
-            # Yapısal SL volatiliteye göre çok darsa, generate_signal()'deki
-            # effective_min_sl kontrolü sinyali reddeder (doğru davranış).
+            # ATR-tabanlı minimum mesafe kontrolü
+            # SL en az son 20 mumun ATR'sinin 1.5 katı uzakta olmalı
+            atr = self._calc_atr(df, 20)
+            ref_price = entry_price if entry_price else df["close"].iloc[-1]
+            min_sl_distance = ref_price - (atr * 1.5)
+            if best[1] > min_sl_distance:
+                # SL çok dar → ATR buffer ile genişlet
+                best = (best[0] + "_ATR_ADJ", min_sl_distance)
+                logger.debug(f"  LONG SL: ATR buffer uygulandı → {best[1]:.8f}")
 
             logger.debug(f"  LONG SL: {best[0]} @ {best[1]:.8f}")
             return best[1]
@@ -1490,11 +1538,17 @@ class ICTStrategy:
             if not valid:
                 return None
 
-            best = min(valid, key=lambda x: x[1])
+            # Öncelik sırası: SWEEP_WICK > SWEPT_LEVEL > SWING_HIGH
+            priority = {"SWEEP_WICK": 1, "SWEPT_LEVEL": 2, "SWING_HIGH": 3}
+            best = min(valid, key=lambda x: priority.get(x[0], 99))
 
-            # NOT: ATR floor KALDIRILDI — yapısal SL'yi bozarak genişletmek yanlış.
-            # Yapısal SL volatiliteye göre çok darsa, generate_signal()'deki
-            # effective_min_sl kontrolü sinyali reddeder (doğru davranış).
+            # ATR-tabanlı minimum mesafe kontrolü
+            atr = self._calc_atr(df, 20)
+            ref_price = entry_price if entry_price else df["close"].iloc[-1]
+            min_sl_distance = ref_price + (atr * 1.5)
+            if best[1] < min_sl_distance:
+                best = (best[0] + "_ATR_ADJ", min_sl_distance)
+                logger.debug(f"  SHORT SL: ATR buffer uygulandı → {best[1]:.8f}")
 
             logger.debug(f"  SHORT SL: {best[0]} @ {best[1]:.8f}")
             return best[1]
@@ -1625,9 +1679,10 @@ class ICTStrategy:
                 best = min(valid, key=lambda x: x[1])
                 logger.debug(f"  LONG TP: {best[0]} @ {best[1]:.8f}")
                 return best[1]
-            # 2.0 RR sağlayan hedef yoksa en uzak olanı dene
+            # 1.5 RR sağlayan hedef yoksa en YAKIN olanı dene (ulaşılabilir hedef)
             if tp_candidates:
-                best = max(tp_candidates, key=lambda x: x[1])
+                # En yakın hedefe git — ulaşılamayan TP yerine gerçekçi hedef
+                best = min(tp_candidates, key=lambda x: x[1])
                 if (best[1] - entry) > risk:
                     return best[1]
         else:
@@ -1657,7 +1712,8 @@ class ICTStrategy:
                 logger.debug(f"  SHORT TP: {best[0]} @ {best[1]:.8f}")
                 return best[1]
             if tp_candidates:
-                best = min(tp_candidates, key=lambda x: x[1])
+                # SHORT fallback: en YAKIN (en yüksek fiyatlı) ulaşılabilir hedef
+                best = max(tp_candidates, key=lambda x: x[1])
                 if (entry - best[1]) > risk:
                     return best[1]
 
@@ -1714,12 +1770,29 @@ class ICTStrategy:
         structure = self.detect_market_structure(df)
         analysis["structure"] = structure
 
+        # Erken yön tayini: WEAKENING değerlendirmesi için direction gerekli
+        # override_direction varsa onu kullan, yoksa structure'dan türet
+        direction = override_direction
+        if not direction:
+            if structure["trend"] in ["BULLISH", "WEAKENING_BEAR"]:
+                direction = "LONG"
+            elif structure["trend"] in ["BEARISH", "WEAKENING_BULL"]:
+                direction = "SHORT"
+
         if structure["trend"] in ["BULLISH", "BEARISH"]:
             score += 10
             components.append("MARKET_STRUCTURE")
         elif structure["trend"] in ["WEAKENING_BULL", "WEAKENING_BEAR"]:
-            score -= 5
-            penalties.append("WEAKENING_TREND(-15)")
+            # Yöne göre değerlendir: Karşı trend zayıflıyorsa OLUMLU
+            if direction and (
+                (direction == "SHORT" and structure["trend"] == "WEAKENING_BULL") or
+                (direction == "LONG" and structure["trend"] == "WEAKENING_BEAR")
+            ):
+                score += 5
+                components.append("WEAKENING_FAVORABLE")
+            else:
+                score -= 5
+                penalties.append("WEAKENING_TREND(-5)")
 
         # === HTF BIAS (4H) ===
         htf_bias_block = False
@@ -1732,12 +1805,19 @@ class ICTStrategy:
             analysis["htf_liquidity"] = htf_result.get("liquidity", [])
 
             # HTF ve LTF aynı yönde mi?
-            if htf_result["bias"] == "LONG" and structure["trend"] in ["BULLISH", "WEAKENING_BEAR"]:
+            if htf_result["bias"] == "LONG" and structure["trend"] == "BULLISH":
                 score += 25
                 components.append("HTF_CONFIRMATION")
-            elif htf_result["bias"] == "SHORT" and structure["trend"] in ["BEARISH", "WEAKENING_BULL"]:
+            elif htf_result["bias"] == "SHORT" and structure["trend"] == "BEARISH":
                 score += 25
                 components.append("HTF_CONFIRMATION")
+            # WEAKENING durumlar: yarı kredi (trend henüz dönmedi)
+            elif htf_result["bias"] == "LONG" and structure["trend"] == "WEAKENING_BEAR":
+                score += 12
+                components.append("HTF_PARTIAL_CONFIRMATION")
+            elif htf_result["bias"] == "SHORT" and structure["trend"] == "WEAKENING_BULL":
+                score += 12
+                components.append("HTF_PARTIAL_CONFIRMATION")
             elif htf_result["bias"] == "LONG" and structure["trend"] == "BEARISH":
                 # HTF LONG ama LTF BEARISH → HARD BLOCK
                 htf_bias_block = True
@@ -1787,18 +1867,7 @@ class ICTStrategy:
 
         analysis["htf_bias_block"] = htf_bias_block
 
-        # === YÖN ===
-        # override_direction: generate_signal() HTF bias'ını aktarır.
-        # Bu sayede LTF WEAKENING_BULL + HTF LONG durumunda confluence
-        # doğru yönde (LONG) puanlanır.
-        if override_direction:
-            direction = override_direction
-        else:
-            direction = None
-            if structure["trend"] in ["BULLISH", "WEAKENING_BEAR"]:
-                direction = "LONG"
-            elif structure["trend"] in ["BEARISH", "WEAKENING_BULL"]:
-                direction = "SHORT"
+        # === YÖN (zaten yukarıda erken belirlenmiş, analiz'e ata) ===
         analysis["direction"] = direction
 
         # === MTF (1H) ONAY — GÜÇLENDİRİLMİŞ ===
@@ -1987,13 +2056,13 @@ class ICTStrategy:
             if direction == "LONG" and pd_zone["zone"] == "DISCOUNT":
                 score += 7
                 components.append("DISCOUNT_ZONE")
-                if pd_zone["in_ote"]:
+                if pd_zone.get("in_ote_long", pd_zone.get("in_ote")):
                     score += 3
                     components.append("OTE")
             elif direction == "SHORT" and pd_zone["zone"] == "PREMIUM":
                 score += 7
                 components.append("PREMIUM_ZONE")
-                if pd_zone["in_ote"]:
+                if pd_zone.get("in_ote_short", pd_zone.get("in_ote")):
                     score += 3
                     components.append("OTE")
 
@@ -2074,17 +2143,21 @@ class ICTStrategy:
             penalty += 4   # (8→4: FVG zamanlama meselesi)
         if "LIQUIDITY_SWEEP" not in components:
             penalty += 6   # (10→6: sweep en kritik)
-        if "HTF_CONFIRMATION" not in components:
+        if "HTF_CONFIRMATION" not in components and "HTF_PARTIAL_CONFIRMATION" not in components:
             penalty += 5   # (8→5: HTF yoksa zaten score düşük)
+        elif "HTF_PARTIAL_CONFIRMATION" in components:
+            penalty += 2   # Kısmi HTF onay — küçük ceza
 
         # Premium/Discount uyumsuzluğu
         if "DISCOUNT_ZONE" not in components and "PREMIUM_ZONE" not in components:
             penalty += 3   # (5→3: zone soft signal)
 
-        # ★ WEAKENING_TREND cezası — 15m momentum zayıflıyorsa güvenilmez
+        # ★ WEAKENING_TREND cezası — sadece yöne ters zayıflarsa cezalandır
         penalties_list = analysis.get("penalties", [])
+        components = analysis.get("components", [])
         if any("WEAKENING_TREND" in p for p in penalties_list):
             penalty += 8
+        # WEAKENING_FAVORABLE durumunda ceza yok, zaten components'ta
 
         confidence = max(0, min(100, base + bonus - penalty))
         return round(confidence, 1)
@@ -2161,6 +2234,34 @@ class ICTStrategy:
             logger.debug(f"🚫 {symbol}: LTF BULLISH vs HTF SHORT → yetersiz çakışma")
             return None
 
+        # ===== GATE 1.1: LTF WEAKENING karşı yönde → WATCH =====
+        # HTF LONG + LTF WEAKENING_BULL (düşüş eğilimi) → karşı yön
+        # HTF SHORT + LTF WEAKENING_BEAR (yükseliş eğilimi) → karşı yön
+        # NEUTRAL → yön yok, sadece WATCH
+        if bias == "LONG" and structure["trend"] == "WEAKENING_BULL":
+            analysis = self.calculate_confluence(df, multi_tf_data, override_direction=bias)
+            confidence = self._calculate_confidence(analysis)
+            if confidence >= 35:
+                return self._build_signal_dict(
+                    symbol, bias, current_price, analysis, confidence,
+                    action="WATCH",
+                    watch_reason="LTF WEAKENING_BULL (düşüş eğilimi) — yapı kırılımı bekleniyor"
+                )
+            return None
+        if bias == "SHORT" and structure["trend"] == "WEAKENING_BEAR":
+            analysis = self.calculate_confluence(df, multi_tf_data, override_direction=bias)
+            confidence = self._calculate_confidence(analysis)
+            if confidence >= 35:
+                return self._build_signal_dict(
+                    symbol, bias, current_price, analysis, confidence,
+                    action="WATCH",
+                    watch_reason="LTF WEAKENING_BEAR (yükseliş eğilimi) — yapı kırılımı bekleniyor"
+                )
+            return None
+        if structure["trend"] == "NEUTRAL":
+            logger.debug(f"🚫 {symbol}: LTF NEUTRAL → yön yok, atlanıyor")
+            return None
+
         # ===== GATE 1.5: MTF (1H) Doğrulama =====
         direction_for_mtf = bias
         mtf_result = self._analyze_mtf_confirmation(multi_tf_data, structure, direction_for_mtf)
@@ -2221,8 +2322,8 @@ class ICTStrategy:
             # Normal CE entry (Consequent Encroachment = orta nokta)
             entry = (entry_fvg["high"] + entry_fvg["low"]) / 2
 
-        # Yapısal SL
-        sl = self._calc_structural_sl(df, sweep, bias, structure)
+        # Yapısal SL (entry fiyatı ile ATR floor hesabı)
+        sl = self._calc_structural_sl(df, sweep, bias, structure, entry_price=entry)
         if sl is None:
             return None
 
@@ -2614,7 +2715,7 @@ class ICTStrategy:
             "analysis": analysis,
             # ── Dinamik tier: bileşen kalitesine göre (artık sabit POTENTIAL değil)
             "quality_tier": quality_tier,
-            "htf_bias": analysis.get("htf_bias", "?"),
+            "htf_bias": analysis.get("htf_trend", "?"),
         }
 
         return result

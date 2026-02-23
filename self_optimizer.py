@@ -177,23 +177,28 @@ class SelfOptimizer:
 
     def _optimize_confidence_threshold(self, stats):
         """
-        Win rate'e göre minimum güven eşiğini ayarla:
-        - Win rate düşükse -> eşiği yükselt (daha seçici ol)
-        - Win rate hedefin üstündeyse -> eşiği biraz düşür (daha fazla fırsat)
+        Win rate'e göre minimum güven eşiğini ayarla.
+        ★ FIX: Daha dengeli hareket — hem yukarı hem aşağı aynı hızda.
+        Min 10 trade olmalı (küçük örneklemlerden kaçın).
+        Tavan: 68 (72 çok yüksekti, sinyal üretimi duruyordu).
         """
+        # Minimum trade sayısı kontrolü
+        if stats["total_trades"] < 10:
+            return None
+            
         current_wr = stats["win_rate"] / 100
         current_threshold = get_bot_param("min_confidence", ICT_PARAMS["min_confidence"])
 
         if current_wr < self.target_win_rate * 0.85:
-            # Win rate çok düşük, eşiği yükselt
-            adjustment = self.learning_rate * (self.target_win_rate - current_wr) * 100
-            new_threshold = min(90, current_threshold + adjustment)
-            reason = f"Win rate düşük ({stats['win_rate']}%), güven eşiği yükseltiliyor"
+            # Win rate düşük, eşiği HAFIF yükselt (küçük adımlar)
+            adjustment = self.learning_rate * 0.5 * (self.target_win_rate - current_wr) * 100
+            new_threshold = min(68, current_threshold + min(adjustment, 2.0))  # Max 2 puan artış
+            reason = f"Win rate düşük ({stats['win_rate']}%), güven eşiği hafif yükseltiliyor"
 
         elif current_wr > self.target_win_rate * 1.15:
-            # Win rate çok yüksek, biraz daha fazla sinyal üretilebilir
-            adjustment = self.learning_rate * 5
-            new_threshold = max(55, current_threshold - adjustment)
+            # Win rate yüksek, eşiği düşür (AYNI hızda — dengeli)
+            adjustment = self.learning_rate * 0.5 * (current_wr - self.target_win_rate) * 100
+            new_threshold = max(50, current_threshold - min(adjustment, 2.0))
             reason = f"Win rate yüksek ({stats['win_rate']}%), güven eşiği düşürülüyor"
 
         else:
@@ -285,13 +290,14 @@ class SelfOptimizer:
             new_val = current_val
 
             if win_rate < 0.4:
-                # Kötü performans → daha seçici ol (parametreyi artır)
-                adjustment = current_val * self.learning_rate
+                # Kötü performans → daha seçici ol (parametreyi HAFIF artır)
+                # ★ FIX: Daha küçük adımlar — %50 daha yavaş
+                adjustment = current_val * self.learning_rate * 0.5
                 new_val = min(cfg["max_val"], current_val + adjustment)
-                reason = f"{comp_name} düşük WR ({comp['win_rate']}%), daha seçici"
+                reason = f"{comp_name} düşük WR ({comp['win_rate']}%), hafif sıkılaştırma"
 
-            elif win_rate > 0.75:
-                # Çok iyi performans → biraz gevşet (daha fazla fırsat)
+            elif win_rate > 0.65:
+                # İyi performans → biraz gevşet (eşik düşürüldü: 0.75 → 0.65)
                 adjustment = current_val * self.learning_rate * 0.5
                 new_val = max(cfg["min_val"], current_val - adjustment)
                 reason = f"{comp_name} yüksek WR ({comp['win_rate']}%), biraz gevşetiliyor"
@@ -426,8 +432,8 @@ class SelfOptimizer:
         loss_rate = len(losers) / len(completed) if completed else 0
 
         if loss_rate > 0.55 and avg_loss > current_sl * 100 * 0.9:
-            # SL'yi biraz genişlet (market noise'ı azalt)
-            new_sl = min(current_sl * 1.1, 0.03)  # Max %3
+            # SL'yi biraz genişlet (market noise'ı azalt) — ★ FIX: daha muhafazakar
+            new_sl = min(current_sl * 1.05, 0.022)  # Max %2.2 (eskiden %3'tü)
             new_sl = round(new_sl, 4)
 
             if abs(new_sl - current_sl) > 0.0005:
@@ -605,8 +611,8 @@ class SelfOptimizer:
             low_conf_ratio = loss_info["low_confidence_losses"] / loss_info["total_losses"]
             if low_conf_ratio > 0.4:
                 current = get_bot_param("min_confidence", ICT_PARAMS["min_confidence"])
-                # Küçük adımlarla artır (agresif değil, ideal)
-                new_val = min(80, current + self.learning_rate * 15)
+                # Küçük adımlarla artır — ★ FIX: daha düşük tavan (68), daha küçük adım
+                new_val = min(68, current + self.learning_rate * 8)
                 new_val = round(new_val, 1)
                 if new_val - current >= 1.0:
                     new_val = self._save_with_bounds("min_confidence", new_val, ICT_PARAMS["min_confidence"])
@@ -662,10 +668,10 @@ class SelfOptimizer:
 
         # 5. Ortalama kayıp büyükse → SL mesafesini kontrol et
         #    (Adım 4'te zaten ayarlandıysa atla — çelişkili yön koruması)
-        if "default_sl_pct" not in already_changed and loss_info["avg_loss_pct"] > 2.0:
+        if "default_sl_pct" not in already_changed and loss_info["avg_loss_pct"] > 2.5:
             current_sl = get_bot_param("default_sl_pct", ICT_PARAMS["default_sl_pct"])
-            # SL çok geniş olabilir, daralt
-            new_sl = max(0.008, current_sl * 0.92)
+            # SL çok geniş olabilir, daralt ama çok agresif değil
+            new_sl = max(0.010, current_sl * 0.95)  # Min %1.0, %5 daralma
             new_sl = round(new_sl, 4)
             if abs(new_sl - current_sl) > 0.001:
                 new_sl = self._save_with_bounds("default_sl_pct", new_sl, ICT_PARAMS["default_sl_pct"])
@@ -689,21 +695,21 @@ class SelfOptimizer:
     def _emergency_mode(self, stats):
         """
         🚨 ACİL MOD — %0 win rate ile ardışık kayıplarda tetiklenir.
-        TEK SEFER çalışır (death spiral koruması):
-        - Sadece SL mesafesini hafif artır (kayıp büyüklüğünü azalt)
-        - confidence/confluence'a DOKUNMAZ (çok artırırsa hiç işlem açılmaz)
+        ★ FIX: Daha muhafazakar acil mod.
+        SL'yi max %2'ye kadar genişlet, hiç confidence/confluence değiştirme.
+        Minimum 3 trade olmalı.
         """
         changes = []
 
-        # Acil mod sadece ilk 5 kayıpta tetiklenir, sonra normal öğrenmeye bırakır
-        if stats["losing_trades"] > 8:
-            logger.info("🚨 Acil mod atlandı — yeterli veri toplandı, normal öğrenme devrede")
+        # Acil mod sadece 3-8 kayıpta tetiklenir
+        if stats["losing_trades"] > 8 or stats["total_trades"] < 3:
+            logger.info("🚨 Acil mod atlandı — yeterli veri toplandı/yetersiz trade")
             return changes
 
         # SL mesafesini hafif artır (kayma koruması)
         current_sl = get_bot_param("default_sl_pct", ICT_PARAMS["default_sl_pct"])
-        if current_sl < 0.02:
-            new_sl = min(0.02, current_sl * 1.10)
+        if current_sl < 0.018:  # Max %1.8'e kadar (eskiden %2'ydi)
+            new_sl = min(0.018, current_sl * 1.08)  # %8 artış (eskiden %10'du)
             new_sl = round(new_sl, 4)
             new_sl = self._save_with_bounds("default_sl_pct", new_sl, ICT_PARAMS["default_sl_pct"])
             if new_sl > current_sl:
