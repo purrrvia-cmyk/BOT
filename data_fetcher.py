@@ -265,19 +265,19 @@ class OKXDataFetcher:
         data["15m"] = self.get_candles(symbol, "15m", 100)
         if data["15m"] is None or data["15m"].empty:
             # 15m yoksa diğer TF'leri çekmeye gerek yok
-            data["4H"] = pd.DataFrame()
-            data["1H"] = pd.DataFrame()
+            data["4h"] = pd.DataFrame()
+            data["1h"] = pd.DataFrame()
             data["5m"] = pd.DataFrame()
             return data
 
         time.sleep(0.1)  # Rate limit
 
         # 4 saatlik - HTF Bias (yapı analizi)
-        data["4H"] = self.get_candles(symbol, "4H", 100)
+        data["4h"] = self.get_candles(symbol, "4H", 100)
         time.sleep(0.1)
 
         # 1 saatlik - MTF (sinyal onayı)
-        data["1H"] = self.get_candles(symbol, "1H", 100)
+        data["1h"] = self.get_candles(symbol, "1H", 100)
         time.sleep(0.1)
 
         # 5 dakikalık - Watchlist onay akışı

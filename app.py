@@ -109,7 +109,6 @@ def scan_markets():
             regime = bot_state.get("current_regime", "UNKNOWN")
 
         # ── Tüm coinleri ICT ile tara (rejim filtresi yok) ──
-        gate_stats = {f"gate{i}": 0 for i in range(2, 6)}  # pass counts
         for symbol in active_coins:
             if market_regime._is_btc(symbol):
                 continue  # BTC referans, sinyale gerek yok
@@ -117,13 +116,12 @@ def scan_markets():
             try:
                 # Gerçek zamanlı çoklu zaman dilimi verisi çek
                 multi_tf = data_fetcher.get_multi_timeframe_data(symbol)
-                ltf_data = multi_tf.get("15m")
 
-                if ltf_data is None or ltf_data.empty:
+                if multi_tf is None or multi_tf.get("15m") is None:
                     continue
 
-                # ICT strateji analizi — tüm yönler serbest
-                result = ict_strategy.generate_signal(symbol, ltf_data, multi_tf)
+                # ICT v4.0: Narrative → POI → Trigger analizi
+                result = ict_strategy.generate_signal(symbol, multi_tf)
 
                 if result:
                     trade_result = trade_manager.process_signal(result)
@@ -144,6 +142,11 @@ def scan_markets():
 
                 symbols_scanned += 1
                 time.sleep(0.15)  # Rate limit
+
+                # Stop edilmişse erken çık
+                if not bot_state["running"]:
+                    logger.info("🛑 Tarama durduruldu (bot stopped)")
+                    break
 
             except Exception as e:
                 logger.error(f"Hata ({symbol}): {e}")
@@ -427,6 +430,14 @@ def api_start():
 
     bot_state["running"] = True
 
+    # Eski taramadan kalan scan_lock'u serbest bırak
+    if scan_lock.locked():
+        try:
+            scan_lock.release()
+            logger.info("🔓 Eski scan_lock serbest bırakıldı (restart)")
+        except RuntimeError:
+            pass  # Zaten serbest
+
     # İlk taramayı hemen yap, sonra döngü devralır
     threading.Thread(target=scan_markets, daemon=True).start()
 
@@ -549,15 +560,14 @@ def api_cancel_signal(signal_id):
 
 @app.route("/api/analyze/<symbol>")
 def api_analyze_symbol(symbol):
-    """Tek bir coini analiz et"""
+    """Tek bir coini analiz et — v4.0 full_analysis kullanır."""
     try:
         multi_tf = data_fetcher.get_multi_timeframe_data(symbol)
-        ltf_data = multi_tf.get("15m")
 
-        if ltf_data is None or ltf_data.empty:
+        if multi_tf is None or multi_tf.get("15m") is None:
             return jsonify({"error": "Veri alınamadı"}), 400
 
-        analysis = ict_strategy.calculate_confluence(ltf_data, multi_tf)
+        analysis = ict_strategy.full_analysis(symbol, multi_tf)
 
         # Timestamp'leri string'e çevir
         def serialize(obj):
@@ -576,8 +586,7 @@ def api_analyze_symbol(symbol):
 @app.route("/api/chart-data/<symbol>")
 def api_chart_data(symbol):
     """
-    ICT Chart verisi: 15m mumları + tüm ICT çizim katmanları.
-    Aktif sinyallerdeki coin'e çift tıklandığında chart açılır.
+    ICT Chart verisi v4.0: 15m mumları + Narrative/POI/Trigger katmanları.
     """
     try:
         multi_tf = data_fetcher.get_multi_timeframe_data(symbol)
@@ -585,6 +594,10 @@ def api_chart_data(symbol):
 
         if ltf_data is None or ltf_data.empty:
             return jsonify({"error": "Veri alınamadı"}), 400
+
+        # v4.0: full_analysis ile tüm ICT bileşenlerini al
+        analysis = ict_strategy.full_analysis(symbol, multi_tf)
+        narrative = analysis.get("narrative", {})
 
         # Mum verileri (Lightweight Charts formatı)
         candles = []
@@ -597,39 +610,6 @@ def api_chart_data(symbol):
                 "close": float(row["close"]),
                 "volume": float(row["volume"]) if "volume" in row else 0
             })
-
-        # ICT bileşenleri hesapla
-        structure = ict_strategy.detect_market_structure(ltf_data)
-        active_obs, all_obs = ict_strategy.find_order_blocks(ltf_data, structure)
-        breaker_blocks = ict_strategy.find_breaker_blocks(all_obs, ltf_data)
-        fvgs = ict_strategy.find_fvg(ltf_data)
-        displacements = ict_strategy.detect_displacement(ltf_data, lookback=30)
-        liquidity_levels = ict_strategy.find_liquidity_levels(ltf_data)
-        pd_zone = ict_strategy.calculate_premium_discount(ltf_data, structure)
-
-        # EMA hesapla (21 ve 50 periyot)
-        import numpy as np
-        ema21 = ltf_data["close"].ewm(span=21, adjust=False).mean()
-        ema50 = ltf_data["close"].ewm(span=50, adjust=False).mean()
-        ema_21_data = []
-        ema_50_data = []
-        for idx_i, row in ltf_data.iterrows():
-            t = int(row["timestamp"].timestamp())
-            v21 = ema21.loc[idx_i]
-            v50 = ema50.loc[idx_i]
-            if not (isinstance(v21, float) and np.isnan(v21)):
-                ema_21_data.append({"time": t, "value": round(float(v21), 8)})
-            if not (isinstance(v50, float) and np.isnan(v50)):
-                ema_50_data.append({"time": t, "value": round(float(v50), 8)})
-
-        # HTF bias
-        htf_result = ict_strategy._analyze_htf_bias(multi_tf)
-        htf_bias = htf_result["bias"] if htf_result else None
-
-        # Sweep event
-        sweep = None
-        if htf_bias:
-            sweep = ict_strategy._find_sweep_event(ltf_data, htf_bias)
 
         # Aktif sinyal bilgisi (entry/sl/tp çizgileri için)
         active_signal = None
@@ -646,158 +626,146 @@ def api_chart_data(symbol):
                 }
                 break
 
+        # Helper: index → unix timestamp
+        def idx_to_time(idx):
+            """DataFrame index'ini Unix timestamp'e çevir."""
+            try:
+                idx = int(idx)
+                if 0 <= idx < len(ltf_data):
+                    return int(ltf_data.iloc[idx]["timestamp"].timestamp())
+            except (ValueError, TypeError):
+                pass
+            return None
+
         # Swing points
         swing_highs_data = []
-        for sh in structure.get("swing_highs", []):
-            if sh["index"] < len(ltf_data):
+        for sh in analysis.get("swing_points", {}).get("highs", []):
+            t = idx_to_time(sh.get("index", 0))
+            if t:
                 swing_highs_data.append({
-                    "time": int(ltf_data.iloc[sh["index"]]["timestamp"].timestamp()),
                     "price": float(sh["price"]),
-                    "type": sh.get("fractal_type", "MAJOR")
+                    "time": t,
                 })
 
         swing_lows_data = []
-        for sl_p in structure.get("swing_lows", []):
-            if sl_p["index"] < len(ltf_data):
+        for sl_p in analysis.get("swing_points", {}).get("lows", []):
+            t = idx_to_time(sl_p.get("index", 0))
+            if t:
                 swing_lows_data.append({
-                    "time": int(ltf_data.iloc[sl_p["index"]]["timestamp"].timestamp()),
                     "price": float(sl_p["price"]),
-                    "type": sl_p.get("fractal_type", "MAJOR")
+                    "time": t,
                 })
 
-        # Order Blocks → dikdörtgen bölgeler
+        # Order Blocks
         obs_data = []
-        for ob in active_obs:
-            if ob["index"] < len(ltf_data):
+        for ob in analysis.get("order_blocks", []):
+            t = idx_to_time(ob.get("index", 0))
+            if t:
                 obs_data.append({
-                    "time": int(ltf_data.iloc[ob["index"]]["timestamp"].timestamp()),
-                    "high": float(ob["high"]),
-                    "low": float(ob["low"]),
-                    "type": ob["type"],
-                    "strength": round(ob.get("strength", 0), 2)
+                    "high": float(ob.get("high", 0)),
+                    "low": float(ob.get("low", 0)),
+                    "type": ob.get("type", ""),
+                    "time": t,
                 })
 
-        # FVGs → dikdörtgen bölgeler
+        # FVGs
         fvgs_data = []
-        for fvg in fvgs:
-            if fvg["index"] < len(ltf_data):
+        for fvg in analysis.get("fvgs", []):
+            t = idx_to_time(fvg.get("index", 0))
+            if t:
                 fvgs_data.append({
-                    "time": int(ltf_data.iloc[fvg["index"]]["timestamp"].timestamp()),
-                    "high": float(fvg["high"]),
-                    "low": float(fvg["low"]),
-                    "type": fvg["type"],
-                    "size_pct": fvg.get("size_pct", 0)
+                    "high": float(fvg.get("high", 0)),
+                    "low": float(fvg.get("low", 0)),
+                    "type": fvg.get("type", ""),
+                    "time": t,
                 })
 
-        # Displacement mumları
-        disp_data = []
-        for d in displacements:
-            if d["index"] < len(ltf_data):
-                disp_data.append({
-                    "time": int(ltf_data.iloc[d["index"]]["timestamp"].timestamp()),
-                    "direction": d["direction"],
-                    "body_ratio": d.get("body_ratio", 0),
-                    "atr_multiple": d.get("atr_multiple", 0)
-                })
-
-        # BOS/CHoCH yapısal kırılımlar
-        bos_data = []
-        for bos in structure.get("bos_events", []):
-            if bos["index"] < len(ltf_data):
-                bos_data.append({
-                    "time": int(ltf_data.iloc[bos["index"]]["timestamp"].timestamp()),
-                    "type": bos["type"],
-                    "price": float(bos["price"]),
-                    "prev_price": float(bos["prev_price"])
-                })
-
-        choch_data = []
-        for ch in structure.get("choch_events", []):
-            if ch["index"] < len(ltf_data):
-                choch_data.append({
-                    "time": int(ltf_data.iloc[ch["index"]]["timestamp"].timestamp()),
-                    "type": ch["type"],
-                    "price": float(ch["price"]),
-                    "prev_price": float(ch["prev_price"])
-                })
-
-        # Sweep event
-        sweep_data = None
-        if sweep:
-            sidx = sweep["sweep_candle_idx"]
-            if sidx < len(ltf_data):
-                sweep_data = {
-                    "time": int(ltf_data.iloc[sidx]["timestamp"].timestamp()),
-                    "swept_level": float(sweep["swept_level"]),
-                    "sweep_wick": float(sweep.get("sweep_wick", sweep["swept_level"])),
-                    "type": sweep["sweep_type"],
-                    "quality": sweep.get("sweep_quality", 1.0)
-                }
-
-        # Premium/Discount bölgeleri
+        # Premium/Discount
         pd_data = None
-        if pd_zone:
+        pd_zone = analysis.get("pd_zone", {})
+        if pd_zone and pd_zone.get("equilibrium"):
+            range_high = float(pd_zone.get("range_high", 0))
+            range_low = float(pd_zone.get("range_low", 0))
+            dealing_range = range_high - range_low
             pd_data = {
-                "equilibrium": float(pd_zone["equilibrium"]),
-                "high": float(pd_zone["high"]),
-                "low": float(pd_zone["low"]),
-                "zone": pd_zone["zone"],
-                "in_ote": pd_zone.get("in_ote", False),
-                "ote_high": float(pd_zone.get("ote_high", 0)),
-                "ote_low": float(pd_zone.get("ote_low", 0))
+                "equilibrium": float(pd_zone.get("equilibrium", 0)),
+                "high": range_high,
+                "low": range_low,
+                "zone": pd_zone.get("zone", "NEUTRAL"),
             }
+            if dealing_range > 0:
+                pd_data["ote_high"] = range_low + dealing_range * 0.786
+                pd_data["ote_low"] = range_low + dealing_range * 0.618
 
         # Liquidity levels
+        liq = analysis.get("liquidity", {})
         liq_data = []
-        for liq in liquidity_levels:
-            liq_data.append({
-                "price": float(liq["price"]),
-                "type": liq["type"],
-                "touches": liq.get("touches", 2),
-                "swept": liq.get("swept", False)
+        for level in liq.get("eqh", []):
+            liq_data.append({"price": float(level.get("price", 0)), "type": "EQH", "touches": level.get("touches", 2)})
+        for level in liq.get("eql", []):
+            liq_data.append({"price": float(level.get("price", 0)), "type": "EQL", "touches": level.get("touches", 2)})
+
+        # POI zones
+        pois_data = []
+        for poi in analysis.get("pois", []):
+            pois_data.append({
+                "zone_low": float(poi.get("zone_low", 0)),
+                "zone_high": float(poi.get("zone_high", 0)),
+                "entry": float(poi.get("entry", 0)),
+                "sl": float(poi.get("sl", 0)),
+                "tp": float(poi.get("tp", 0)),
+                "rr": poi.get("rr", 0),
+                "confluence_count": poi.get("confluence_count", 0),
             })
 
-        # Breaker blocks
-        breaker_data = []
-        for bb in breaker_blocks:
-            if bb["index"] < len(ltf_data):
-                breaker_data.append({
-                    "time": int(ltf_data.iloc[bb["index"]]["timestamp"].timestamp()),
-                    "high": float(bb["high"]),
-                    "low": float(bb["low"]),
-                    "type": bb["type"]
-                })
+        # EMA serileri (grafik üstü çizgi)
+        ema_21_data = []
+        ema_50_data = []
+        if len(ltf_data) >= 50:
+            ema21 = ltf_data["close"].ewm(span=21, adjust=False).mean()
+            ema50 = ltf_data["close"].ewm(span=50, adjust=False).mean()
+            for i in range(49, len(ltf_data)):
+                t = int(ltf_data.iloc[i]["timestamp"].timestamp())
+                ema_21_data.append({"time": t, "value": round(float(ema21.iloc[i]), 6)})
+                ema_50_data.append({"time": t, "value": round(float(ema50.iloc[i]), 6)})
+
+        # LTF trend (15m structure)
+        ltf_trend = "NEUTRAL"
+        try:
+            sh_15, sl_15 = ict_strategy._find_swing_points(ltf_data, lookback=5)
+            struct_15 = ict_strategy._detect_structure(sh_15, sl_15)
+            if struct_15["bias"] == "LONG":
+                ltf_trend = "BULLISH" if struct_15["structure_quality"] == "STRONG" else "WEAK BULLISH"
+            elif struct_15["bias"] == "SHORT":
+                ltf_trend = "BEARISH" if struct_15["structure_quality"] == "STRONG" else "WEAK BEARISH"
+        except Exception:
+            pass
 
         result = {
             "symbol": symbol,
             "candles": candles,
-            "htf_bias": htf_bias,
-            "ltf_trend": structure.get("trend", "NEUTRAL"),
+            "htf_bias": narrative.get("bias", "NEUTRAL"),
+            "ltf_trend": ltf_trend,
+            "narrative": narrative,
             "swing_highs": swing_highs_data,
             "swing_lows": swing_lows_data,
             "order_blocks": obs_data,
             "fvgs": fvgs_data,
-            "displacements": disp_data,
-            "bos_events": bos_data,
-            "choch_events": choch_data,
-            "sweep": sweep_data,
             "premium_discount": pd_data,
             "liquidity_levels": liq_data,
-            "breaker_blocks": breaker_data,
+            "pois": pois_data,
             "active_signal": active_signal,
             "ema_21": ema_21_data,
             "ema_50": ema_50_data,
+            "atr": analysis.get("atr", 0),
             "current_price": float(ltf_data.iloc[-1]["close"]) if len(ltf_data) > 0 else None,
-            "market_structure_trend": structure.get("trend", "NEUTRAL"),
-            "structure_shift_count": len(structure.get("choch_events", [])),
-            "bos_count": len(structure.get("bos_events", []))
         }
 
         # numpy tiplerini Python native'e çevir
         def _serialize(obj):
-            if hasattr(obj, "item"):         # numpy scalar (int64, float64, bool_)
+            if hasattr(obj, "item"):
                 return obj.item()
-            if hasattr(obj, "isoformat"):     # datetime/Timestamp
+            if hasattr(obj, "isoformat"):
                 return obj.isoformat()
             return str(obj)
 
@@ -2006,7 +1974,7 @@ def api_coin_detail(symbol):
         # Her TF için gelişmiş analiz
         tf_results = {}
         for tf_key, tf_label in [("15m", "15 Dakika"), ("1H", "1 Saat"), ("4H", "4 Saat")]:
-            df_tf = multi_tf.get(tf_key)
+            df_tf = multi_tf.get(tf_key.lower())
             tf_results[tf_key] = _analyze_tf(df_tf, tf_label)
 
         # Ticker bilgisi

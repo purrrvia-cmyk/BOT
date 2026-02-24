@@ -1,31 +1,33 @@
 # =====================================================
-# ICT Trading Bot — SMC Parameter Optimizer v3.0
-# (Pure SMC — Boolean Gate Threshold Optimizer)
+# ICT Trading Bot — SMC Parameter Optimizer v4.0
+# (Narrative → POI → Trigger Threshold Optimizer)
 # =====================================================
 #
-# SIFIRDAN YAZILDI: Eski puanlama (scoring) ve retail
-# indikatör (RSI, MACD, EMA vb.) ağırlıkları SİLİNDİ.
+# v4.0 UYARLAMA: Gate sistemi kaldırıldı.
+# Yeni mimari: Narrative (4H yapı) → POI (OB+FVG+Likidite) → Trigger
 #
-# YENİ MANTIK:
+# MANTIK:
 #   Bot, veritabanındaki WON/LOST işlemleri analiz ederek
 #   ICT strateji motorundaki geometrik ve hacimsel eşikleri
 #   (threshold) otomatik optimize eder.
 #
 # OPTİMİZE EDİLEN PARAMETRELER:
 # ┌──────────────────────────────────┬────────────┬────────────────┐
-# │ Parametre                        │ Gate       │ Güvenli Aralık │
+# │ Parametre                        │ Katman     │ Güvenli Aralık │
 # ├──────────────────────────────────┼────────────┼────────────────┤
-# │ displacement_min_body_ratio      │ Gate 4     │ 0.40 – 0.75    │
-# │ displacement_min_size_pct        │ Gate 4     │ 0.001 – 0.005  │
-# │ displacement_atr_multiplier      │ Gate 4     │ 0.80 – 2.00    │
-# │ fvg_min_size_pct                 │ Gate 5     │ 0.0003 – 0.004 │
-# │ fvg_max_age_candles              │ Gate 5     │ 10 – 40        │
-# │ liquidity_equal_tolerance        │ Gate 3     │ 0.0003 – 0.003 │
-# │ ob_body_ratio_min                │ Yapısal    │ 0.25 – 0.65    │
-# │ ob_max_age_candles               │ Yapısal    │ 15 – 50        │
-# │ swing_lookback                   │ Gate 3     │ 3 – 8          │
-# │ default_sl_pct                   │ Risk       │ 0.006 – 0.025  │
-# │ default_tp_ratio                 │ Risk       │ 1.50 – 4.00    │
+# │ displacement_min_body_ratio      │ Trigger    │ 0.40 – 0.75    │
+# │ displacement_min_size_pct        │ Trigger    │ 0.002 – 0.010  │
+# │ displacement_atr_multiplier      │ Trigger    │ 1.00 – 2.50    │
+# │ bos_min_displacement             │ Narrative  │ 0.001 – 0.006  │
+# │ fvg_min_size_pct                 │ POI        │ 0.0003 – 0.004 │
+# │ fvg_max_age_candles              │ POI        │ 10 – 40        │
+# │ liquidity_equal_tolerance        │ POI        │ 0.0003 – 0.003 │
+# │ ob_body_ratio_min                │ POI        │ 0.25 – 0.65    │
+# │ ob_max_age_candles               │ POI        │ 15 – 50        │
+# │ swing_lookback                   │ Yapısal    │ 3 – 8          │
+# │ default_sl_pct                   │ Risk       │ 0.008 – 0.025  │
+# │ poi_max_distance_pct             │ POI        │ 0.005 – 0.020  │
+# │ min_rr_ratio                     │ Risk       │ 1.20 – 3.00    │
 # └──────────────────────────────────┴────────────┴────────────────┘
 #
 # ÖĞRENME ALGORİTMASI:
@@ -61,18 +63,24 @@ logger = logging.getLogger("ICT-Bot.Optimizer")
 
 class SelfOptimizer:
     """
-    SMC Parameter Optimizer v3.0 — Boolean Gate Threshold Optimizer.
+    SMC Parameter Optimizer v4.0 — Narrative → POI → Trigger Threshold Optimizer.
 
     WON/LOST işlem verilerinden öğrenerek ICT strateji motorunun
     geometrik ve hacimsel eşik değerlerini otomatik optimize eder.
 
-    Eski scoring/confidence/retail-indicator mantığı tamamen kaldırıldı.
-    Sadece SMC yapısal parametreleri optimize edilir.
+    v4.0: Gate sistemi kaldırıldı → 3 katmanlı bağlamsal mimari.
+    Perakende gösterge ve puanlama sıfır.
+
+    Optimize edilen katmanlar:
+      Trigger  → displacement kalitesi (body ratio, ATR mult, size)
+      Narrative → BOS kırılım hassasiyeti
+      POI      → FVG, OB, Likidite, confluence mesafe
+      Risk     → SL fallback, min RR
 
     Akış:
       1. Son kapanmış işlemleri çek (batch)
       2. WON ve LOST havuzlarını ayrıştır
-      3. Her parametre grubu için veri odaklı analiz yap
+      3. Her katman için veri odaklı analiz yap
       4. Eşik değerlerini küçük adımlarla ayarla
       5. Her değişikliği logla ve izle
     """
@@ -83,51 +91,58 @@ class SelfOptimizer:
     # ═══════════════════════════════════════════════════════════
 
     PARAM_REGISTRY = {
-        # ── Gate 4: Displacement Kalitesi ──
+        # ── Trigger Katmanı: Displacement Kalitesi ──
         "displacement_min_body_ratio": {
             "bounds": (0.40, 0.75),
-            "group": "displacement",
+            "group": "trigger",
             "desc": "Displacement mumunun minimum gövde/fitil oranı",
         },
         "displacement_min_size_pct": {
-            "bounds": (0.001, 0.005),
-            "group": "displacement",
+            "bounds": (0.002, 0.010),
+            "group": "trigger",
             "desc": "Minimum displacement boyutu (fiyatın %'si)",
         },
         "displacement_atr_multiplier": {
-            "bounds": (0.80, 2.00),
-            "group": "displacement",
+            "bounds": (1.00, 2.50),
+            "group": "trigger",
             "desc": "Displacement ATR çarpanı (şiddet ölçüsü)",
         },
 
-        # ── Gate 5: FVG Giriş Kalitesi ──
+        # ── Narrative Katmanı: Yapı Kırılımı ──
+        "bos_min_displacement": {
+            "bounds": (0.001, 0.006),
+            "group": "narrative",
+            "desc": "BOS için minimum kırılım oranı",
+        },
+
+        # ── POI Katmanı: FVG Kalitesi ──
         "fvg_min_size_pct": {
             "bounds": (0.0003, 0.004),
-            "group": "fvg",
+            "group": "poi",
             "desc": "Minimum FVG boyutu (fiyatın %'si)",
         },
         "fvg_max_age_candles": {
             "bounds": (10, 40),
-            "group": "fvg",
+            "group": "poi",
             "desc": "FVG geçerlilik süresi (mum sayısı)",
         },
 
-        # ── Gate 3: Likidite Sweep Hassasiyeti ──
+        # ── POI Katmanı: Likidite Sweep Hassasiyeti ──
         "liquidity_equal_tolerance": {
             "bounds": (0.0003, 0.003),
-            "group": "liquidity",
+            "group": "poi",
             "desc": "Equal high/low toleransı (milimetrik hassasiyet)",
         },
 
-        # ── Yapısal: Order Block & Swing ──
+        # ── POI Katmanı: Order Block & Swing ──
         "ob_body_ratio_min": {
             "bounds": (0.25, 0.65),
-            "group": "structural",
+            "group": "poi",
             "desc": "Order Block mumunun minimum gövde oranı",
         },
         "ob_max_age_candles": {
             "bounds": (15, 50),
-            "group": "structural",
+            "group": "poi",
             "desc": "Order Block geçerlilik süresi (mum sayısı)",
         },
         "swing_lookback": {
@@ -136,25 +151,32 @@ class SelfOptimizer:
             "desc": "Swing noktası tespiti bakış penceresi",
         },
 
-        # ── Risk: SL / TP Fallback Değerleri ──
+        # ── POI Katmanı: Confluence Mesafe ──
+        "poi_max_distance_pct": {
+            "bounds": (0.005, 0.020),
+            "group": "poi",
+            "desc": "POI bölgesine max uzaklık eşiği (%)",
+        },
+
+        # ── Risk: SL / RR ──
         "default_sl_pct": {
-            "bounds": (0.006, 0.025),
+            "bounds": (0.008, 0.025),
             "group": "risk",
             "desc": "Fallback SL yüzdesi (yapısal SL bulunamazsa)",
         },
-        "default_tp_ratio": {
-            "bounds": (1.50, 4.00),
+        "min_rr_ratio": {
+            "bounds": (1.20, 3.00),
             "group": "risk",
-            "desc": "TP/SL oranı (opposing liquidity bulunamazsa)",
+            "desc": "Minimum Risk:Reward oranı eşiği",
         },
     }
 
     GROUP_DESCRIPTIONS = {
-        "displacement": "Gate 4 — Displacement kalitesi ve momentum",
-        "fvg": "Gate 5 — FVG giriş noktası kalitesi",
-        "liquidity": "Gate 3 — Likidite sweep hassasiyeti",
-        "structural": "Yapısal — OB ve Swing noktası tespiti",
-        "risk": "Risk Yönetimi — SL/TP fallback değerleri",
+        "trigger": "Trigger Katmanı — Displacement kalitesi ve momentum",
+        "narrative": "Narrative Katmanı — 4H yapı analizi (BOS/CHoCH)",
+        "poi": "POI Katmanı — OB, FVG, Likidite confluence kalitesi",
+        "structural": "Yapısal — Swing noktası tespiti",
+        "risk": "Risk Yönetimi — SL ve RR eşikleri",
     }
 
     def __init__(self):
@@ -163,7 +185,7 @@ class SelfOptimizer:
         self.min_trades = OPTIMIZER_CONFIG.get("min_trades_for_optimization", 20)
         self.target_win_rate = OPTIMIZER_CONFIG.get("win_rate_target", 0.55)
         self._last_trade_count = 0
-        logger.info("SMC Parameter Optimizer v3.0 başlatıldı — Boolean Gate Threshold Optimizer")
+        logger.info("SMC Parameter Optimizer v4.0 başlatıldı — Narrative → POI → Trigger")
 
     # ═══════════════════════════════════════════════════════════
     #  BAŞLANGIÇ GÜVENLİK KONTROLÜ
@@ -217,14 +239,16 @@ class SelfOptimizer:
         Adımlar:
           1. Yeterli veri kontrolü (min 20 kapanmış işlem)
           2. WON/LOST havuzu oluştur + istatistikler hesapla
-          3. Displacement parametreleri optimize et (Gate 4)
-          4. FVG parametreleri optimize et (Gate 5)
-          5. Likidite parametreleri optimize et (Gate 3)
+          3. Displacement parametreleri optimize et (Trigger)
+          4. FVG parametreleri optimize et (POI)
+          5. Likidite parametreleri optimize et (POI)
           6. Yapısal parametreler optimize et (OB, swing)
-          7. Risk parametreleri optimize et (SL, TP)
-          8. Seans, HTF bias, entry mode bilgi analizi
+          7. Risk parametreleri optimize et (SL, RR)
+          8. POI confluence parametreleri optimize et
+          9. Narrative parametreleri optimize et
+          10. Seans, HTF bias bilgi analizi
         """
-        logger.info("🔄 SMC Optimizer v3.0 — Optimizasyon döngüsü başlatılıyor...")
+        logger.info("🔄 SMC Optimizer v4.0 — Optimizasyon döngüsü başlatılıyor...")
 
         stats = get_performance_summary()
         total_trades = stats["total_trades"]
@@ -266,17 +290,17 @@ class SelfOptimizer:
         # ═══ OPTİMİZASYON ADIMLARI ═══
         already_changed = {c["param"] for c in changes}
 
-        # 1. Displacement parametreleri (Gate 4)
+        # 1. Displacement parametreleri (Trigger katmanı)
         disp_changes = self._optimize_displacement(pool, stats, already_changed)
         changes.extend(disp_changes)
         already_changed.update(c["param"] for c in disp_changes)
 
-        # 2. FVG parametreleri (Gate 5)
+        # 2. FVG parametreleri (POI katmanı)
         fvg_changes = self._optimize_fvg(pool, stats, already_changed)
         changes.extend(fvg_changes)
         already_changed.update(c["param"] for c in fvg_changes)
 
-        # 3. Likidite parametreleri (Gate 3)
+        # 3. Likidite parametreleri (POI katmanı)
         liq_changes = self._optimize_liquidity(pool, stats, already_changed)
         changes.extend(liq_changes)
         already_changed.update(c["param"] for c in liq_changes)
@@ -286,14 +310,23 @@ class SelfOptimizer:
         changes.extend(struct_changes)
         already_changed.update(c["param"] for c in struct_changes)
 
-        # 5. Risk parametreleri (SL, TP)
+        # 5. Risk parametreleri (SL, RR)
         risk_changes = self._optimize_risk(pool, stats, already_changed)
         changes.extend(risk_changes)
+        already_changed.update(c["param"] for c in risk_changes)
 
-        # 6. Bilgi analizleri (parametre değiştirmez, sadece loglar)
+        # 6. POI confluence parametreleri
+        poi_changes = self._optimize_poi_confluence(pool, stats, already_changed)
+        changes.extend(poi_changes)
+        already_changed.update(c["param"] for c in poi_changes)
+
+        # 7. Narrative parametreleri (BOS hassasiyeti)
+        narr_changes = self._optimize_narrative(pool, stats, already_changed)
+        changes.extend(narr_changes)
+
+        # 8. Bilgi analizleri (parametre değiştirmez, sadece loglar)
         self._log_session_analysis(pool)
         self._log_htf_bias_analysis()
-        self._log_entry_mode_analysis()
 
         # ═══ SONUÇ ═══
         if changes:
@@ -393,7 +426,7 @@ class SelfOptimizer:
         }
 
     # ═══════════════════════════════════════════════════════════
-    #  1. DISPLACEMENT PARAMETRELERİ (Gate 4)
+    #  1. DISPLACEMENT PARAMETRELERİ (Trigger Katmanı)
     # ═══════════════════════════════════════════════════════════
 
     def _optimize_displacement(self, pool, stats, already_changed):
@@ -539,7 +572,7 @@ class SelfOptimizer:
         return changes
 
     # ═══════════════════════════════════════════════════════════
-    #  2. FVG PARAMETRELERİ (Gate 5)
+    #  2. FVG PARAMETRELERİ (POI Katmanı)
     # ═══════════════════════════════════════════════════════════
 
     def _optimize_fvg(self, pool, stats, already_changed):
@@ -557,7 +590,7 @@ class SelfOptimizer:
         │ RR iyi + WR iyi       │ fvg_min_size_pct ↓ (hafif)       │
         │                        │ → Daha fazla FVG yakala          │
         ├────────────────────────┼──────────────────────────────────┤
-        │ LIMIT WR < MARKET WR  │ fvg_max_age_candles ↓            │
+        │ WR düşük + veri var    │ fvg_max_age_candles ↓            │
         │                        │ → Eski FVG'ler güvenilmez        │
         └────────────────────────┴──────────────────────────────────┘
         """
@@ -610,31 +643,7 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            # LIMIT vs MARKET entry karşılaştırması
-            entry_perf = get_entry_mode_performance()
-            limit_data = entry_perf.get("LIMIT", {})
-            market_data = entry_perf.get("MARKET", {})
-
-            limit_wr = limit_data.get("win_rate", 0)
-            market_wr = market_data.get("win_rate", 0)
-            limit_total = limit_data.get("total", 0)
-            market_total = market_data.get("total", 0)
-
-            if limit_total >= 5 and market_total >= 5 and limit_wr < market_wr - 10:
-                # LIMIT (FVG entry) MARKET'ten çok daha kötü → eski FVG'ler bozulmuş
-                step = max(1, current * self.learning_rate)
-                new_val = current - step
-                reason = (
-                    f"LIMIT WR ({limit_wr:.0f}%) < MARKET WR ({market_wr:.0f}%), "
-                    f"fvg_max_age_candles {int(current)}'den "
-                    f"{max(int(new_val), self.PARAM_REGISTRY[param]['bounds'][0])}'e azaltıldı "
-                    f"(eski FVG'ler güvenilmez)"
-                )
-                change = self._apply_change(param, current, new_val, reason, stats)
-                if change:
-                    changes.append(change)
-
-            elif win_rate < 40 and pool["total"] >= 20:
+            if win_rate < 40 and pool["total"] >= 20:
                 # Genel WR düşük → eski FVG'leri kısıtla
                 step = max(1, current * self.learning_rate * 0.8)
                 new_val = current - step
@@ -650,7 +659,7 @@ class SelfOptimizer:
         return changes
 
     # ═══════════════════════════════════════════════════════════
-    #  3. LİKİDİTE PARAMETRELERİ (Gate 3)
+    #  3. LİKİDİTE PARAMETRELERİ (POI Katmanı)
     # ═══════════════════════════════════════════════════════════
 
     def _optimize_liquidity(self, pool, stats, already_changed):
@@ -721,7 +730,7 @@ class SelfOptimizer:
         """
         Order Block ve swing noktası parametrelerini optimize et.
 
-        Bu parametreler Gate'lere dolaylı bağlıdır — gate öncesi
+        Bu parametreler POI katmanına dolaylı bağlıdır — yapısal
         veri hazırlığının kalitesini belirler.
 
         Kararlar:
@@ -824,9 +833,9 @@ class SelfOptimizer:
 
     def _optimize_risk(self, pool, stats, already_changed):
         """
-        SL ve TP parametrelerini gerçekleşen trade sonuçlarından öğren.
+        SL ve min RR parametrelerini gerçekleşen trade sonuçlarından öğren.
 
-        NOT: v3.0'da SL = sweep wick extreme, TP = opposing liquidity.
+        NOT: v4.0'da SL = sweep wick extreme, TP = opposing liquidity.
         Bu parametreler sadece FALLBACK olarak kullanılır.
         Ama gerçekleşen RR ve kayıp büyüklüğünü izleyerek trend gösterir.
 
@@ -840,11 +849,11 @@ class SelfOptimizer:
         │ Ort kayıp > %2.5       │ default_sl_pct ↓                │
         │                         │ → SL çok geniş, daralt          │
         ├─────────────────────────┼─────────────────────────────────┤
-        │ Gerçek RR < 1.2 +      │ default_tp_ratio ↑              │
-        │ WR < %50                │ → TP hedefini yükselt           │
+        │ Gerçek RR < 1.2 +      │ min_rr_ratio ↓                  │
+        │ WR > %55                │ → Daha fazla setup yakala       │
         ├─────────────────────────┼─────────────────────────────────┤
-        │ RR > 3.0 + WR < %45    │ default_tp_ratio ↓              │
-        │                         │ → TP çok uzak, yakınlaştır      │
+        │ WR < %40 + RR < 1.5    │ min_rr_ratio ↑                  │
+        │                         │ → Kalite filtresi sıkılaştır    │
         └─────────────────────────┴─────────────────────────────────┘
         """
         changes = []
@@ -898,32 +907,165 @@ class SelfOptimizer:
                     changes.append(change)
 
         # ────────────────────────────────────────
-        # default_tp_ratio
+        # min_rr_ratio
         # ────────────────────────────────────────
-        param = "default_tp_ratio"
+        param = "min_rr_ratio"
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if realized_rr < 1.2 and win_rate < 50:
-                # RR çok düşük → TP hedefini yükselt
-                new_val = current + 0.1
+            if realized_rr < 1.2 and win_rate > 55:
+                # RR düşük ama WR iyi → min RR'yi hafif gevşet, daha fazla setup yakala
+                new_val = current - 0.1
                 reason = (
-                    f"Gerçek RR düşük ({realized_rr:.2f}) ve WR düşük ({win_rate:.1f}%), "
-                    f"default_tp_ratio {current:.1f}'den "
-                    f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.1f}'e artırıldı"
+                    f"Gerçek RR düşük ({realized_rr:.2f}) ama WR iyi ({win_rate:.1f}%), "
+                    f"min_rr_ratio {current:.2f}'den "
+                    f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.2f}'e gevşetildi "
+                    f"(daha fazla setup)"
                 )
                 change = self._apply_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif realized_rr > 3.0 and win_rate < 45:
-                # RR yüksek ama WR düşük → TP çok uzak, ulaşılamıyor
-                new_val = current - 0.1
+            elif win_rate < 40 and realized_rr < 1.5:
+                # Hem WR hem RR düşük → kalite filtresi sıkılaştır
+                new_val = current + 0.15
                 reason = (
-                    f"RR yüksek ({realized_rr:.2f}) ama WR düşük ({win_rate:.1f}%), "
-                    f"default_tp_ratio {current:.1f}'den "
-                    f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.1f}'e "
-                    f"yakınlaştırıldı (ulaşılabilir TP)"
+                    f"WR düşük ({win_rate:.1f}%) ve RR düşük ({realized_rr:.2f}), "
+                    f"min_rr_ratio {current:.2f}'den "
+                    f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.2f}'e "
+                    f"artırıldı (kalite filtresi)"
+                )
+                change = self._apply_change(param, current, new_val, reason, stats)
+                if change:
+                    changes.append(change)
+
+        return changes
+
+    # ═══════════════════════════════════════════════════════════
+    #  6. POI CONFLUENCE PARAMETRELERİ
+    # ═══════════════════════════════════════════════════════════
+
+    def _optimize_poi_confluence(self, pool, stats, already_changed):
+        """
+        POI bölgesi ile fiyat arasındaki mesafe eşiğini optimize et.
+
+        poi_max_distance_pct: Fiyatın POI bölgesine ne kadar yakın
+        olması gerektiğini belirler. Düşük değer = daha hassas,
+        yüksek değer = daha geniş yakalama alanı.
+
+        Kararlar:
+        ┌─────────────────────────┬─────────────────────────────────┐
+        │ Durum                   │ Aksiyon                         │
+        ├─────────────────────────┼─────────────────────────────────┤
+        │ WR < %40 + hızlı kayıp │ poi_max_distance_pct ↓          │
+        │ > %40                   │ → POI'ye daha yakın giriş       │
+        ├─────────────────────────┼─────────────────────────────────┤
+        │ WR > %60 + az işlem    │ poi_max_distance_pct ↑ (hafif)  │
+        │ (göreceli)              │ → Daha fazla setup yakala       │
+        └─────────────────────────┴─────────────────────────────────┘
+        """
+        changes = []
+
+        if pool["total"] < self.min_trades:
+            return changes
+
+        win_rate = pool["win_rate"]
+        quick_loss_ratio = pool["quick_loss_ratio"]
+        realized_rr = pool["realized_rr"]
+
+        param = "poi_max_distance_pct"
+        if param not in already_changed:
+            current = get_bot_param(param, ICT_PARAMS[param])
+
+            if win_rate < 40 and quick_loss_ratio > 0.40:
+                # POI'den uzak girişler hızlı kayıp veriyor → mesafeyi daralt
+                step = current * self.learning_rate
+                new_val = current - step
+                reason = (
+                    f"WR düşük ({win_rate:.1f}%) ve hızlı kayıp yüksek ({quick_loss_ratio:.0%}), "
+                    f"poi_max_distance_pct {current:.4f}'den "
+                    f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.4f}'e "
+                    f"daraltıldı (POI'ye daha yakın giriş)"
+                )
+                change = self._apply_change(param, current, new_val, reason, stats)
+                if change:
+                    changes.append(change)
+
+            elif win_rate > 60 and realized_rr > 2.0 and pool["total"] < 30:
+                # İyi WR + iyi RR ama az işlem → hafif genişlet
+                step = current * self.learning_rate * 0.5
+                new_val = current + step
+                reason = (
+                    f"WR iyi ({win_rate:.1f}%) ve RR iyi ({realized_rr:.2f}) ama az işlem, "
+                    f"poi_max_distance_pct {current:.4f}'den "
+                    f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.4f}'e "
+                    f"gevşetildi (daha fazla setup)"
+                )
+                change = self._apply_change(param, current, new_val, reason, stats)
+                if change:
+                    changes.append(change)
+
+        return changes
+
+    # ═══════════════════════════════════════════════════════════
+    #  7. NARRATIVE PARAMETRELERİ (BOS Hassasiyeti)
+    # ═══════════════════════════════════════════════════════════
+
+    def _optimize_narrative(self, pool, stats, already_changed):
+        """
+        BOS (Break of Structure) kırılım hassasiyetini optimize et.
+
+        bos_min_displacement: 4H yapısal kırılımın minimum displacement
+        büyüklüğü. Düşük → daha fazla BOS algılanır (daha fazla sinyal),
+        yüksek → sadece güçlü kırılımlar sayılır (daha az ama kaliteli).
+
+        Kararlar:
+        ┌─────────────────────────┬─────────────────────────────────┐
+        │ Durum                   │ Aksiyon                         │
+        ├─────────────────────────┼─────────────────────────────────┤
+        │ WR < %40 + hızlı       │ bos_min_displacement ↑          │
+        │ kayıp yüksek            │ → Sahte BOS'ları filtrele       │
+        ├─────────────────────────┼─────────────────────────────────┤
+        │ WR > %65 + az işlem    │ bos_min_displacement ↓ (hafif)  │
+        │                         │ → Daha fazla narrative yakala   │
+        └─────────────────────────┴─────────────────────────────────┘
+        """
+        changes = []
+
+        if pool["total"] < self.min_trades:
+            return changes
+
+        win_rate = pool["win_rate"]
+        quick_loss_ratio = pool["quick_loss_ratio"]
+        avg_loss = pool["avg_loss_pnl"]
+
+        param = "bos_min_displacement"
+        if param not in already_changed:
+            current = get_bot_param(param, ICT_PARAMS[param])
+
+            if win_rate < 40 and quick_loss_ratio > 0.35:
+                # Yanlış narrative → yanlış yön → hızlı kayıp
+                step = current * self.learning_rate * 1.5
+                new_val = current + step
+                reason = (
+                    f"WR düşük ({win_rate:.1f}%) ve hızlı kayıp yüksek ({quick_loss_ratio:.0%}), "
+                    f"bos_min_displacement {current:.4f}'den "
+                    f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.4f}'e "
+                    f"artırıldı (sahte BOS filtresi)"
+                )
+                change = self._apply_change(param, current, new_val, reason, stats)
+                if change:
+                    changes.append(change)
+
+            elif win_rate > 65 and pool["total"] < 25:
+                # İyi WR ama az işlem → BOS hassasiyetini hafif gevşet
+                step = current * self.learning_rate * 0.5
+                new_val = current - step
+                reason = (
+                    f"WR iyi ({win_rate:.1f}%) ama az işlem ({pool['total']}), "
+                    f"bos_min_displacement {current:.4f}'den "
+                    f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.4f}'e "
+                    f"gevşetildi (daha fazla narrative)"
                 )
                 change = self._apply_change(param, current, new_val, reason, stats)
                 if change:
@@ -1048,21 +1190,10 @@ class SelfOptimizer:
 
     def _log_entry_mode_analysis(self):
         """
-        LIMIT vs MARKET giriş mode performans karşılaştırması.
-
-        FVG limit entry mi yoksa market entry mi daha karlı?
-        Parametre değiştirmez.
+        v4.0: MARKET-only — entry mode karşılaştırması artık geçersiz.
+        Geriye uyumluluk için boş bırakıldı, çağrılmaz.
         """
-        perf = get_entry_mode_performance()
-        if not perf:
-            return
-
-        logger.info("📊 ─── Entry Mode Performans Raporu ───")
-        for mode, data in perf.items():
-            logger.info(
-                f"   {mode}: {data['total']} işlem, "
-                f"WR={data['win_rate']}%, avgPnL={data['avg_pnl']}%"
-            )
+        pass
 
     # ═══════════════════════════════════════════════════════════
     #  YARDIMCI METODLAR
@@ -1207,14 +1338,13 @@ class SelfOptimizer:
 
         Endpoint: GET /api/optimization/summary
 
-        Geriye uyumlu alanlar korundu + yeni v3.0 alanları eklendi:
+        Geriye uyumlu alanlar korundu + v4.0 alanları eklendi:
         - optimizer_version, param_groups, realized_rr
         - changed_params artık bounds ve group bilgisi içerir
         """
         stats = get_performance_summary()
         all_params = get_all_bot_params()
         loss_info = get_loss_analysis(30)
-        entry_mode_perf = get_entry_mode_performance()
         htf_accuracy = get_htf_bias_accuracy()
 
         # ── Varsayılandan değişen parametreleri bul ──
@@ -1271,7 +1401,7 @@ class SelfOptimizer:
         )
 
         return {
-            "optimizer_version": "3.0 — SMC Threshold Optimizer",
+            "optimizer_version": "4.0 — Narrative → POI → Trigger Threshold Optimizer",
             "total_optimizations": len(changed_params),
             "current_win_rate": stats["win_rate"],
             "target_win_rate": self.target_win_rate * 100,
@@ -1282,7 +1412,6 @@ class SelfOptimizer:
             "changed_params": changed_params,
             "performance": stats,
             "loss_lessons": loss_info.get("lesson_summary", []),
-            "entry_mode_performance": entry_mode_perf,
             "htf_bias_accuracy": htf_accuracy,
             "param_groups": self.GROUP_DESCRIPTIONS,
             "optimizable_params": {

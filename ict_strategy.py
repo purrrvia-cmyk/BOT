@@ -1,46 +1,51 @@
 # =====================================================
-# ICT Trading Bot — Pure SMC Strategy Engine v3.0
+# ICT Trading Bot — Pure SMC Strategy Engine v4.0
 # =====================================================
 #
-# SIFIRDAN YAZILDI: Saf ICT / Smart Money Concepts
+# SIFIRDAN YAZILDI: Narrative → POI → Trigger mimarisi
 #
-# KURALLAR:
-#   - Perakende gösterge YOK (RSI, MACD, EMA, SMA, Bollinger, ADX vb.)
+# v3.x'ten FARKLAR:
+#   - 5 sıralı gate YOK → Bağlamsal (contextual) analiz
+#   - Mum sayısı bekleme YOK → Fiyat POI'ye geldiğinde tetiklenir
+#   - LIMIT emir YOK → MARKET giriş (trigger anında)
+#   - Perakende gösterge YOK (RSI, MACD, EMA, SMA, Bollinger, ADX)
 #   - Puanlama / Scoring sistemi YOK
-#   - Minimum R:R kısıtlaması YOK
-#   - Tamamen Boolean (Evet / Hayır) kapı sistemi
+#   - Tamamen Boolean (Evet / Hayır) mantık
 #
-# 5 ZORUNLU AŞAMA (hepsi geçmeli, yoksa None döner):
+# MİMARİ (3 Katman):
 #
-#   GATE 1 — Seans Bilgisi (Kripto 7/24 - Bypass)
-#       Kripto piyasaları 7/24 aktif.
-#       Killzone kontrolü YOK (forex killzone'ları kripto'da anlamsız).
-#       Seans bilgisi sadece loglama için tutulur.
+#   KATMAN 1 — NARRATIVE (Hikaye)
+#       4H yapı analizi → LONG / SHORT / NÖTR
+#       Draw on Liquidity hedefi (fiyat nereye çekilecek?)
+#       Daily ile uyum kontrolü
 #
-#   GATE 2 — HTF Bias + Premium / Discount
-#       4H (veya 1H fallback) dealing range.
-#       Bullish bias → sadece LONG, fiyat Discount'ta (< %50).
-#       Bearish bias → sadece SHORT, fiyat Premium'da (> %50).
+#   KATMAN 2 — POI TESPİTİ (Points of Interest)
+#       OB + FVG + Likidite çakışma bölgeleri
+#       Yolda engel taraması (karşı OB, FVG, psikolojik seviye)
+#       RR ön hesaplaması (engeller dahil)
 #
-#   GATE 3 — Liquidity Sweep
-#       15m swing high / low FİTİL ile süpürülmeli (body close ile DEĞİL).
-#       Gövde geri kapanmalı (rejection). Wick:body oranı kontrol edilir.
+#   KATMAN 3 — TRIGGER (Tetik)
+#       Fiyat POI'ye yaklaştığında:
+#         a) Sweep + rejection (mum KAPANIŞI ile doğrulanır)
+#         b) MSS (micro structure shift — CHoCH)
+#         c) 2-3 ardışık displacement mumu (tek dev mum = GİRME)
+#       Trigger → anında SIGNAL döner → trade_manager MARKET giriş yapar
 #
-#   GATE 4 — Hacim Destekli Displacement + MSS
-#       Sweep sonrası bias yönünde güçlü gövdeli mum.
-#       GÖVDE kapanışı yapıyı kırar (fitil DEĞİL).
-#       Hacim > 20-bar ortalama.
+# FAKE WICK KORUMALARI:
+#   - Mum kapanışı doğru tarafta mı? (sweep seviyesinin ters tarafı)
+#   - Tek mum > 3x ATR → anormal → BEKLEyin
+#   - Body/wick oranı rejection mi gösteriyor?
 #
-#   GATE 5 — FVG Giriş + SL / TP
-#       Giriş: FVG CE (Consequent Encroachment — orta nokta) limit emir.
-#       SL: Sweep fitil (wick) uç noktası.
-#       TP: Karşı taraftaki likidite havuzu (min RR 1.0).
+# ENGEL TARAMASI:
+#   - TP yolunda karşı OB, FVG, psikolojik seviye (round number)
+#   - Engel yakınsa → TP öne çekilir veya trade reddedilir
 #
 # =====================================================
 
 import logging
 import numpy as np
 from datetime import datetime, timezone
+from typing import Optional, Dict, List, Any, Tuple
 
 from config import ICT_PARAMS
 from database import get_bot_param
@@ -48,21 +53,29 @@ from database import get_bot_param
 logger = logging.getLogger("ICT-Bot.Strategy")
 
 
-class ICTStrategy:
-    """Saf ICT / Smart Money Concepts strateji motoru — Boolean kapı sistemi."""
+# ═════════════════════════════════════════════════════
+#  ANA SINIF
+# ═════════════════════════════════════════════════════
 
-    # Integer olması gereken parametreler (DB'den float gelir)
+class ICTStrategy:
+    """
+    Saf ICT / Smart Money Concepts v4.0 — Narrative → POI → Trigger.
+    
+    Perakende gösterge SIFIR. Puanlama SIFIR. Boolean mantık.
+    """
+
     _INT_PARAMS = {
         "swing_lookback", "ob_max_age_candles", "fvg_max_age_candles",
         "liquidity_min_touches", "max_concurrent_trades",
         "max_same_direction_trades", "signal_cooldown_minutes",
-        "patience_watch_candles",
     }
 
     def __init__(self):
         self.params = {}
         self._load_params()
-        logger.info("ICTStrategy v3.1 başlatıldı — Kripto 24/7 Boolean Gate Protocol")
+        # Aktif POI listesi (coin bazında)
+        self._active_pois: Dict[str, List[Dict]] = {}
+        logger.info("ICTStrategy v4.0 başlatıldı — Narrative → POI → Trigger Protocol")
 
     def _load_params(self):
         for key, default in ICT_PARAMS.items():
@@ -76,1539 +89,1464 @@ class ICTStrategy:
         logger.info("ICT parametreleri yeniden yüklendi")
 
     # =================================================================
-    #  BÖLÜM 1 — SEANS / KİLLZONE BİLGİSİ
+    #  BÖLÜM 1 — YARDIMCI FONKSİYONLAR
     # =================================================================
 
-    def get_session_info(self):
-        """
-        UTC saatine göre seans bilgisi döndürür.
-
-        Kripto 7/24 işlem görür — tüm seanslar geçerlidir.
-        Killzone kalitesi sadece pozisyon güvenini etkiler,
-        sinyal üretimini ENGELLEMEZ.
-
-        Killzone tanımları (UTC):
-          London Open : 07:00 – 10:00  (en yüksek kalite)
-          NY Open     : 12:00 – 15:00  (en yüksek kalite)
-          Asia        : 00:00 – 06:00  (kripto'da aktif)
-          Transition  : 10:00 – 12:00  (geçiş dönemi)
-          London Close: 15:00 – 17:00  (orta kalite)
-          Off-Peak    : 17:00 – 00:00  (düşük kalite ama geçerli)
-        """
-        now_utc = datetime.now(timezone.utc)
-        hour = now_utc.hour
-        weekday = now_utc.weekday()  # 0=Pazartesi, 5=Cumartesi, 6=Pazar
-
-        is_weekend = weekday >= 5
-
-        # Kripto 7/24 — tüm seanslar geçerli, kalite farklı
-        if 7 <= hour < 10:
-            label = "London Open Killzone"
-            quality = 1.0
-        elif 12 <= hour < 15:
-            label = "NY Open Killzone"
-            quality = 1.0
-        elif 0 <= hour < 6:
-            label = "Asian Session"
-            quality = 0.7
-        elif 10 <= hour < 12:
-            label = "London-NY Transition"
-            quality = 0.8
-        elif 15 <= hour < 17:
-            label = "London Close"
-            quality = 0.6
-        else:
-            label = "Off-Peak"
-            quality = 0.5
-
-        # Kripto'da hafta sonu da geçerli (kalite düşer)
-        if is_weekend:
-            quality *= 0.7
-
-        # ★ Kripto 7/24: is_valid_killzone daima True
-        is_valid_killzone = True
-
-        return {
-            "label": label,
-            "hour_utc": hour,
-            "quality": quality,
-            "is_weekend": is_weekend,
-            "is_valid_killzone": is_valid_killzone,
-            "weekday": weekday,
-        }
-
-    # =================================================================
-    #  BÖLÜM 2 — ATR HESAPLAMA
-    # =================================================================
-
-    def _calc_atr(self, df, period=14):
-        """Average True Range hesapla."""
-        if len(df) < period + 1:
-            return 0
-        high = df["high"].values
-        low = df["low"].values
-        close = df["close"].values
-        tr = np.maximum(
-            high[1:] - low[1:],
-            np.maximum(
-                np.abs(high[1:] - close[:-1]),
-                np.abs(low[1:] - close[:-1]),
-            ),
-        )
-        if len(tr) < period:
-            return float(np.mean(tr)) if len(tr) > 0 else 0
-        return float(np.mean(tr[-period:]))
-
-    # =================================================================
-    #  BÖLÜM 3 — RANGING MARKET TESPİTİ
-    # =================================================================
-
-    def detect_ranging_market(self, df, lookback=30):
-        """
-        Piyasanın yatay (ranging) olup olmadığını tespit et.
-        Efficiency Ratio + ATR-normalize range kullanır.
-        """
-        if len(df) < lookback:
-            return False
-        subset = df.tail(lookback)
-        price_change = abs(subset["close"].iloc[-1] - subset["close"].iloc[0])
-        path_sum = (subset["high"] - subset["low"]).sum()
-        if path_sum <= 0:
-            return False
-        efficiency_ratio = price_change / path_sum
-
-        atr = self._calc_atr(df, 14)
-        mid_price = subset["close"].mean()
-        if mid_price <= 0:
-            return False
-        total_range = subset["high"].max() - subset["low"].min()
-        atr_normalized_range = total_range / mid_price
-
-        # Düşük efficiency + dar range = yatay piyasa
-        is_ranging = efficiency_ratio < 0.15 and atr_normalized_range < 0.04
-        return is_ranging
-
-    # =================================================================
-    #  BÖLÜM 4 — SWING POINT TESPİTİ
-    # =================================================================
-
-    def find_swing_points(self, df):
-        """
-        Fractal-tabanlı swing high ve swing low tespiti.
-        Major (5-bar) + internal (3-bar) fractal kullanır.
-        """
-        lookback = self.params.get("swing_lookback", 5)
-        n = len(df)
-        swing_highs = []
-        swing_lows = []
-
-        if n < lookback * 2 + 1:
-            return swing_highs, swing_lows
-
+    def _calc_atr(self, df, period: int = 14) -> float:
+        """ATR (Average True Range) — volatilite ölçümü."""
+        if df is None or len(df) < period + 1:
+            return 0.0
         highs = df["high"].values
         lows = df["low"].values
+        closes = df["close"].values
+        tr = np.maximum(
+            highs[1:] - lows[1:],
+            np.maximum(
+                np.abs(highs[1:] - closes[:-1]),
+                np.abs(lows[1:] - closes[:-1])
+            )
+        )
+        if len(tr) < period:
+            return float(np.mean(tr)) if len(tr) > 0 else 0.0
+        return float(np.mean(tr[-period:]))
 
-        # Major fractals (5-bar)
-        for i in range(lookback, n - lookback):
-            # Swing High: orta mum en yüksek
-            if all(highs[i] > highs[i - j] for j in range(1, lookback + 1)) and \
-               all(highs[i] > highs[i + j] for j in range(1, lookback + 1)):
+    def _find_swing_points(self, df, lookback: int = 5) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Swing High ve Swing Low noktalarını bul.
+        
+        Fractal yöntemi: bir mum, sol ve sağ komşularının hepsinden
+        yüksek (swing high) veya düşük (swing low) ise swing noktası sayılır.
+        
+        Lookback=5: Her iki tarafta 5 mum kontrol (toplam 11 mum pencere).
+        """
+        if df is None or len(df) < lookback * 2 + 1:
+            return [], []
+
+        swing_highs = []
+        swing_lows = []
+        highs = df["high"].values
+        lows = df["low"].values
+        
+        for i in range(lookback, len(df) - lookback):
+            # Swing High: tüm komşulardan yüksek
+            is_high = True
+            for j in range(1, lookback + 1):
+                if highs[i] <= highs[i - j] or highs[i] <= highs[i + j]:
+                    is_high = False
+                    break
+            if is_high:
                 swing_highs.append({
                     "index": i,
                     "price": float(highs[i]),
-                    "fractal_type": "MAJOR",
-                    "timestamp": df.iloc[i].get("timestamp", ""),
+                    "timestamp": str(df.iloc[i].get("timestamp", "")),
                 })
 
-            # Swing Low: orta mum en düşük
-            if all(lows[i] < lows[i - j] for j in range(1, lookback + 1)) and \
-               all(lows[i] < lows[i + j] for j in range(1, lookback + 1)):
+            # Swing Low: tüm komşulardan düşük
+            is_low = True
+            for j in range(1, lookback + 1):
+                if lows[i] >= lows[i - j] or lows[i] >= lows[i + j]:
+                    is_low = False
+                    break
+            if is_low:
                 swing_lows.append({
                     "index": i,
                     "price": float(lows[i]),
-                    "fractal_type": "MAJOR",
-                    "timestamp": df.iloc[i].get("timestamp", ""),
+                    "timestamp": str(df.iloc[i].get("timestamp", "")),
                 })
 
-        # Internal fractals (3-bar) — sadece major eksikse
-        if len(swing_highs) < 2 or len(swing_lows) < 2:
-            for i in range(2, n - 2):
-                if highs[i] > highs[i - 1] and highs[i] > highs[i + 1] and \
-                   highs[i] > highs[i - 2] and highs[i] > highs[i + 2]:
-                    # Major ile çakışma kontrolü
-                    if not any(abs(sh["index"] - i) <= 2 for sh in swing_highs):
-                        swing_highs.append({
-                            "index": i,
-                            "price": float(highs[i]),
-                            "fractal_type": "INTERNAL",
-                            "timestamp": df.iloc[i].get("timestamp", ""),
-                        })
-                if lows[i] < lows[i - 1] and lows[i] < lows[i + 1] and \
-                   lows[i] < lows[i - 2] and lows[i] < lows[i + 2]:
-                    if not any(abs(sl["index"] - i) <= 2 for sl in swing_lows):
-                        swing_lows.append({
-                            "index": i,
-                            "price": float(lows[i]),
-                            "fractal_type": "INTERNAL",
-                            "timestamp": df.iloc[i].get("timestamp", ""),
-                        })
-
-        swing_highs.sort(key=lambda x: x["index"])
-        swing_lows.sort(key=lambda x: x["index"])
         return swing_highs, swing_lows
 
-    # =================================================================
-    #  BÖLÜM 5 — MARKET STRUCTURE (BOS / CHoCH)
-    # =================================================================
-
-    def detect_market_structure(self, df):
+    def _detect_structure(self, swing_highs: List[Dict], swing_lows: List[Dict]) -> Dict:
         """
-        Break of Structure (BOS) ve Change of Character (CHoCH) tespiti.
+        Market Structure analizi — BOS ve CHoCH tespiti.
+        
+        Bullish structure:
+          - Higher High (HH) + Higher Low (HL)
+          - BOS = son swing high'ın body ile kırılması
+          
+        Bearish structure:
+          - Lower Low (LL) + Lower High (LH)
+          - BOS = son swing low'un body ile kırılması
+          
+        CHoCH (Change of Character):
+          - Bullish trend'de ilk Lower Low = Bearish CHoCH
+          - Bearish trend'de ilk Higher High = Bullish CHoCH
+          - CHoCH = trend dönüşü sinyali
+        
+        Returns:
+            {"bias": "LONG"/"SHORT"/"NEUTRAL", 
+             "bos_count": int, "choch_detected": bool,
+             "last_bos_price": float, "last_swing_high": float,
+             "last_swing_low": float, "structure_quality": "STRONG"/"WEAK"/"NEUTRAL"}
         """
-        swing_highs, swing_lows = self.find_swing_points(df)
-        bos_events = []
-        choch_events = []
-        current_trend = "NEUTRAL"
-        last_bos_dir = None
-
-        min_disp = self.params.get("bos_min_displacement", 0.003)
-        n = len(df)
-
-        # Higher Highs / Lower Lows analizi
-        for i in range(1, len(swing_highs)):
-            prev = swing_highs[i - 1]
-            curr = swing_highs[i]
-            if curr["index"] >= n:
-                continue
-            close_at_break = df.iloc[min(curr["index"], n - 1)]["close"]
-            displacement = (close_at_break - prev["price"]) / prev["price"] if prev["price"] > 0 else 0
-
-            if curr["price"] > prev["price"] and displacement >= min_disp:
-                if last_bos_dir == "BEARISH":
-                    choch_events.append({
-                        "index": curr["index"],
-                        "type": "BULLISH_CHOCH",
-                        "price": curr["price"],
-                        "prev_price": prev["price"],
-                    })
-                else:
-                    bos_events.append({
-                        "index": curr["index"],
-                        "type": "BULLISH_BOS",
-                        "price": curr["price"],
-                        "prev_price": prev["price"],
-                    })
-                last_bos_dir = "BULLISH"
-
-        for i in range(1, len(swing_lows)):
-            prev = swing_lows[i - 1]
-            curr = swing_lows[i]
-            if curr["index"] >= n:
-                continue
-            close_at_break = df.iloc[min(curr["index"], n - 1)]["close"]
-            displacement = (prev["price"] - close_at_break) / prev["price"] if prev["price"] > 0 else 0
-
-            if curr["price"] < prev["price"] and displacement >= min_disp:
-                if last_bos_dir == "BULLISH":
-                    choch_events.append({
-                        "index": curr["index"],
-                        "type": "BEARISH_CHOCH",
-                        "price": curr["price"],
-                        "prev_price": prev["price"],
-                    })
-                else:
-                    bos_events.append({
-                        "index": curr["index"],
-                        "type": "BEARISH_BOS",
-                        "price": curr["price"],
-                        "prev_price": prev["price"],
-                    })
-                last_bos_dir = "BEARISH"
-
-        # Trend belirleme
-        bullish_bos = sum(1 for b in bos_events if b["type"] == "BULLISH_BOS")
-        bearish_bos = sum(1 for b in bos_events if b["type"] == "BEARISH_BOS")
-
-        recent_events = (bos_events + choch_events)
-        recent_events.sort(key=lambda x: x["index"])
-        last_events = recent_events[-3:] if recent_events else []
-
-        if last_events:
-            last = last_events[-1]
-            if "BULLISH" in last["type"]:
-                current_trend = "BULLISH"
-            elif "BEARISH" in last["type"]:
-                current_trend = "BEARISH"
-        elif bullish_bos > bearish_bos:
-            current_trend = "BULLISH"
-        elif bearish_bos > bullish_bos:
-            current_trend = "BEARISH"
-
-        # WEAKENING tespiti
-        if current_trend == "BULLISH" and choch_events:
-            last_choch = [c for c in choch_events if "BEARISH" in c["type"]]
-            last_bullish_bos = [b for b in bos_events if "BULLISH" in b["type"]]
-            if last_choch and last_bullish_bos:
-                if last_choch[-1]["index"] > last_bullish_bos[-1]["index"]:
-                    current_trend = "WEAKENING_BULL"
-        elif current_trend == "BEARISH" and choch_events:
-            last_choch = [c for c in choch_events if "BULLISH" in c["type"]]
-            last_bearish_bos = [b for b in bos_events if "BEARISH" in b["type"]]
-            if last_choch and last_bearish_bos:
-                if last_choch[-1]["index"] > last_bearish_bos[-1]["index"]:
-                    current_trend = "WEAKENING_BEAR"
-
-        # Son swing noktaları
-        last_swing_high = swing_highs[-1] if swing_highs else None
-        last_swing_low = swing_lows[-1] if swing_lows else None
-
-        return {
-            "trend": current_trend,
-            "swing_highs": swing_highs,
-            "swing_lows": swing_lows,
-            "bos_events": bos_events,
-            "choch_events": choch_events,
-            "last_swing_high": last_swing_high,
-            "last_swing_low": last_swing_low,
+        result = {
+            "bias": "NEUTRAL",
+            "bos_count": 0,
+            "choch_detected": False,
+            "last_bos_price": 0.0,
+            "last_swing_high": 0.0,
+            "last_swing_low": 0.0,
+            "structure_quality": "NEUTRAL",
         }
 
-    # =================================================================
-    #  BÖLÜM 6 — ORDER BLOCK TESPİTİ
-    # =================================================================
+        if len(swing_highs) < 2 or len(swing_lows) < 2:
+            return result
 
-    def find_order_blocks(self, df, structure=None):
-        """
-        Order Block tespiti — mitigation kontrolü ile.
-        """
-        if structure is None:
-            structure = self.detect_market_structure(df)
+        # Son swing noktalarını zamana göre sırala
+        sh = sorted(swing_highs, key=lambda x: x["index"])
+        sl = sorted(swing_lows, key=lambda x: x["index"])
 
-        n = len(df)
-        max_age = self.params.get("ob_max_age_candles", 30)
+        result["last_swing_high"] = sh[-1]["price"]
+        result["last_swing_low"] = sl[-1]["price"]
+
+        # Son 8 swing noktasını analiz et
+        all_swings = []
+        for s in sh:
+            all_swings.append({"type": "high", **s})
+        for s in sl:
+            all_swings.append({"type": "low", **s})
+        all_swings.sort(key=lambda x: x["index"])
+
+        recent = all_swings[-8:] if len(all_swings) >= 8 else all_swings
+
+        # HH/HL/LH/LL dizisi
+        hh_count = 0
+        hl_count = 0
+        ll_count = 0
+        lh_count = 0
+
+        prev_highs = [s for s in recent if s["type"] == "high"]
+        prev_lows = [s for s in recent if s["type"] == "low"]
+
+        for i in range(1, len(prev_highs)):
+            if prev_highs[i]["price"] > prev_highs[i-1]["price"]:
+                hh_count += 1
+            elif prev_highs[i]["price"] < prev_highs[i-1]["price"]:
+                lh_count += 1
+
+        for i in range(1, len(prev_lows)):
+            if prev_lows[i]["price"] > prev_lows[i-1]["price"]:
+                hl_count += 1
+            elif prev_lows[i]["price"] < prev_lows[i-1]["price"]:
+                ll_count += 1
+
+        # Bias belirleme
+        bull_score = hh_count + hl_count
+        bear_score = ll_count + lh_count
+
+        if bull_score >= 2 and bull_score > bear_score:
+            result["bias"] = "LONG"
+            result["bos_count"] = hh_count
+            if bull_score >= 3:
+                result["structure_quality"] = "STRONG"
+            else:
+                result["structure_quality"] = "WEAK"
+        elif bear_score >= 2 and bear_score > bull_score:
+            result["bias"] = "SHORT"
+            result["bos_count"] = ll_count
+            if bear_score >= 3:
+                result["structure_quality"] = "STRONG"
+            else:
+                result["structure_quality"] = "WEAK"
+
+        # CHoCH tespiti: son swing'de trend kırıldı mı?
+        # NOT: CHoCH bias'ı NEUTRAL yapmaz, sadece kaliteyi düşürür
+        # Çünkü tek bir geri çekilme tüm yapıyı geçersiz kılmamalı
+        if len(prev_highs) >= 2 and len(prev_lows) >= 2:
+            if result["bias"] == "LONG" and prev_lows[-1]["price"] < prev_lows[-2]["price"]:
+                result["choch_detected"] = True
+                result["structure_quality"] = "WEAK"  # bias korunur, kalite düşer
+            elif result["bias"] == "SHORT" and prev_highs[-1]["price"] > prev_highs[-2]["price"]:
+                result["choch_detected"] = True
+                result["structure_quality"] = "WEAK"  # bias korunur, kalite düşer
+
+        # BOS price
+        if result["bias"] == "LONG" and len(prev_highs) >= 2:
+            result["last_bos_price"] = prev_highs[-2]["price"]
+        elif result["bias"] == "SHORT" and len(prev_lows) >= 2:
+            result["last_bos_price"] = prev_lows[-2]["price"]
+
+        return result
+
+    def _find_order_blocks(self, df, bias: str, max_age: int = 30) -> List[Dict]:
+        """
+        Order Block tespiti — kurumsal alım/satım bölgeleri.
+        
+        Bullish OB: Son düşüş mumundan SONRA güçlü yükseliş (sweep bölgesinde)
+                    → O düşüş mumunun range'i = Bullish OB (destek bölgesi)
+        Bearish OB: Son yükseliş mumundan SONRA güçlü düşüş
+                    → O yükseliş mumunun range'i = Bearish OB (direnç bölgesi)
+        
+        Mitigation kontrolü: OB daha önce test edildiyse → geçersiz.
+        """
+        if df is None or len(df) < 10:
+            return []
+
+        obs = []
+        opens = df["open"].values
+        closes = df["close"].values
+        highs = df["high"].values
+        lows = df["low"].values
+        
+        start_idx = max(0, len(df) - max_age)
         min_body_ratio = self.params.get("ob_body_ratio_min", 0.4)
-        current_price = df["close"].iloc[-1]
-        active_obs = []
-        all_obs = []
 
-        bos_indices = set()
-        for event in structure["bos_events"] + structure["choch_events"]:
-            bos_indices.add(event["index"])
-
-        search_start = max(0, n - max_age - 10)
-        for i in range(search_start, n - 1):
-            candle = df.iloc[i]
-            body = abs(candle["close"] - candle["open"])
-            total_range = candle["high"] - candle["low"]
-            if total_range <= 0:
+        for i in range(start_idx + 1, len(df) - 1):
+            body = abs(closes[i] - opens[i])
+            total_range = highs[i] - lows[i]
+            if total_range == 0:
                 continue
             body_ratio = body / total_range
-            if body_ratio < min_body_ratio:
-                continue
 
-            age = n - 1 - i
-            is_bullish_ob = candle["close"] < candle["open"]
-            is_bearish_ob = candle["close"] > candle["open"]
+            # Sonraki mum analizi
+            next_body = abs(closes[i+1] - opens[i+1])
+            next_range = highs[i+1] - lows[i+1]
+            next_body_ratio = (next_body / next_range) if next_range > 0 else 0
 
-            # Sonrasında BOS/CHoCH var mı?
-            has_structure_break = any(idx > i for idx in bos_indices)
-            if not has_structure_break and age > 5:
-                continue
+            curr_bullish = closes[i] > opens[i]
+            curr_bearish = closes[i] < opens[i]
 
-            ob_dict = {
-                "index": i,
-                "high": float(candle["high"]),
-                "low": float(candle["low"]),
-                "type": "BULLISH_OB" if is_bullish_ob else "BEARISH_OB",
-                "strength": round(body_ratio, 3),
-                "age": age,
-                "timestamp": candle.get("timestamp", ""),
-            }
-            all_obs.append(ob_dict)
+            # Bullish OB: bearish mum → sonrasında güçlü bullish displacement
+            if bias in ("LONG", "NEUTRAL") and curr_bearish and body_ratio >= min_body_ratio:
+                if closes[i+1] > opens[i+1] and next_body_ratio >= 0.5:
+                    if closes[i+1] > highs[i]:
+                        mitigated = False
+                        for j in range(i + 2, len(df)):
+                            if lows[j] <= lows[i]:
+                                mitigated = True
+                                break
+                        if not mitigated:
+                            obs.append({
+                                "type": "BULLISH",
+                                "high": float(highs[i]),
+                                "low": float(lows[i]),
+                                "ce": float((highs[i] + lows[i]) / 2),
+                                "index": i,
+                                "age": len(df) - 1 - i,
+                                "mitigated": False,
+                            })
 
-            # Mitigation kontrolü (fiyat OB'ye ulaştı mı?)
-            mitigated = False
-            for j in range(i + 1, n):
-                if is_bullish_ob:
-                    if df.iloc[j]["low"] <= candle["low"]:
-                        mitigated = True
-                        break
-                elif is_bearish_ob:
-                    if df.iloc[j]["high"] >= candle["high"]:
-                        mitigated = True
-                        break
+            # Bearish OB: bullish mum → sonrasında güçlü bearish displacement
+            if bias in ("SHORT", "NEUTRAL") and curr_bullish and body_ratio >= min_body_ratio:
+                if closes[i+1] < opens[i+1] and next_body_ratio >= 0.5:
+                    if closes[i+1] < lows[i]:
+                        mitigated = False
+                        for j in range(i + 2, len(df)):
+                            if highs[j] >= highs[i]:
+                                mitigated = True
+                                break
+                        if not mitigated:
+                            obs.append({
+                                "type": "BEARISH",
+                                "high": float(highs[i]),
+                                "low": float(lows[i]),
+                                "ce": float((highs[i] + lows[i]) / 2),
+                                "index": i,
+                                "age": len(df) - 1 - i,
+                                "mitigated": False,
+                            })
 
-            if not mitigated and age <= max_age:
-                active_obs.append(ob_dict)
+        return obs
 
-        return active_obs, all_obs
-
-    # =================================================================
-    #  BÖLÜM 7 — BREAKER BLOCK TESPİTİ
-    # =================================================================
-
-    def find_breaker_blocks(self, all_obs, df):
-        """Mitigate edilmiş OB → Breaker Block'a dönüşür."""
-        breaker_blocks = []
-        n = len(df)
-
-        for ob in all_obs:
-            idx = ob["index"]
-            if idx >= n - 2:
-                continue
-
-            mitigated = False
-            for j in range(idx + 1, n):
-                if ob["type"] == "BULLISH_OB" and df.iloc[j]["low"] <= ob["low"]:
-                    mitigated = True
-                    break
-                elif ob["type"] == "BEARISH_OB" and df.iloc[j]["high"] >= ob["high"]:
-                    mitigated = True
-                    break
-
-            if mitigated:
-                bb_type = "BULLISH_BREAKER" if ob["type"] == "BEARISH_OB" else "BEARISH_BREAKER"
-                breaker_blocks.append({
-                    "index": ob["index"],
-                    "high": ob["high"],
-                    "low": ob["low"],
-                    "type": bb_type,
-                })
-
-        return breaker_blocks
-
-    # =================================================================
-    #  BÖLÜM 8 — FAIR VALUE GAP (FVG)
-    # =================================================================
-
-    def find_fvg(self, df):
+    def _find_fvg(self, df, max_age: int = 20) -> List[Dict]:
         """
-        3-mum FVG tespiti.
-        Bullish FVG: prev.high < next.low (yukarı gap)
-        Bearish FVG: prev.low > next.high (aşağı gap)
+        Fair Value Gap (FVG) tespiti — 3 mumlu boşluk.
+        
+        Bullish FVG: mum[i-1].high < mum[i+1].low → arada boşluk
+        Bearish FVG: mum[i-1].low > mum[i+1].high → arada boşluk
+        
+        CE (Consequent Encroachment) = FVG'nin %50 seviyesi (optimal entry).
+        
+        Mitigation: Fiyat FVG'ye ulaştıysa = partially/fully mitigated.
         """
+        if df is None or len(df) < 5:
+            return []
+
         fvgs = []
-        min_size = self.params.get("fvg_min_size_pct", 0.001)
-        max_age = self.params.get("fvg_max_age_candles", 20)
-        n = len(df)
+        highs = df["high"].values
+        lows = df["low"].values
+        closes = df["close"].values
+        min_size_pct = self.params.get("fvg_min_size_pct", 0.001)
+        start_idx = max(1, len(df) - max_age - 1)
 
-        search_start = max(1, n - max_age - 5)
-        for i in range(search_start, n - 1):
-            if i < 1:
-                continue
-            prev = df.iloc[i - 1]
-            curr = df.iloc[i]
-            next_ = df.iloc[i + 1]
-            mid = curr["close"]
-            if mid <= 0:
+        for i in range(start_idx, len(df) - 1):
+            price_ref = closes[i]
+            if price_ref == 0:
                 continue
 
             # Bullish FVG
-            if prev["high"] < next_["low"]:
-                gap = next_["low"] - prev["high"]
-                if gap / mid >= min_size:
-                    # CE (Consequent Encroachment) tabanlı fill kontrolü
-                    ce = prev["high"] + gap / 2
-                    filled = False
-                    if i + 2 < n and len(df.iloc[i + 2:]) > 0:
-                        filled = df.iloc[i + 2:]["low"].min() <= ce
-                    if not filled:
+            if highs[i-1] < lows[i+1]:
+                gap_size = lows[i+1] - highs[i-1]
+                if gap_size / price_ref >= min_size_pct:
+                    fvg_high = float(lows[i+1])
+                    fvg_low = float(highs[i-1])
+                    ce = (fvg_high + fvg_low) / 2
+
+                    mitigated = "FRESH"
+                    for j in range(i + 2, len(df)):
+                        if lows[j] <= fvg_low:
+                            mitigated = "FULL"
+                            break
+                        elif lows[j] <= ce:
+                            mitigated = "PARTIAL"
+
+                    if mitigated != "FULL":
                         fvgs.append({
-                            "type": "BULLISH_FVG",
+                            "type": "BULLISH",
+                            "high": fvg_high,
+                            "low": fvg_low,
+                            "ce": float(ce),
                             "index": i,
-                            "high": float(next_["low"]),
-                            "low": float(prev["high"]),
-                            "size_pct": round((gap / mid) * 100, 4),
-                            "timestamp": curr.get("timestamp", ""),
+                            "age": len(df) - 1 - i,
+                            "mitigated": mitigated,
+                            "size_pct": float(gap_size / price_ref),
                         })
 
             # Bearish FVG
-            if prev["low"] > next_["high"]:
-                gap = prev["low"] - next_["high"]
-                if gap / mid >= min_size:
-                    ce = next_["high"] + gap / 2
-                    filled = False
-                    if i + 2 < n and len(df.iloc[i + 2:]) > 0:
-                        filled = df.iloc[i + 2:]["high"].max() >= ce
-                    if not filled:
+            if lows[i-1] > highs[i+1]:
+                gap_size = lows[i-1] - highs[i+1]
+                if gap_size / price_ref >= min_size_pct:
+                    fvg_high = float(lows[i-1])
+                    fvg_low = float(highs[i+1])
+                    ce = (fvg_high + fvg_low) / 2
+
+                    mitigated = "FRESH"
+                    for j in range(i + 2, len(df)):
+                        if highs[j] >= fvg_high:
+                            mitigated = "FULL"
+                            break
+                        elif highs[j] >= ce:
+                            mitigated = "PARTIAL"
+
+                    if mitigated != "FULL":
                         fvgs.append({
-                            "type": "BEARISH_FVG",
+                            "type": "BEARISH",
+                            "high": fvg_high,
+                            "low": fvg_low,
+                            "ce": float(ce),
                             "index": i,
-                            "high": float(prev["low"]),
-                            "low": float(next_["high"]),
-                            "size_pct": round((gap / mid) * 100, 4),
-                            "timestamp": curr.get("timestamp", ""),
+                            "age": len(df) - 1 - i,
+                            "mitigated": mitigated,
+                            "size_pct": float(gap_size / price_ref),
                         })
 
         return fvgs
 
-    # =================================================================
-    #  BÖLÜM 9 — LİKİDİTE SEVİYELERİ (Equal Highs / Lows)
-    # =================================================================
-
-    def find_liquidity_levels(self, df):
+    def _find_liquidity_pools(self, swing_highs: List[Dict], swing_lows: List[Dict],
+                               current_price: float) -> Dict:
         """
-        Eşit dipli / eşit tepeli likidite havuzları.
+        Likidite havuzları — EQH, EQL, Swing H/L.
+        
+        Eşit zirveler/dipler = stop-loss yoğunlaşma bölgesi.
+        Kurumlar bu bölgeleri hedef alır (likidite avı).
         """
-        swing_highs, swing_lows = self.find_swing_points(df)
         tolerance = self.params.get("liquidity_equal_tolerance", 0.001)
-        min_touches = self.params.get("liquidity_min_touches", 2)
-        n = len(df)
-        levels = []
+        result = {"bsl": [], "ssl": [], "nearest_bsl": 0.0, "nearest_ssl": 0.0}
 
-        # Equal Highs (BSL — Buy-Side Liquidity)
-        for i in range(len(swing_highs)):
-            touches = 1
-            for j in range(i + 1, len(swing_highs)):
-                if abs(swing_highs[j]["price"] - swing_highs[i]["price"]) / swing_highs[i]["price"] <= tolerance:
-                    touches += 1
-            if touches >= min_touches:
-                swept = False
-                level_price = swing_highs[i]["price"]
-                for k in range(swing_highs[i]["index"] + 1, n):
-                    if df.iloc[k]["high"] > level_price * (1 + tolerance):
-                        swept = True
-                        break
-                # Tekrar kontrolü
-                if not any(abs(l["price"] - level_price) / level_price <= tolerance * 2
-                           for l in levels if l["type"] == "EQUAL_HIGHS"):
-                    levels.append({
-                        "type": "EQUAL_HIGHS",
-                        "price": float(level_price),
-                        "touches": touches,
-                        "swept": swept,
-                    })
+        if not swing_highs or not swing_lows or current_price == 0:
+            return result
 
-        # Equal Lows (SSL — Sell-Side Liquidity)
-        for i in range(len(swing_lows)):
-            touches = 1
-            for j in range(i + 1, len(swing_lows)):
-                if abs(swing_lows[j]["price"] - swing_lows[i]["price"]) / swing_lows[i]["price"] <= tolerance:
-                    touches += 1
-            if touches >= min_touches:
-                swept = False
-                level_price = swing_lows[i]["price"]
-                for k in range(swing_lows[i]["index"] + 1, n):
-                    if df.iloc[k]["low"] < level_price * (1 - tolerance):
-                        swept = True
-                        break
-                if not any(abs(l["price"] - level_price) / level_price <= tolerance * 2
-                           for l in levels if l["type"] == "EQUAL_LOWS"):
-                    levels.append({
-                        "type": "EQUAL_LOWS",
-                        "price": float(level_price),
-                        "touches": touches,
-                        "swept": swept,
-                    })
-
-        return levels
-
-    # =================================================================
-    #  BÖLÜM 10 — DISPLACEMENT TESPİTİ
-    # =================================================================
-
-    def detect_displacement(self, df, lookback=30):
-        """
-        Güçlü tek yönlü mum hareketi tespiti.
-        ATR-normalized + hacim oranı.
-        """
-        displacements = []
-        n = len(df)
-        start = max(1, n - lookback)
-        atr = self._calc_atr(df, 14)
-        min_body_ratio = self.params.get("displacement_min_body_ratio", 0.5)
-        min_size_pct = self.params.get("displacement_min_size_pct", 0.002)
-        atr_mult = self.params.get("displacement_atr_multiplier", 1.2)
-
-        # Hacim ortalamasını hesapla
-        vol_series = df["volume"].values if "volume" in df.columns else None
-        avg_vol = float(np.mean(vol_series[max(0, n - 20):n])) if vol_series is not None and n > 0 else 0
-
-        for i in range(start, n):
-            candle = df.iloc[i]
-            body = abs(candle["close"] - candle["open"])
-            total_range = candle["high"] - candle["low"]
-            mid_price = (candle["high"] + candle["low"]) / 2
-            if total_range <= 0 or mid_price <= 0:
-                continue
-
-            body_ratio = body / total_range
-            is_disp = body_ratio >= min_body_ratio and (
-                (atr > 0 and body >= atr * atr_mult) or
-                (body / mid_price >= min_size_pct)
-            )
-
-            if is_disp:
-                direction = "BULLISH" if candle["close"] > candle["open"] else "BEARISH"
-                vol_ratio = float(candle.get("volume", 0) / avg_vol) if avg_vol > 0 else 1.0
-                displacements.append({
-                    "index": i,
-                    "direction": direction,
-                    "body_ratio": round(body_ratio, 3),
-                    "size_pct": round((body / mid_price) * 100, 3),
-                    "atr_multiple": round(body / atr, 2) if atr > 0 else 0,
-                    "volume_ratio": round(vol_ratio, 2),
+        # BSL: Fiyatın ÜZERİNDEKİ likidite havuzları
+        for sh in swing_highs:
+            price = sh["price"]
+            if price > current_price:
+                eq_count = sum(1 for s in swing_highs
+                               if abs(s["price"] - price) / price <= tolerance
+                               and s["index"] != sh["index"])
+                result["bsl"].append({
+                    "price": price,
+                    "type": "EQH" if eq_count >= 1 else "SWING_HIGH",
+                    "strength": min(eq_count + 1, 5),
                 })
 
-        return displacements
+        # SSL: Fiyatın ALTINDAKİ likidite havuzları
+        for sl_point in swing_lows:
+            price = sl_point["price"]
+            if price < current_price:
+                eq_count = sum(1 for s in swing_lows
+                               if abs(s["price"] - price) / price <= tolerance
+                               and s["index"] != sl_point["index"])
+                result["ssl"].append({
+                    "price": price,
+                    "type": "EQL" if eq_count >= 1 else "SWING_LOW",
+                    "strength": min(eq_count + 1, 5),
+                })
 
-    # =================================================================
-    #  BÖLÜM 11 — PREMIUM / DISCOUNT BÖLGE
-    # =================================================================
+        # En yakın hedefler
+        if result["bsl"]:
+            result["bsl"].sort(key=lambda x: x["price"])
+            result["nearest_bsl"] = result["bsl"][0]["price"]
+        if result["ssl"]:
+            result["ssl"].sort(key=lambda x: -x["price"])
+            result["nearest_ssl"] = result["ssl"][0]["price"]
 
-    def calculate_premium_discount(self, df, structure=None):
+        return result
+
+    def _calculate_premium_discount(self, swing_highs: List[Dict],
+                                      swing_lows: List[Dict],
+                                      current_price: float) -> Dict:
         """
-        Dealing range'in premium / discount bölgesini hesapla.
-
-        Equilibrium = %50 seviyesi.
-        Premium = üst %50 (SHORT bölgesi).
-        Discount = alt %50 (LONG bölgesi).
+        Premium / Discount Zone hesaplaması.
+        
+        Dealing Range = Son swing high ile son swing low arasındaki alan.
+        %50 seviyesi (Equilibrium) = (high + low) / 2
+        
+        Discount Zone (< %50): LONG için uygun
+        Premium Zone (> %50): SHORT için uygun
+        
+        OTE (Optimal Trade Entry): Fib 0.618 — 0.786 bölgesi
         """
-        if structure is None:
-            structure = self.detect_market_structure(df)
+        if not swing_highs or not swing_lows:
+            return {"zone": "NEUTRAL", "pct": 50.0, "equilibrium": 0.0,
+                    "range_high": 0.0, "range_low": 0.0, "in_ote": False}
 
-        sh = structure.get("last_swing_high")
-        sl_ = structure.get("last_swing_low")
-        if not sh or not sl_:
-            return None
+        range_high = max(s["price"] for s in swing_highs)
+        range_low = min(s["price"] for s in swing_lows)
+        dealing_range = range_high - range_low
 
-        range_high = sh["price"]
-        range_low = sl_["price"]
-        if range_high <= range_low:
-            return None
+        if dealing_range <= 0:
+            return {"zone": "NEUTRAL", "pct": 50.0, "equilibrium": 0.0,
+                    "range_high": range_high, "range_low": range_low, "in_ote": False}
 
         equilibrium = (range_high + range_low) / 2
-        current_price = df["close"].iloc[-1]
+        position_pct = ((current_price - range_low) / dealing_range) * 100
 
-        # Premium level (%0 = range low, %100 = range high)
-        premium_level = ((current_price - range_low) / (range_high - range_low)) * 100
-        premium_level = max(0, min(100, premium_level))
+        # OTE (Fibonacci 0.618 — 0.786 — LONG için dealing range'in altından)
+        # LONG OTE: fiyat range_low + 21.4% ile range_low + 38.2% arasında
+        # SHORT OTE: fiyat range_high - 21.4% ile range_high - 38.2% arasında
+        ote_long_low = range_low + dealing_range * (1 - 0.786)
+        ote_long_high = range_low + dealing_range * (1 - 0.618)
+        ote_short_low = range_low + dealing_range * 0.618
+        ote_short_high = range_low + dealing_range * 0.786
 
-        if premium_level > 50:
-            zone = "PREMIUM"
-        elif premium_level < 50:
+        in_ote_long = ote_long_low <= current_price <= ote_long_high
+        in_ote_short = ote_short_low <= current_price <= ote_short_high
+
+        # Zone belirleme
+        if position_pct <= 30:
+            zone = "DEEP_DISCOUNT"
+        elif position_pct <= 50:
             zone = "DISCOUNT"
+        elif position_pct >= 70:
+            zone = "DEEP_PREMIUM"
+        elif position_pct >= 50:
+            zone = "PREMIUM"
         else:
-            zone = "EQUILIBRIUM"
-
-        # OTE bölgeleri
-        ote_high = range_low + (range_high - range_low) * 0.79
-        ote_low = range_low + (range_high - range_low) * 0.62
+            zone = "NEUTRAL"
 
         return {
-            "equilibrium": float(equilibrium),
-            "high": float(range_high),
-            "low": float(range_low),
             "zone": zone,
-            "premium_level": round(premium_level, 1),
-            "in_ote": ote_low <= current_price <= ote_high,
-            "in_ote_long": range_low <= current_price <= ote_low,
-            "in_ote_short": ote_high <= current_price <= range_high,
-            "ote_high": float(ote_high),
-            "ote_low": float(ote_low),
+            "pct": round(position_pct, 1),
+            "equilibrium": float(equilibrium),
+            "range_high": float(range_high),
+            "range_low": float(range_low),
+            "in_ote": in_ote_long or in_ote_short,
+            "in_ote_long": in_ote_long,
+            "in_ote_short": in_ote_short,
         }
 
-    # =================================================================
-    #  BÖLÜM 12 — HTF BIAS (4H Yapısal Analiz)
-    # =================================================================
-
-    def _analyze_htf_bias(self, multi_tf_data):
+    def _detect_sweep(self, df, swing_highs: List[Dict], swing_lows: List[Dict],
+                       bias: str, lookback: int = 30) -> Optional[Dict]:
         """
-        4H zaman diliminde yapısal trend → HTF Bias.
-
-        4H NEUTRAL ise 1H'e fallback yapar.
-        Bias, dealing range'in hangi tarafında olduğumuzu belirler.
-
-        Returns: {"bias": "LONG"|"SHORT"|None, "htf_trend": str, ...}
-                 veya None
+        Likidite Süpürme (Stop Hunt) tespiti.
+        
+        ICT'nin kalbi: Kurumlar stop-loss emirlerini tetiklemek için
+        fiyatı eski swing noktalarının ötesine iter, sonra asıl yöne döner.
+        
+        FAKE WICK KORUMASI:
+        - Mum KAPANIŞI sweep seviyesinin doğru tarafında olmalı
+        - Wick > body * 0.5 (rejection işareti)
         """
-        if not multi_tf_data:
+        if df is None or len(df) < 5:
             return None
 
-        # 4H tercih, NEUTRAL ise 1H'e düş
-        bias = None
-        htf_df = None
-        htf_label = None
-        structure = None
-        trend = None
+        highs = df["high"].values
+        lows = df["low"].values
+        opens = df["open"].values
+        closes = df["close"].values
 
-        for tf in ["4H", "1H"]:
-            candidate = multi_tf_data.get(tf)
-            if candidate is None or candidate.empty or len(candidate) < 20:
-                continue
-
-            s = self.detect_market_structure(candidate)
-            t = s["trend"]
-
-            # Bias belirleme
-            b = None
-            if t == "BULLISH":
-                b = "LONG"
-            elif t == "BEARISH":
-                b = "SHORT"
-            elif t == "WEAKENING_BEAR":
-                b = "LONG"
-            elif t == "WEAKENING_BULL":
-                b = "SHORT"
-            # NEUTRAL → b remains None, try next TF
-
-            if b is not None:
-                bias = b
-                htf_df = candidate
-                htf_label = tf
-                structure = s
-                trend = t
-                break
-
-        if bias is None or htf_df is None:
-            return None  # Her iki TF'de de NEUTRAL → işlem yok
-
-        # HTF Premium/Discount
-        htf_pd = self.calculate_premium_discount(htf_df, structure)
-
-        # HTF likidite seviyeleri
-        htf_liquidity = self.find_liquidity_levels(htf_df)
-
-        return {
-            "bias": bias,
-            "htf_trend": trend,
-            "timeframe": htf_label,
-            "structure": structure,
-            "htf_pd": htf_pd,
-            "liquidity": htf_liquidity,
-        }
-
-    # =================================================================
-    #  BÖLÜM 13 — GATE 3: LİKİDİTE SWEEP TESPİTİ
-    # =================================================================
-
-    def _find_sweep_event(self, df, bias):
-        """
-        Likidite avı (sweep) tespiti.
-
-        LONG: Fiyat swing low'un ALTINA iner (fitil veya gövde) ve sonra toparlanır.
-        SHORT: Fiyat swing high'ın ÜSTÜNE çıkar (fitil veya gövde) ve sonra düşer.
-
-        Kripto piyasasına uygun gevşek kontroller:
-          1. Fiyat seviyeyi geçer (fitil VEYA gövde)
-          2. Sonraki mumlardan birinde geri kapanış olmalı
-          3. Wick ratio minimum %10
-        """
-        swing_highs, swing_lows = self.find_swing_points(df)
-        n = len(df)
-        max_lookback = 50  # Son 50 mum içinde sweep aranır
-
-        all_sweeps = []
+        recent_start = max(0, len(df) - lookback)
+        best_sweep = None
 
         if bias == "LONG":
-            for sl_point in reversed(swing_lows[-10:]):  # Son 10 swing low
-                sl_idx = sl_point["index"]
-                sl_price = sl_point["price"]
-
-                for i in range(max(sl_idx + 1, n - max_lookback), n):
-                    candle = df.iloc[i]
-
-                    # Sweep: low < swing low
-                    if candle["low"] >= sl_price:
-                        continue
-
-                    # Rejection: ya bu mumun gövdesi yukarıda ya da sonraki mum yukarıda
-                    body_low = min(candle["open"], candle["close"])
-                    rejected = body_low >= sl_price
-                    if not rejected and i + 1 < n:
-                        next_close = df.iloc[i + 1]["close"]
-                        rejected = next_close > sl_price
-                    if not rejected and i + 2 < n:
-                        next2_close = df.iloc[i + 2]["close"]
-                        rejected = next2_close > sl_price
-
-                    if not rejected:
-                        continue
-
-                    total_range = candle["high"] - candle["low"]
-                    if total_range <= 0:
-                        continue
-                    lower_wick = min(candle["open"], candle["close"]) - candle["low"]
-                    wick_ratio = max(lower_wick / total_range, 0.1)
-
-                    sweep_depth = (sl_price - candle["low"]) / sl_price
-
-                    all_sweeps.append({
-                        "type": "SSL_SWEEP",
-                        "sweep_type": "SSL_SWEEP",
-                        "swept_level": float(sl_price),
-                        "sweep_low": float(candle["low"]),
-                        "sweep_wick": float(candle["low"]),
-                        "sweep_candle_idx": i,
-                        "wick_ratio": round(wick_ratio, 3),
-                        "sweep_quality": round(wick_ratio, 2),
-                        "sweep_depth_pct": round(sweep_depth * 100, 3),
-                        "swing_index": sl_idx,
-                        "fractal_type": sl_point.get("fractal_type", ""),
-                    })
-                    break
+            for sl_point in swing_lows:
+                level = sl_point["price"]
+                for i in range(recent_start, len(df)):
+                    # Fitil seviyenin altına inmiş ama mum üstünde kapanmış
+                    if lows[i] < level and closes[i] > level:
+                        body = abs(closes[i] - opens[i])
+                        lower_wick = min(opens[i], closes[i]) - lows[i]
+                        
+                        if lower_wick > body * 0.5:
+                            sweep_depth = (level - lows[i]) / level
+                            
+                            if best_sweep is None or i > best_sweep["index"]:
+                                best_sweep = {
+                                    "direction": "LONG",
+                                    "level": float(level),
+                                    "sweep_price": float(lows[i]),
+                                    "rejection_close": float(closes[i]),
+                                    "sweep_depth_pct": float(sweep_depth * 100),
+                                    "wick_body_ratio": float(lower_wick / body) if body > 0 else 999,
+                                    "index": i,
+                                    "candles_ago": len(df) - 1 - i,
+                                }
 
         elif bias == "SHORT":
-            for sh_point in reversed(swing_highs[-10:]):  # Son 10 swing high
-                sh_idx = sh_point["index"]
-                sh_price = sh_point["price"]
+            for sh_point in swing_highs:
+                level = sh_point["price"]
+                for i in range(recent_start, len(df)):
+                    if highs[i] > level and closes[i] < level:
+                        body = abs(closes[i] - opens[i])
+                        upper_wick = highs[i] - max(opens[i], closes[i])
 
-                for i in range(max(sh_idx + 1, n - max_lookback), n):
-                    candle = df.iloc[i]
+                        if upper_wick > body * 0.5:
+                            sweep_depth = (highs[i] - level) / level
 
-                    if candle["high"] <= sh_price:
-                        continue
+                            if best_sweep is None or i > best_sweep["index"]:
+                                best_sweep = {
+                                    "direction": "SHORT",
+                                    "level": float(level),
+                                    "sweep_price": float(highs[i]),
+                                    "rejection_close": float(closes[i]),
+                                    "sweep_depth_pct": float(sweep_depth * 100),
+                                    "wick_body_ratio": float(upper_wick / body) if body > 0 else 999,
+                                    "index": i,
+                                    "candles_ago": len(df) - 1 - i,
+                                }
 
-                    body_high = max(candle["open"], candle["close"])
-                    rejected = body_high <= sh_price
-                    if not rejected and i + 1 < n:
-                        next_close = df.iloc[i + 1]["close"]
-                        rejected = next_close < sh_price
-                    if not rejected and i + 2 < n:
-                        next2_close = df.iloc[i + 2]["close"]
-                        rejected = next2_close < sh_price
+        return best_sweep
 
-                    if not rejected:
-                        continue
-
-                    total_range = candle["high"] - candle["low"]
-                    if total_range <= 0:
-                        continue
-                    upper_wick = candle["high"] - max(candle["open"], candle["close"])
-                    wick_ratio = max(upper_wick / total_range, 0.1)
-
-                    sweep_depth = (candle["high"] - sh_price) / sh_price
-
-                    all_sweeps.append({
-                        "type": "BSL_SWEEP",
-                        "sweep_type": "BSL_SWEEP",
-                        "swept_level": float(sh_price),
-                        "sweep_high": float(candle["high"]),
-                        "sweep_wick": float(candle["high"]),
-                        "sweep_candle_idx": i,
-                        "wick_ratio": round(wick_ratio, 3),
-                        "sweep_quality": round(wick_ratio, 2),
-                        "sweep_depth_pct": round(sweep_depth * 100, 3),
-                        "swing_index": sh_idx,
-                        "fractal_type": sh_point.get("fractal_type", ""),
-                    })
-                    break
-
-        if not all_sweeps:
+    def _detect_mss(self, df, bias: str, after_index: int = 0) -> Optional[Dict]:
+        """
+        MSS (Market Structure Shift) — Micro CHoCH tespiti.
+        
+        15m'de küçük yapı kırılımı. Sweep sonrası yön değişiminin ilk işareti.
+        
+        LONG MSS: Son micro swing high'ın body ile kırılması
+        SHORT MSS: Son micro swing low'un body ile kırılması
+        """
+        if df is None or len(df) < 10:
             return None
 
-        # Kalite + tazelik dengesi: %60 tazelik, %40 kalite (wick_ratio)
-        n = len(df)
-        best = max(all_sweeps, key=lambda s: (s["sweep_candle_idx"] / n) * 0.6 + s["wick_ratio"] * 0.4)
-        return best
+        micro_highs, micro_lows = self._find_swing_points(df, lookback=3)
 
-    # =================================================================
-    #  BÖLÜM 14 — GATE 4: HACİM DESTEKLİ DISPLACEMENT + MSS
-    # =================================================================
+        if bias == "LONG":
+            relevant_highs = [s for s in micro_highs if s["index"] >= after_index]
+            if not relevant_highs:
+                return None
+            
+            target = relevant_highs[-1]
+            for i in range(target["index"] + 1, len(df)):
+                close_val = float(df.iloc[i]["close"])
+                if close_val > target["price"]:
+                    return {
+                        "direction": "LONG",
+                        "break_price": target["price"],
+                        "confirm_close": close_val,
+                        "index": i,
+                        "candles_ago": len(df) - 1 - i,
+                    }
 
-    def _find_post_sweep_confirmation(self, df, sweep, bias):
+        elif bias == "SHORT":
+            relevant_lows = [s for s in micro_lows if s["index"] >= after_index]
+            if not relevant_lows:
+                return None
+            
+            target = relevant_lows[-1]
+            for i in range(target["index"] + 1, len(df)):
+                close_val = float(df.iloc[i]["close"])
+                if close_val < target["price"]:
+                    return {
+                        "direction": "SHORT",
+                        "break_price": target["price"],
+                        "confirm_close": close_val,
+                        "index": i,
+                        "candles_ago": len(df) - 1 - i,
+                    }
+
+        return None
+
+    def _detect_displacement(self, df, bias: str, atr: float,
+                              after_index: int = 0) -> Optional[Dict]:
         """
-        Sweep sonrası Displacement (momentum) tespiti.
+        Displacement tespiti — kurumsal güçlü hareket.
         
-        v3.4 Crypto-optimized stricter checks:
-        - Displacement sweep'ten max 2 mum sonra gelmeli
-        - Minimum %0.6 hareket (config: displacement_min_size_pct)
-        - Hacim destekli (avg'nin üstünde)
-        - Güçlü gövde (55%+)
+        Tek bir dev mum DEĞİL → 2-3 ardışık güçlü mum aranır.
+        Tek mum > 3x ATR = anormal volatilite → GİRME (fake olabilir).
         """
-        sweep_idx = sweep["sweep_candle_idx"]
-        n = len(df)
-        
-        # v3.4: Max 2-3 mum sonra displacement gelmeli (hızlı reaction)
-        max_lookahead = self.params.get("displacement_max_candles_after_sweep", 2)
+        if df is None or len(df) < 5 or atr <= 0:
+            return None
+
+        opens = df["open"].values
+        closes = df["close"].values
+        highs = df["high"].values
+        lows = df["low"].values
+        volumes = df["volume"].values if "volume" in df.columns else None
+
         min_body_ratio = self.params.get("displacement_min_body_ratio", 0.55)
-        min_size_pct = self.params.get("displacement_min_size_pct", 0.006)
-        atr_mult = self.params.get("displacement_atr_multiplier", 1.5)
-        
-        atr = self._calc_atr(df, 14)
+        atr_multiplier = self.params.get("displacement_atr_multiplier", 1.5)
 
-        # 20-bar hacim ortalaması
-        vol_end = min(sweep_idx + 1, n)
-        vol_start = max(0, vol_end - 20)
-        if "volume" in df.columns:
-            avg_volume = float(df["volume"].iloc[vol_start:vol_end].mean())
-        else:
-            avg_volume = 0
+        search_start = max(after_index, len(df) - 20)
 
-        displacement = None
-        
-        # Sweep'ten hemen sonraki 2-3 mumu kontrol et
-        for i in range(sweep_idx + 1, min(sweep_idx + max_lookahead + 1, n)):
-            candle = df.iloc[i]
-            body = abs(candle["close"] - candle["open"])
-            total_range = candle["high"] - candle["low"]
-            mid_price = (candle["high"] + candle["low"]) / 2
-            if total_range <= 0 or mid_price <= 0:
+        for i in range(search_start, len(df) - 1):
+            # Tek dev mum kontrolü (FAKE WICK koruma)
+            candle_range = highs[i] - lows[i]
+            if candle_range > 3 * atr:
+                continue  # 3x ATR'den büyük tek mum = anormal → ATLA
+
+            body = abs(closes[i] - opens[i])
+            total_range = highs[i] - lows[i]
+            if total_range == 0:
                 continue
-
             body_ratio = body / total_range
-            size_pct = body / mid_price
-            
-            # v3.4: Daha sıkı kontroller
-            if body_ratio < min_body_ratio:
-                continue
-                
-            # Minimum hareket kontrolü (%0.6)
-            if size_pct < min_size_pct:
-                continue
 
-            candle_dir = "BULLISH" if candle["close"] > candle["open"] else "BEARISH"
+            if bias == "LONG" and closes[i] > opens[i] and body_ratio >= min_body_ratio:
+                consecutive = 1
+                total_move = closes[i] - opens[i]
+                start_open = opens[i]
+                end_close = closes[i]
 
-            # Yön kontrolü
-            if bias == "LONG" and candle_dir != "BULLISH":
-                continue
-            if bias == "SHORT" and candle_dir != "BEARISH":
-                continue
-            
-            # Hacim kontrolü (avg'nin en az %80'i)
-            candle_volume = float(candle.get("volume", 0))
-            volume_confirmed = candle_volume >= avg_volume * 0.8 if avg_volume > 0 else False
-            
-            # ATR kontrolü opsiyonel
-            atr_check = (atr > 0 and body >= atr * atr_mult) or size_pct >= min_size_pct
-            
-            if not atr_check:
-                continue
+                for j in range(i + 1, min(i + 3, len(df))):
+                    if closes[j] > opens[j]:
+                        b = abs(closes[j] - opens[j])
+                        r = highs[j] - lows[j]
+                        if r > 0 and b / r >= 0.45:
+                            consecutive += 1
+                            end_close = closes[j]
+                            total_move = end_close - start_open
+                        else:
+                            break
+                    else:
+                        break
 
-            # Tüm kriterler geçti
-            displacement = {
-                "index": i,
-                "direction": candle_dir,
-                "body_ratio": round(body_ratio, 3),
-                "size_pct": round(size_pct * 100, 3),
-                "atr_multiple": round(body / atr, 2) if atr > 0 else 0,
-                "volume": candle_volume,
-                "avg_volume": round(avg_volume, 2),
-                "volume_confirmed": volume_confirmed,
-            }
-            break
+                if total_move >= atr * atr_multiplier:
+                    vol_confirmed = True
+                    if volumes is not None and len(volumes) > 20:
+                        avg_vol = np.mean(volumes[max(0, i-20):i])
+                        curr_vol = volumes[i]
+                        vol_confirmed = avg_vol > 0 and curr_vol > avg_vol * 0.8
 
-        if displacement is None:
-            return None
+                    if vol_confirmed:
+                        return {
+                            "direction": "LONG",
+                            "start_index": i,
+                            "end_index": min(i + consecutive - 1, len(df) - 1),
+                            "consecutive_candles": consecutive,
+                            "total_move_pct": float(total_move / start_open * 100) if start_open > 0 else 0,
+                            "atr_ratio": float(total_move / atr),
+                            "candles_ago": len(df) - 1 - i,
+                            "displacement_low": float(lows[i]),
+                            "displacement_high": float(end_close),
+                        }
 
-        return {
-            "displacement": displacement,
-            "mss_confirmed": True,
-            "volume_confirmed": displacement["volume_confirmed"],
+            elif bias == "SHORT" and closes[i] < opens[i] and body_ratio >= min_body_ratio:
+                consecutive = 1
+                total_move = opens[i] - closes[i]
+                start_open = opens[i]
+                end_close = closes[i]
+
+                for j in range(i + 1, min(i + 3, len(df))):
+                    if closes[j] < opens[j]:
+                        b = abs(closes[j] - opens[j])
+                        r = highs[j] - lows[j]
+                        if r > 0 and b / r >= 0.45:
+                            consecutive += 1
+                            end_close = closes[j]
+                            total_move = start_open - end_close
+                        else:
+                            break
+                    else:
+                        break
+
+                if total_move >= atr * atr_multiplier:
+                    vol_confirmed = True
+                    if volumes is not None and len(volumes) > 20:
+                        avg_vol = np.mean(volumes[max(0, i-20):i])
+                        curr_vol = volumes[i]
+                        vol_confirmed = avg_vol > 0 and curr_vol > avg_vol * 0.8
+
+                    if vol_confirmed:
+                        return {
+                            "direction": "SHORT",
+                            "start_index": i,
+                            "end_index": min(i + consecutive - 1, len(df) - 1),
+                            "consecutive_candles": consecutive,
+                            "total_move_pct": float(total_move / start_open * 100) if start_open > 0 else 0,
+                            "atr_ratio": float(total_move / atr),
+                            "candles_ago": len(df) - 1 - i,
+                            "displacement_high": float(highs[i]),
+                            "displacement_low": float(end_close),
+                        }
+
+        return None
+
+    def _scan_obstacles(self, bias: str, entry: float, tp: float,
+                        obs_1h: List[Dict], fvgs_1h: List[Dict],
+                        current_price: float) -> Dict:
+        """
+        TP yolundaki engelleri tara.
+        
+        LONG: Entry ile TP arasında bearish OB/FVG var mı?
+        SHORT: Entry ile TP arasında bullish OB/FVG var mı?
+        Psikolojik seviyeler (round number): xx,000 — xx,500
+        
+        İlk engel TP yolunun ilk %30'undaysa → TP öne çekilir.
+        """
+        result = {
+            "has_obstacle": False,
+            "obstacles": [],
+            "adjusted_tp": tp,
+            "obstacle_distance_pct": 100.0,
         }
 
+        if entry == 0 or tp == 0:
+            return result
+
+        tp_distance = abs(tp - entry)
+        if tp_distance == 0:
+            return result
+
+        obstacles = []
+
+        if bias == "LONG":
+            for ob in obs_1h:
+                if ob["type"] == "BEARISH" and not ob["mitigated"]:
+                    if entry < ob["low"] < tp:
+                        dist_from_entry = ob["low"] - entry
+                        pct_of_tp = (dist_from_entry / tp_distance) * 100
+                        obstacles.append({
+                            "type": "BEARISH_OB",
+                            "price": ob["low"],
+                            "pct_of_tp_distance": round(pct_of_tp, 1),
+                        })
+
+            for fvg in fvgs_1h:
+                if fvg["type"] == "BEARISH" and fvg["mitigated"] != "FULL":
+                    if entry < fvg["low"] < tp:
+                        dist_from_entry = fvg["low"] - entry
+                        pct_of_tp = (dist_from_entry / tp_distance) * 100
+                        obstacles.append({
+                            "type": "BEARISH_FVG",
+                            "price": fvg["low"],
+                            "pct_of_tp_distance": round(pct_of_tp, 1),
+                            "age": fvg["age"],
+                        })
+
+            step = self._round_number_step(current_price)
+            if step > 0:
+                low_round = int(entry / step) * step + step
+                while low_round < tp:
+                    dist_from_entry = low_round - entry
+                    pct_of_tp = (dist_from_entry / tp_distance) * 100
+                    if 20 < pct_of_tp < 90:
+                        obstacles.append({
+                            "type": "ROUND_NUMBER",
+                            "price": float(low_round),
+                            "pct_of_tp_distance": round(pct_of_tp, 1),
+                        })
+                    low_round += step
+
+        elif bias == "SHORT":
+            for ob in obs_1h:
+                if ob["type"] == "BULLISH" and not ob["mitigated"]:
+                    if tp < ob["high"] < entry:
+                        dist_from_entry = entry - ob["high"]
+                        pct_of_tp = (dist_from_entry / tp_distance) * 100
+                        obstacles.append({
+                            "type": "BULLISH_OB",
+                            "price": ob["high"],
+                            "pct_of_tp_distance": round(pct_of_tp, 1),
+                        })
+
+            for fvg in fvgs_1h:
+                if fvg["type"] == "BULLISH" and fvg["mitigated"] != "FULL":
+                    if tp < fvg["high"] < entry:
+                        dist_from_entry = entry - fvg["high"]
+                        pct_of_tp = (dist_from_entry / tp_distance) * 100
+                        obstacles.append({
+                            "type": "BULLISH_FVG",
+                            "price": fvg["high"],
+                            "pct_of_tp_distance": round(pct_of_tp, 1),
+                            "age": fvg["age"],
+                        })
+
+            step = self._round_number_step(current_price)
+            if step > 0:
+                high_round = int(entry / step) * step
+                while high_round > tp:
+                    dist_from_entry = entry - high_round
+                    pct_of_tp = (dist_from_entry / tp_distance) * 100
+                    if 20 < pct_of_tp < 90:
+                        obstacles.append({
+                            "type": "ROUND_NUMBER",
+                            "price": float(high_round),
+                            "pct_of_tp_distance": round(pct_of_tp, 1),
+                        })
+                    high_round -= step
+
+        if obstacles:
+            obstacles.sort(key=lambda x: x["pct_of_tp_distance"])
+            result["has_obstacle"] = True
+            result["obstacles"] = obstacles
+            result["obstacle_distance_pct"] = obstacles[0]["pct_of_tp_distance"]
+
+            first_obstacle = obstacles[0]
+            if first_obstacle["pct_of_tp_distance"] < 30:
+                buffer = tp_distance * 0.02
+                if bias == "LONG":
+                    result["adjusted_tp"] = first_obstacle["price"] - buffer
+                else:
+                    result["adjusted_tp"] = first_obstacle["price"] + buffer
+
+        return result
+
+    def _round_number_step(self, price: float) -> float:
+        """Psikolojik seviye adımı (fiyata göre dinamik)."""
+        if price >= 50000:
+            return 1000
+        elif price >= 10000:
+            return 500
+        elif price >= 1000:
+            return 100
+        elif price >= 100:
+            return 50
+        elif price >= 10:
+            return 5
+        elif price >= 1:
+            return 0.5
+        else:
+            return 0.05
+
+    def _is_volatile_candle(self, candle_range: float, atr: float) -> bool:
+        """Tek mum > 3x ATR = anormal volatilite."""
+        return atr > 0 and candle_range > 3 * atr
+
     # =================================================================
-    #  BÖLÜM 15 — GATE 5: DISPLACEMENT FVG (Giriş Bölgesi)
+    #  BÖLÜM 2 — KATMAN 1: NARRATIVE (4H Yapı Analizi)
     # =================================================================
 
-    def _find_displacement_fvg(self, df, displacement_idx, bias):
+    def analyze_narrative(self, df_4h, df_1h=None) -> Dict:
         """
-        Displacement mumunun oluşturduğu FVG'yi bul.
-
-        Displacement güçlü hareket → FVG bırakır.
-        Bu FVG giriş bölgemizdir — limit emir buraya koyulur.
+        HTF Narrative — Piyasa nereye gitmek istiyor?
+        
+        4H yapı analizi:
+          - BOS → Trend yönü
+          - CHoCH → Trend dönüşü
+          - Structure quality (STRONG/WEAK)
+        
+        1H fallback: 4H NEUTRAL ise 1H'ya bakılır (otomatik WEAK).
         """
-        n = len(df)
-        search_start = max(1, displacement_idx - 1)
-        search_end = min(n - 1, displacement_idx + 4)
-        min_fvg_size = self.params.get("fvg_min_size_pct", 0.001)
-        best_fvg = None
+        result = {
+            "bias": "NEUTRAL",
+            "quality": "NEUTRAL",
+            "choch": False,
+            "confidence_note": "",
+            "htf_swing_high": 0.0,
+            "htf_swing_low": 0.0,
+        }
 
-        for i in range(search_start, search_end):
-            if i < 1 or i >= n - 1:
-                continue
-            prev = df.iloc[i - 1]
-            curr = df.iloc[i]
-            next_ = df.iloc[i + 1]
-            mid_price = curr["close"]
-            if mid_price <= 0:
-                continue
+        if df_4h is None or len(df_4h) < 20:
+            result["confidence_note"] = "4H veri yetersiz"
+            return result
+
+        sh_4h, sl_4h = self._find_swing_points(df_4h, lookback=self.params.get("swing_lookback", 5))
+        structure_4h = self._detect_structure(sh_4h, sl_4h)
+
+        result["bias"] = structure_4h["bias"]
+        result["quality"] = structure_4h["structure_quality"]
+        result["choch"] = structure_4h["choch_detected"]
+        result["htf_swing_high"] = structure_4h["last_swing_high"]
+        result["htf_swing_low"] = structure_4h["last_swing_low"]
+
+        if structure_4h["choch_detected"]:
+            result["confidence_note"] = "4H CHoCH tespit edildi — kalite düşürüldü"
+            # CHoCH bias'ı öldürmez, sadece bilgi amaçlı
+
+        elif structure_4h["bias"] != "NEUTRAL":
+            result["confidence_note"] = f"4H {structure_4h['bias']} yapı — {structure_4h['structure_quality']}"
+
+        # 4H NEUTRAL ise 1H fallback
+        if result["bias"] == "NEUTRAL" and not result["choch"] and df_1h is not None and len(df_1h) >= 20:
+            sh_1h, sl_1h = self._find_swing_points(df_1h, lookback=self.params.get("swing_lookback", 5))
+            structure_1h = self._detect_structure(sh_1h, sl_1h)
+
+            if structure_1h["bias"] != "NEUTRAL":
+                result["bias"] = structure_1h["bias"]
+                result["quality"] = "WEAK"
+                result["confidence_note"] = f"1H fallback — {structure_1h['bias']} yapı (4H nötr, 1H {structure_1h['structure_quality']})"
+
+        if result["bias"] == "NEUTRAL":
+            result["confidence_note"] = "HTF yapı belirsiz — trade açılmayacak"
+
+        return result
+
+    # =================================================================
+    #  BÖLÜM 3 — KATMAN 2: POI TESPİTİ
+    # =================================================================
+
+    def find_poi_zones(self, df_15m, df_1h, bias: str,
+                       current_price: float) -> List[Dict]:
+        """
+        POI (Point of Interest) bölgeleri tespit et.
+        
+        POI = OB + FVG + Likidite çakışma bölgesi.
+        Fiyat bu bölgelere geldiğinde trade fırsatı doğar.
+        """
+        if df_15m is None or len(df_15m) < 30 or bias == "NEUTRAL":
+            return []
+
+        # 15m analiz
+        sh_15m, sl_15m = self._find_swing_points(df_15m, lookback=self.params.get("swing_lookback", 5))
+        obs_15m = self._find_order_blocks(df_15m, bias, self.params.get("ob_max_age_candles", 30))
+        fvgs_15m = self._find_fvg(df_15m, self.params.get("fvg_max_age_candles", 20))
+        liquidity = self._find_liquidity_pools(sh_15m, sl_15m, current_price)
+
+        # 1H analiz (engel taraması için)
+        obs_1h = self._find_order_blocks(df_1h, bias, 50) if df_1h is not None and len(df_1h) >= 20 else []
+        fvgs_1h = self._find_fvg(df_1h, 30) if df_1h is not None and len(df_1h) >= 20 else []
+
+        pd_zone = self._calculate_premium_discount(sh_15m, sl_15m, current_price)
+
+        pois = []
+
+        # Candidate zone'ları topla
+        candidate_zones = []
+
+        if bias == "LONG":
+            for ob in obs_15m:
+                if ob["type"] == "BULLISH" and ob["low"] < current_price:
+                    candidate_zones.append({
+                        "source": "OB", "high": ob["high"],
+                        "low": ob["low"], "ce": ob["ce"],
+                    })
+            for fvg in fvgs_15m:
+                if fvg["type"] == "BULLISH" and fvg["low"] < current_price:
+                    candidate_zones.append({
+                        "source": "FVG", "high": fvg["high"],
+                        "low": fvg["low"], "ce": fvg["ce"],
+                    })
+        elif bias == "SHORT":
+            for ob in obs_15m:
+                if ob["type"] == "BEARISH" and ob["high"] > current_price:
+                    candidate_zones.append({
+                        "source": "OB", "high": ob["high"],
+                        "low": ob["low"], "ce": ob["ce"],
+                    })
+            for fvg in fvgs_15m:
+                if fvg["type"] == "BEARISH" and fvg["high"] > current_price:
+                    candidate_zones.append({
+                        "source": "FVG", "high": fvg["high"],
+                        "low": fvg["low"], "ce": fvg["ce"],
+                    })
+
+        for zone in candidate_zones:
+            # Çakışma analizi
+            confluence_count = 1
+            confluence_sources = [zone["source"]]
+
+            for other in candidate_zones:
+                if other is zone:
+                    continue
+                overlap = min(zone["high"], other["high"]) - max(zone["low"], other["low"])
+                if overlap > 0:
+                    confluence_count += 1
+                    confluence_sources.append(other["source"])
+
+            # Likidite çakışması
+            liq_list = liquidity["ssl"] if bias == "LONG" else liquidity["bsl"]
+            for liq_level in liq_list:
+                if zone["low"] <= liq_level["price"] <= zone["high"]:
+                    confluence_count += 1
+                    confluence_sources.append(f"LIQ_{liq_level['type']}")
+
+            # Entry, SL, TP hesaplama
+            entry = zone["ce"]
 
             if bias == "LONG":
-                if prev["high"] < next_["low"]:
-                    gap = next_["low"] - prev["high"]
-                    if gap / mid_price >= min_fvg_size:
-                        # Fill kontrolü
-                        filled = False
-                        if i + 2 < n and len(df.iloc[i + 2:]) > 0:
-                            if df.iloc[i + 2:]["low"].min() <= prev["high"]:
-                                filled = True
-                        if not filled:
-                            fvg = {
-                                "type": "BULLISH_FVG",
-                                "index": i,
-                                "high": float(next_["low"]),
-                                "low": float(prev["high"]),
-                                "size_pct": round((gap / mid_price) * 100, 4),
-                                "timestamp": curr.get("timestamp", ""),
-                            }
-                            if best_fvg is None or abs(i - displacement_idx) < abs(best_fvg["index"] - displacement_idx):
-                                best_fvg = fvg
+                sl = zone["low"] - (zone["high"] - zone["low"]) * 0.2
+                tp = liquidity["nearest_bsl"] if liquidity["nearest_bsl"] > entry else entry * 1.02
+                in_correct_zone = pd_zone["zone"] in ("DISCOUNT", "DEEP_DISCOUNT")
+            else:
+                sl = zone["high"] + (zone["high"] - zone["low"]) * 0.2
+                tp = liquidity["nearest_ssl"] if liquidity["nearest_ssl"] > 0 and liquidity["nearest_ssl"] < entry else entry * 0.98
+                in_correct_zone = pd_zone["zone"] in ("PREMIUM", "DEEP_PREMIUM")
 
-            elif bias == "SHORT":
-                if prev["low"] > next_["high"]:
-                    gap = prev["low"] - next_["high"]
-                    if gap / mid_price >= min_fvg_size:
-                        filled = False
-                        if i + 2 < n and len(df.iloc[i + 2:]) > 0:
-                            if df.iloc[i + 2:]["high"].max() >= prev["low"]:
-                                filled = True
-                        if not filled:
-                            fvg = {
-                                "type": "BEARISH_FVG",
-                                "index": i,
-                                "high": float(prev["low"]),
-                                "low": float(next_["high"]),
-                                "size_pct": round((gap / mid_price) * 100, 4),
-                                "timestamp": curr.get("timestamp", ""),
-                            }
-                            if best_fvg is None or abs(i - displacement_idx) < abs(best_fvg["index"] - displacement_idx):
-                                best_fvg = fvg
+            # Min/Max SL kontrolü
+            min_sl_pct = self.params.get("min_sl_distance_pct", 0.008)
+            max_sl_pct = self.params.get("max_sl_distance_pct", 0.025)
+            sl_distance_pct = abs(entry - sl) / entry if entry > 0 else 0
 
-        # Displacement yakınında FVG bulunamadıysa tüm FVG'leri kontrol et
-        if best_fvg is None:
-            all_fvgs = self.find_fvg(df)
-            target_type = "BULLISH_FVG" if bias == "LONG" else "BEARISH_FVG"
-            relevant = [
-                f for f in all_fvgs
-                if f["type"] == target_type and f["index"] >= displacement_idx - 3
-            ]
-            if relevant:
-                best_fvg = min(relevant, key=lambda f: abs(f["index"] - displacement_idx))
+            if sl_distance_pct < min_sl_pct:
+                sl = entry * (1 - min_sl_pct) if bias == "LONG" else entry * (1 + min_sl_pct)
+            elif sl_distance_pct > max_sl_pct:
+                sl = entry * (1 - max_sl_pct) if bias == "LONG" else entry * (1 + max_sl_pct)
 
-        return best_fvg
+            # Engel taraması
+            obstacle_info = self._scan_obstacles(bias, entry, tp, obs_1h, fvgs_1h, current_price)
+            if obstacle_info["adjusted_tp"] != tp:
+                tp = obstacle_info["adjusted_tp"]
+
+            # RR hesaplaması
+            risk = abs(entry - sl)
+            reward = abs(tp - entry)
+            rr = reward / risk if risk > 0 else 0
+
+            # Distance from current price
+            distance_pct = abs(current_price - entry) / current_price * 100 if current_price > 0 else 0
+
+            pois.append({
+                "bias": bias,
+                "entry": float(entry),
+                "sl": float(sl),
+                "tp": float(tp),
+                "rr": round(rr, 2),
+                "zone_high": float(zone["high"]),
+                "zone_low": float(zone["low"]),
+                "confluence_count": confluence_count,
+                "confluence_sources": confluence_sources,
+                "in_correct_zone": in_correct_zone,
+                "in_ote": pd_zone.get("in_ote", False),
+                "distance_from_price_pct": round(distance_pct, 2),
+                "obstacles": obstacle_info["obstacles"],
+                "has_obstacle": obstacle_info["has_obstacle"],
+                "pd_zone": pd_zone,
+            })
+
+        # Sıralama: RR >= 1.5 önce, sonra confluence, sonra fiyata yakınlık
+        pois.sort(key=lambda p: (
+            -(1 if p["rr"] >= 1.5 else 0),
+            -p["confluence_count"],
+            p["distance_from_price_pct"],
+        ))
+
+        return pois
 
     # =================================================================
-    #  BÖLÜM 16 — YAPISAL STOP LOSS (Sweep Wick Extreme)
+    #  BÖLÜM 4 — KATMAN 3: TRIGGER
     # =================================================================
 
-    def _calc_structural_sl(self, df, sweep, bias, structure, entry_price=None):
+    def check_trigger(self, df_15m, bias: str, poi: Dict,
+                      current_price: float, atr: float) -> Optional[Dict]:
         """
-        SL = Sweep fitil (wick) uç noktası + buffer.
-
-        v3.4 Crypto-optimized:
-        - LONG → SL = sweep wick low × 0.99 (%1 buffer)
-        - SHORT → SL = sweep wick high × 1.01 (%1 buffer)
-        - Max SL mesafesi kontrol edilir (config'de)
-        """
-        sl_buffer = self.params.get("sl_buffer_pct", 0.01)  # %1 default
+        POI bölgesinde trigger oluştu mu?
         
+        Trigger tipleri (herhangi biri yeterli):
+          A) Sweep + Rejection
+          B) MSS (Micro Structure Shift)
+          C) Displacement (2-3 ardışık güçlü mum)
+        
+        RR >= 1.5 zorunlu. Tek dev mum (>3x ATR) = REDDET.
+        """
+        if df_15m is None or len(df_15m) < 10 or poi is None:
+            return None
+
+        zone_high = poi["zone_high"]
+        zone_low = poi["zone_low"]
+        tp = poi["tp"]
+
+        # Fiyat POI'ye yeterince yakın mı? (< %1.0)
+        proximity_threshold = 0.01
         if bias == "LONG":
-            # Sweep wicki alt noktası
-            sweep_wick = sweep.get("sweep_wick", sweep.get("sweep_low"))
-            if sweep_wick and sweep_wick > 0:
-                sl = sweep_wick * (1 - sl_buffer)  # %1 buffer aşağı
-                logger.debug(f"  LONG SL: Sweep Wick @ {sl:.8f} (buffer: {sl_buffer*100:.1f}%)")
-                return sl
-
-            # Fallback: swept level
-            sl = sweep["swept_level"] * (1 - sl_buffer * 1.5)
-            return sl
-
+            price_in_or_near_zone = current_price <= zone_high * (1 + proximity_threshold)
         elif bias == "SHORT":
-            sweep_wick = sweep.get("sweep_wick", sweep.get("sweep_high"))
-            if sweep_wick and sweep_wick > 0:
-                sl = sweep_wick * (1 + sl_buffer)  # %1 buffer yukarı
-                logger.debug(f"  SHORT SL: Sweep Wick @ {sl:.8f} (buffer: {sl_buffer*100:.1f}%)")
-                return sl
+            price_in_or_near_zone = current_price >= zone_low * (1 - proximity_threshold)
+        else:
+            return None
 
-            sl = sweep["swept_level"] * (1 + sl_buffer * 1.5)
-            return sl
+        if not price_in_or_near_zone:
+            return None
+
+        min_sl_pct = self.params.get("min_sl_distance_pct", 0.008)
+        max_sl_pct = self.params.get("max_sl_distance_pct", 0.025)
+
+        # === TRIGGER A: Sweep + Rejection ===
+        sh_15m, sl_15m = self._find_swing_points(df_15m, lookback=3)
+        sweep = self._detect_sweep(df_15m, sh_15m, sl_15m, bias, lookback=10)
+
+        if sweep is not None and sweep["candles_ago"] <= 6:
+            if bias == "LONG":
+                sweep_sl = sweep["sweep_price"] * (1 - 0.002)
+            else:
+                sweep_sl = sweep["sweep_price"] * (1 + 0.002)
+
+            sl_dist = abs(current_price - sweep_sl) / current_price if current_price > 0 else 0
+            if sl_dist < min_sl_pct:
+                sweep_sl = current_price * (1 - min_sl_pct) if bias == "LONG" else current_price * (1 + min_sl_pct)
+            elif sl_dist > max_sl_pct:
+                sweep_sl = current_price * (1 - max_sl_pct) if bias == "LONG" else current_price * (1 + max_sl_pct)
+
+            risk = abs(current_price - sweep_sl)
+            reward = abs(tp - current_price)
+            actual_rr = reward / risk if risk > 0 else 0
+
+            if actual_rr >= 1.5:
+                return {
+                    "trigger_type": "SWEEP_REJECTION",
+                    "direction": bias,
+                    "entry": float(current_price),
+                    "sl": float(sweep_sl),
+                    "tp": float(tp),
+                    "rr": round(actual_rr, 2),
+                    "sweep_data": sweep,
+                    "entry_mode": "MARKET",
+                    "quality": "A+" if poi["confluence_count"] >= 3 else "A" if poi["confluence_count"] >= 2 else "B",
+                    "components": ["HTF_BIAS", "POI_ZONE", "SWEEP", "REJECTION"],
+                    "poi": poi,
+                }
+
+        # === TRIGGER B: MSS ===
+        mss = self._detect_mss(df_15m, bias, after_index=max(0, len(df_15m) - 10))
+
+        if mss is not None and mss["candles_ago"] <= 4:
+            sl = poi["sl"]
+            risk = abs(current_price - sl)
+            reward = abs(tp - current_price)
+            actual_rr = reward / risk if risk > 0 else 0
+
+            if actual_rr >= 1.5:
+                return {
+                    "trigger_type": "MSS",
+                    "direction": bias,
+                    "entry": float(current_price),
+                    "sl": float(sl),
+                    "tp": float(tp),
+                    "rr": round(actual_rr, 2),
+                    "mss_data": mss,
+                    "entry_mode": "MARKET",
+                    "quality": "A" if poi["confluence_count"] >= 2 else "B",
+                    "components": ["HTF_BIAS", "POI_ZONE", "MSS"],
+                    "poi": poi,
+                }
+
+        # === TRIGGER C: Displacement ===
+        displacement = self._detect_displacement(df_15m, bias, atr, after_index=max(0, len(df_15m) - 8))
+
+        if displacement is not None and displacement["candles_ago"] <= 4:
+            if bias == "LONG":
+                disp_sl = displacement["displacement_low"] * (1 - 0.002)
+            else:
+                disp_sl = displacement["displacement_high"] * (1 + 0.002)
+
+            sl_dist = abs(current_price - disp_sl) / current_price if current_price > 0 else 0
+            if sl_dist < min_sl_pct:
+                disp_sl = current_price * (1 - min_sl_pct) if bias == "LONG" else current_price * (1 + min_sl_pct)
+            elif sl_dist > max_sl_pct:
+                disp_sl = current_price * (1 - max_sl_pct) if bias == "LONG" else current_price * (1 + max_sl_pct)
+
+            risk = abs(current_price - disp_sl)
+            reward = abs(tp - current_price)
+            actual_rr = reward / risk if risk > 0 else 0
+
+            if actual_rr >= 1.5:
+                return {
+                    "trigger_type": "DISPLACEMENT",
+                    "direction": bias,
+                    "entry": float(current_price),
+                    "sl": float(disp_sl),
+                    "tp": float(tp),
+                    "rr": round(actual_rr, 2),
+                    "displacement_data": displacement,
+                    "entry_mode": "MARKET",
+                    "quality": "B" if displacement["consecutive_candles"] >= 2 else "C",
+                    "components": ["HTF_BIAS", "POI_ZONE", "DISPLACEMENT"],
+                    "poi": poi,
+                }
 
         return None
 
     # =================================================================
-    #  BÖLÜM 17 — KARŞI LİKİDİTE TP (Draw on Liquidity)
+    #  BÖLÜM 5 — ANA FONKSİYON: generate_signal()
     # =================================================================
 
-    def _calc_opposing_liquidity_tp(self, df, multi_tf_data, entry, sl, bias, structure):
+    def generate_signal(self, symbol: str, multi_tf: Dict,
+                        market_data: Optional[Dict] = None) -> Optional[Dict]:
         """
-        TP = Karşı taraftaki likidite havuzu.
-        MİNİMUM R:R KISITLAMASI YOK — tamamen yapısal hedef.
-
-        LONG TP sırası: HTF equal highs → LTF equal highs → Karşı OB → Son swing high
-        SHORT TP sırası: HTF equal lows → LTF equal lows → Karşı OB → Son swing low
+        Ana sinyal üretici — Narrative → POI → Trigger.
+        
+        v3.x'teki sıralı 5-gate sistemi YOK.
+        3 katmanlı bağlamsal analiz.
+        
+        Returns:
+            None — sinyal yok
+            {"action": "WATCH", ...} — POI tespit edildi, trigger bekleniyor
+            {"action": "SIGNAL", ...} — Trigger oluştu, MARKET giriş yapılacak
         """
-        tp_candidates = []
+        df_15m = multi_tf.get("15m")
+        df_1h = multi_tf.get("1h")
+        df_4h = multi_tf.get("4h")
 
-        # HTF likidite
-        htf_liquidity = []
-        if multi_tf_data:
-            for tf in ["4H", "1H"]:
-                if tf in multi_tf_data and multi_tf_data[tf] is not None and not multi_tf_data[tf].empty:
-                    htf_liquidity = self.find_liquidity_levels(multi_tf_data[tf])
-                    break
+        if df_15m is None or len(df_15m) < 50:
+            return None
 
-        # LTF likidite
-        ltf_liquidity = self.find_liquidity_levels(df)
+        current_price = float(df_15m.iloc[-1]["close"])
+        if current_price <= 0:
+            return None
 
-        # Order blocks
-        active_obs, _ = self.find_order_blocks(df, structure)
+        atr_15m = self._calc_atr(df_15m, 14)
+
+        # ═══ VOLATİLİTE FİLTRESİ ═══
+        last_candle = df_15m.iloc[-1]
+        last_range = float(last_candle["high"]) - float(last_candle["low"])
+        if self._is_volatile_candle(last_range, atr_15m):
+            logger.debug(f"{symbol}: Son mum anormal volatilite — bekleniyor")
+            return None
+
+        # ═══ KATMAN 1: NARRATIVE ═══
+        narrative = self.analyze_narrative(df_4h, df_1h)
+        bias = narrative["bias"]
+
+        if bias == "NEUTRAL":
+            return None
+
+        # CHoCH artık sinyali engellemez — sadece triggerda kalite düşürür
+
+        # ═══ KATMAN 2: POI TESPİTİ ═══
+        pois = self.find_poi_zones(df_15m, df_1h, bias, current_price)
+
+        if not pois:
+            return None
+
+        # RR >= 1.5 filtresi
+        valid_pois = [p for p in pois if p["rr"] >= 1.5]
+        if not valid_pois:
+            return None
+
+        best_poi = valid_pois[0]
+
+        # ═══ KATMAN 3: TRIGGER ═══
+        trigger = self.check_trigger(df_15m, bias, best_poi, current_price, atr_15m)
+
+        if trigger is not None:
+            # TRIGGER OLUŞTU → SIGNAL
+            logger.info(
+                f"🎯 {symbol} SIGNAL: {trigger['direction']} | "
+                f"Trigger: {trigger['trigger_type']} | "
+                f"Entry: {trigger['entry']:.5f} | "
+                f"SL: {trigger['sl']:.5f} | TP: {trigger['tp']:.5f} | "
+                f"RR: {trigger['rr']} | Quality: {trigger['quality']}"
+            )
+
+            return {
+                "action": "SIGNAL",
+                "symbol": symbol,
+                "direction": trigger["direction"],
+                "entry_price": trigger["entry"],
+                "current_price": current_price,
+                "stop_loss": trigger["sl"],
+                "take_profit": trigger["tp"],
+                "rr_ratio": trigger["rr"],
+                "entry_mode": "MARKET",
+                "trigger_type": trigger["trigger_type"],
+                "quality_tier": trigger["quality"],
+                "components": trigger["components"],
+                "narrative": narrative,
+                "poi": best_poi,
+                "trigger_data": trigger,
+                "atr": atr_15m,
+                # Uyumluluk (eski frontend/API için)
+                "confidence": 100,
+                "confluence_score": 100,
+                "timeframe": "15m",
+            }
+
+        # Trigger yok ama POI var ve fiyat yakınsa → WATCH
+        if best_poi["distance_from_price_pct"] <= 1.0:
+            logger.debug(
+                f"👁️ {symbol} WATCH: {bias} | "
+                f"POI: {best_poi['zone_low']:.5f}-{best_poi['zone_high']:.5f} | "
+                f"RR: {best_poi['rr']} | Dist: {best_poi['distance_from_price_pct']:.2f}%"
+            )
+
+            return {
+                "action": "WATCH",
+                "symbol": symbol,
+                "direction": bias,
+                "entry_price": best_poi["entry"],
+                "current_price": current_price,
+                "stop_loss": best_poi["sl"],
+                "take_profit": best_poi["tp"],
+                "rr_ratio": best_poi["rr"],
+                "watch_reason": f"POI yakın ({best_poi['distance_from_price_pct']:.1f}%), trigger bekleniyor",
+                "quality_tier": "WATCH",
+                "components": ["HTF_BIAS", "POI_ZONE"],
+                "narrative": narrative,
+                "poi": best_poi,
+                "atr": atr_15m,
+                "confidence": 100,
+                "confluence_score": 100,
+                "entry_mode": "MARKET",
+                "timeframe": "15m",
+            }
+
+        return None
+
+    # =================================================================
+    #  BÖLÜM 5B — WATCHLIST TRIGGER KONTROLÜ (Hafif)
+    # =================================================================
+
+    def check_trigger_for_watch(self, symbol: str, df_15m,
+                                stored_narrative: Dict,
+                                stored_poi: Dict) -> Optional[Dict]:
+        """
+        Watchlist item'ı için hafif trigger kontrolü.
+        
+        generate_signal()'den FARKLI:
+          - Narrative tekrar hesaplanmaz (stored kullanılır)
+          - POI tekrar aranmaz (stored kullanılır)
+          - Sadece 15m data ile check_trigger() çağrılır
+          - 4H ve 1H API çağrısı YAPILMAZ → 2 API tasarrufu
+        
+        POI Invalidation:
+          - Fiyat POI zone'unu tamamen geçtiyse → None + "invalidated" flag
+          - CHoCH oluşmuşsa stored_narrative ile tutarsızlık → None
+        
+        Returns:
+            None — trigger yok veya POI invalidate
+            Dict — generate_signal ile aynı SIGNAL formatı
+        """
+        if df_15m is None or len(df_15m) < 20:
+            return None
+
+        if not stored_narrative or not stored_poi:
+            return None
+
+        bias = stored_narrative.get("bias", "NEUTRAL")
+        if bias == "NEUTRAL":
+            return None
+
+        current_price = float(df_15m.iloc[-1]["close"])
+        if current_price <= 0:
+            return None
+
+        atr_15m = self._calc_atr(df_15m, 14)
+
+        # ── VOLATİLİTE FİLTRESİ ──
+        last_candle = df_15m.iloc[-1]
+        last_range = float(last_candle["high"]) - float(last_candle["low"])
+        if self._is_volatile_candle(last_range, atr_15m):
+            return None
+
+        # ── POI İNVALIDATION ──
+        zone_high = stored_poi.get("zone_high", 0)
+        zone_low = stored_poi.get("zone_low", 0)
 
         if bias == "LONG":
-            # HTF BSL (equal highs)
-            for liq in htf_liquidity:
-                if liq["type"] == "EQUAL_HIGHS" and not liq["swept"] and liq["price"] > entry:
-                    tp_candidates.append(("HTF_DRAW_LIQ", liq["price"] * 0.999))
-
-            # LTF BSL
-            for liq in ltf_liquidity:
-                if liq["type"] == "EQUAL_HIGHS" and not liq["swept"] and liq["price"] > entry:
-                    tp_candidates.append(("LTF_BSL", liq["price"] * 0.999))
-
-            # Karşı OB
-            for ob in active_obs:
-                if ob["type"] == "BEARISH_OB" and ob["low"] > entry:
-                    tp_candidates.append(("OPPOSING_OB", ob["low"]))
-
-            # Son swing high
-            if structure["last_swing_high"] and structure["last_swing_high"]["price"] > entry:
-                tp_candidates.append(("SWING_HIGH", structure["last_swing_high"]["price"] * 0.998))
-
-            # Önceki swing high'lar
-            for sh in structure.get("swing_highs", []):
-                if sh["price"] > entry * 1.003:
-                    tp_candidates.append(("PREV_SH", sh["price"] * 0.998))
-
+            # Fiyat POI'nin altına düştüyse → zone sweep edildi, artık geçersiz
+            if current_price < zone_low * 0.995:
+                logger.debug(f"{symbol} WATCH: POI invalidated (fiyat zone altına düştü)")
+                return {"_invalidated": True, "reason": "POI zone aşağı sweep edildi"}
         elif bias == "SHORT":
-            # HTF SSL (equal lows)
-            for liq in htf_liquidity:
-                if liq["type"] == "EQUAL_LOWS" and not liq["swept"] and liq["price"] < entry:
-                    tp_candidates.append(("HTF_DRAW_LIQ", liq["price"] * 1.001))
+            # Fiyat POI'nin üstüne çıktıysa → zone sweep edildi
+            if current_price > zone_high * 1.005:
+                logger.debug(f"{symbol} WATCH: POI invalidated (fiyat zone üstüne çıktı)")
+                return {"_invalidated": True, "reason": "POI zone yukarı sweep edildi"}
 
-            # LTF SSL
-            for liq in ltf_liquidity:
-                if liq["type"] == "EQUAL_LOWS" and not liq["swept"] and liq["price"] < entry:
-                    tp_candidates.append(("LTF_SSL", liq["price"] * 1.001))
+        # ── TRIGGER KONTROLÜ ──
+        trigger = self.check_trigger(df_15m, bias, stored_poi, current_price, atr_15m)
 
-            # Karşı OB
-            for ob in active_obs:
-                if ob["type"] == "BULLISH_OB" and ob["high"] < entry:
-                    tp_candidates.append(("OPPOSING_OB", ob["high"]))
+        if trigger is not None:
+            logger.info(
+                f"🎯 {symbol} WATCH→SIGNAL: {trigger['direction']} | "
+                f"Trigger: {trigger['trigger_type']} | "
+                f"Entry: {trigger['entry']:.5f} | "
+                f"SL: {trigger['sl']:.5f} | TP: {trigger['tp']:.5f} | "
+                f"RR: {trigger['rr']}"
+            )
 
-            # Son swing low
-            if structure["last_swing_low"] and structure["last_swing_low"]["price"] < entry:
-                tp_candidates.append(("SWING_LOW", structure["last_swing_low"]["price"] * 1.002))
-
-            # Önceki swing low'lar
-            for sl_p in structure.get("swing_lows", []):
-                if sl_p["price"] < entry * 0.997:
-                    tp_candidates.append(("PREV_SL", sl_p["price"] * 1.002))
-
-        if not tp_candidates:
-            # Son çare: risk bazlı TP (sadece hiçbir hedef yoksa)
-            risk = abs(entry - sl) if sl else entry * 0.015
-            tp_ratio = self.params.get("default_tp_ratio", 2.5)
-            if bias == "LONG":
-                return entry + (risk * tp_ratio)
-            else:
-                return entry - (risk * tp_ratio)
-
-        # ★ Minimum RR filtresi — çok yakın hedefler ekonomik değil
-        risk = abs(entry - sl) if sl else 0
-        min_rr = 1.0  # Minimum kabul edilebilir RR
-        tp_ratio = self.params.get("default_tp_ratio", 2.5)
-
-        if bias == "LONG":
-            # RR >= min_rr olan hedefler
-            valid = [(label, price) for label, price in tp_candidates
-                     if risk > 0 and (price - entry) / risk >= min_rr]
-
-            if valid:
-                # HTF hedef varsa tercih et (daha güvenilir mıknatıs)
-                htf_valid = [c for c in valid if c[0] == "HTF_DRAW_LIQ"]
-                if htf_valid:
-                    return min(htf_valid, key=lambda x: x[1])[1]
-                return min(valid, key=lambda x: x[1])[1]
-
-            # Hiçbir hedef min RR karşılamıyor → risk bazlı fallback
-            if risk > 0:
-                return entry + (risk * tp_ratio)
-            return min(tp_candidates, key=lambda x: x[1])[1]
-
-        else:  # SHORT
-            valid = [(label, price) for label, price in tp_candidates
-                     if risk > 0 and (entry - price) / risk >= min_rr]
-
-            if valid:
-                htf_valid = [c for c in valid if c[0] == "HTF_DRAW_LIQ"]
-                if htf_valid:
-                    return max(htf_valid, key=lambda x: x[1])[1]
-                return max(valid, key=lambda x: x[1])[1]
-
-            if risk > 0:
-                return entry - (risk * tp_ratio)
-            return max(tp_candidates, key=lambda x: x[1])[1]
-
-    # =================================================================
-    #  BÖLÜM 18 — SİNYAL ÜRETİMİ (5-Aşamalı Boolean Gate Protocol)
-    # =================================================================
-
-    def generate_signal(self, symbol, df, multi_tf_data=None):
-        """
-        Saf ICT sinyal üretimi — 5 zorunlu Boolean kapı.
-
-        Her kapı Evet / Hayır döner.
-        Herhangi biri Hayır → sinyal YOK (None).
-        Hepsi Evet → SIGNAL üretilir.
-
-        Puanlama YOK. Minimum R:R YOK. Perakende gösterge YOK.
-        """
-        if df is None or df.empty or len(df) < 30:
-            return None
-
-        # ═══════════════════════════════════════════════════════════
-        #  GATE 1 — SEANS BİLGİSİ (Kripto 7/24 — Bypass)
-        # ═══════════════════════════════════════════════════════════
-        session = self.get_session_info()
-        # v3.4: Killzone kontrolü YOK - kripto 7/24 aktif, seans bilgisi sadece log için
-        logger.debug(f"  {symbol} GATE 1 BYPASS: {session['label']} - Kripto 7/24 aktif")
-
-        # ═══════════════════════════════════════════════════════════
-        #  GATE 2 — HTF BIAS + PREMIUM / DISCOUNT
-        # ═══════════════════════════════════════════════════════════
-        htf_result = self._analyze_htf_bias(multi_tf_data)
-        if not htf_result:
-            logger.debug(f"  {symbol} GATE 2 FAIL: HTF bias belirlenemedi")
-            return None
-
-        bias = htf_result["bias"]
-
-        # LTF (15m) dealing range'de Premium/Discount kontrolü
-        structure = self.detect_market_structure(df)
-        pd_zone = self.calculate_premium_discount(df, structure)
-
-        if not pd_zone:
-            logger.debug(f"  {symbol} GATE 2 FAIL: Premium/Discount hesaplanamadı")
-            return None
-
-        # ★ LONG → Discount veya Equilibrium (< %65)
-        # ★ SHORT → Premium veya Equilibrium (> %35)
-        # Kripto piyasasında sert trendlerde sıkı %50 sınırı çok daraltıcı
-        pd_level = pd_zone["premium_level"]
-
-        if bias == "LONG" and pd_level > 65:
-            logger.debug(f"  {symbol} GATE 2 FAIL: LONG ama fiyat çok Premium ({pd_level:.1f}%)")
-            return None
-
-        if bias == "SHORT" and pd_level < 35:
-            logger.debug(f"  {symbol} GATE 2 FAIL: SHORT ama fiyat çok Discount ({pd_level:.1f}%)")
-            return None
-
-        logger.debug(f"  {symbol} GATE 2 OK: HTF {bias} + {pd_zone['zone']} ({pd_level:.1f}%)")
-
-        # ═══════════════════════════════════════════════════════════
-        #  GATE 3 — LİKİDİTE SWEEP (Wick rejection zorunlu)
-        # ═══════════════════════════════════════════════════════════
-        sweep = self._find_sweep_event(df, bias)
-        if not sweep:
-            logger.debug(f"  {symbol} GATE 3 FAIL: Likidite sweep bulunamadı")
-            return None
-
-        logger.debug(
-            f"  {symbol} GATE 3 OK: {sweep['type']} @ {sweep['swept_level']:.6f} "
-            f"(wick_ratio: {sweep['wick_ratio']:.2f})"
-        )
-
-        # ═══════════════════════════════════════════════════════════
-        #  GATE 4 — HACİM DESTEKLİ DISPLACEMENT + MSS
-        # ═══════════════════════════════════════════════════════════
-        confirmation = self._find_post_sweep_confirmation(df, sweep, bias)
-        if not confirmation:
-            logger.debug(f"  {symbol} GATE 4 FAIL: Displacement+MSS+Hacim onayı yok → WATCH")
-            # ★ Gate 1-3 geçti, Gate 4 bekleniyor → İzleme listesine gönder
-            current_price = df["close"].iloc[-1]
             return {
-                "action": "WATCH",
+                "action": "SIGNAL",
                 "symbol": symbol,
-                "direction": bias,
-                "potential_entry": float(current_price),
-                "potential_sl": float(sweep.get("sweep_wick", sweep.get("swept_level", 0))),
-                "potential_tp": None,
-                "watch_reason": "Gate4 displacement/MSS bekleniyor",
-                "components": ["KILLZONE", "HTF_BIAS", "PREMIUM_DISCOUNT", "LIQUIDITY_SWEEP"],
+                "direction": trigger["direction"],
+                "entry_price": trigger["entry"],
+                "current_price": current_price,
+                "stop_loss": trigger["sl"],
+                "take_profit": trigger["tp"],
+                "rr_ratio": trigger["rr"],
+                "entry_mode": "MARKET",
+                "trigger_type": trigger["trigger_type"],
+                "quality_tier": trigger["quality"],
+                "components": trigger["components"],
+                "narrative": stored_narrative,
+                "poi": stored_poi,
+                "trigger_data": trigger,
+                "atr": atr_15m,
+                "confidence": 100,
+                "confluence_score": 100,
+                "timeframe": "15m",
             }
 
-        logger.debug(
-            f"  {symbol} GATE 4 OK: Displacement idx={confirmation['displacement']['index']} "
-            f"vol={confirmation['displacement']['volume']:.0f}/{confirmation['displacement']['avg_volume']:.0f}"
-        )
+        return None
 
-        # ═══════════════════════════════════════════════════════════
-        #  GATE 5 — FVG GİRİŞ + SL / TP
-        # ═══════════════════════════════════════════════════════════
-        disp_fvg = self._find_displacement_fvg(
-            df, confirmation["displacement"]["index"], bias
-        )
-        if not disp_fvg:
-            logger.debug(f"  {symbol} GATE 5 FAIL: Displacement FVG bulunamadı → WATCH")
-            # ★ Gate 1-4 geçti, FVG oluşmamış → İzleme listesine gönder
-            current_price = df["close"].iloc[-1]
-            return {
-                "action": "WATCH",
-                "symbol": symbol,
-                "direction": bias,
-                "potential_entry": float(current_price),
-                "potential_sl": float(sweep.get("sweep_wick", sweep.get("swept_level", 0))),
-                "potential_tp": None,
-                "watch_reason": "Gate5 FVG oluşması bekleniyor",
-                "components": ["KILLZONE", "HTF_BIAS", "PREMIUM_DISCOUNT", "LIQUIDITY_SWEEP", "DISPLACEMENT", "MSS"],
-            }
+    # =================================================================
+    #  BÖLÜM 6 — YARDIMCI ANALİZ FONKSİYONLARI (Dashboard)
+    # =================================================================
 
-        # Entry: FVG CE (Consequent Encroachment — orta nokta, optimal giriş)
-        fvg_ce = (disp_fvg["high"] + disp_fvg["low"]) / 2
-        if bias == "LONG":
-            entry = fvg_ce  # Bullish FVG CE — daha iyi RR için pullback ortası
-        else:
-            entry = fvg_ce  # Bearish FVG CE — daha iyi RR için pullback ortası
+    def full_analysis(self, symbol: str, multi_tf: Dict) -> Dict:
+        """Dashboard için tam analiz — sinyal üretmez, sadece bilgi verir."""
+        df_15m = multi_tf.get("15m")
+        df_1h = multi_tf.get("1h")
+        df_4h = multi_tf.get("4h")
 
-        # SL: Sweep wick extreme
-        sl = self._calc_structural_sl(df, sweep, bias, structure, entry)
-        if sl is None:
-            logger.debug(f"  {symbol} GATE 5 FAIL: SL hesaplanamadı")
-            return None
-
-        # TP: Karşı likidite havuzu
-        tp = self._calc_opposing_liquidity_tp(df, multi_tf_data, entry, sl, bias, structure)
-        if tp is None:
-            logger.debug(f"  {symbol} GATE 5 FAIL: TP hesaplanamadı")
-            return None
-
-        # Seviye doğrulama (mantıksal sıra)
-        if bias == "LONG":
-            if sl >= entry or tp <= entry:
-                logger.debug(f"  {symbol} GATE 5 FAIL: Seviye sırası hatalı (SL={sl:.6f} E={entry:.6f} TP={tp:.6f})")
-                return None
-        else:
-            if sl <= entry or tp >= entry:
-                logger.debug(f"  {symbol} GATE 5 FAIL: Seviye sırası hatalı (SL={sl:.6f} E={entry:.6f} TP={tp:.6f})")
-                return None
-
-        # SL mesafe kontrolü (v3.4: min %0.5, max %3.0)
-        sl_distance_pct = abs(entry - sl) / entry
-        min_sl = self.params.get("min_sl_distance_pct", 0.005)
-        max_sl = self.params.get("max_sl_distance_pct", 0.030)
-        
-        if sl_distance_pct < min_sl:
-            logger.debug(f"  {symbol} GATE 5 FAIL: SL çok dar ({sl_distance_pct*100:.2f}% < {min_sl*100:.1f}%)")
-            return None
-        if sl_distance_pct > max_sl:
-            logger.debug(f"  {symbol} GATE 5 FAIL: SL çok geniş ({sl_distance_pct*100:.2f}% > {max_sl*100:.1f}%)")
-            return None
-
-        current_price = df["close"].iloc[-1]
-        risk = abs(entry - sl)
-        reward = abs(tp - entry)
-        rr_ratio = reward / risk if risk > 0 else 0
-
-        # v3.4: SADECE LIMIT entry - FVG CE optimal giriş
-        # MARKET entry kaldırıldı (RR kaybı + entry quality düşüklüğü)
-        # Her zaman FVG CE'ye limit order kurulur
-        entry_mode = "LIMIT"
-        
-        # Entry FVG CE'de sabit (pullback için optimal nokta)
-        # Fiyat FVG'de bile olsa LIMIT kullan (daha iyi RR + kontrol)
-
-        logger.debug(f"  {symbol} GATE 5 OK: Entry={entry:.6f} (FVG CE LIMIT) SL={sl:.6f} TP={tp:.6f} RR={rr_ratio:.2f}")
-
-        # ═══════════════════════════════════════════════════════════
-        #  TÜM 5 GATE GEÇTİ → SİNYAL ÜRET
-        # ═══════════════════════════════════════════════════════════
-
-        components = [
-            "KILLZONE",
-            "HTF_BIAS",
-            "PREMIUM_DISCOUNT",
-            "LIQUIDITY_SWEEP",
-            "DISPLACEMENT",
-            "MSS",
-            "VOLUME_CONFIRMED",
-            "FVG",
-        ]
-
-        signal = {
+        result = {
             "symbol": symbol,
-            "direction": bias,
-            "entry": round(entry, 8),
-            "sl": round(sl, 8),
-            "tp": round(tp, 8),
-            "current_price": round(current_price, 8),
-            "confluence_score": 100,  # Boolean: tüm gate'ler geçti
-            "confidence": 100,
-            "components": components,
-            "penalties": [],
-            "session": session["label"],
-            "rr_ratio": round(rr_ratio, 2),
-            "entry_type": f"FVG Limit ({disp_fvg['type']})",
-            "sl_type": "Sweep Wick Extreme",
-            "tp_type": self._get_tp_type(tp, bias, multi_tf_data, structure),
-            "entry_mode": entry_mode,
-            "action": "SIGNAL",
-            "htf_bias": htf_result.get("htf_trend", bias),
-            "quality_tier": "A+",
-            "sweep": sweep,
-            "fvg": disp_fvg,
-            "pd_zone": pd_zone,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "narrative": {},
+            "pois": [],
+            "swing_points": {"highs": [], "lows": []},
+            "order_blocks": [],
+            "fvgs": [],
+            "liquidity": {},
+            "pd_zone": {},
+            "atr": 0,
         }
 
-        logger.info(
-            f"🎯 SİNYAL: {symbol} {bias} | "
-            f"Entry: {entry:.6f} | SL: {sl:.6f} | TP: {tp:.6f} | "
-            f"RR: {rr_ratio:.2f} | Mode: {entry_mode} | "
-            f"Session: {session['label']}"
-        )
+        if df_15m is None or len(df_15m) < 30:
+            return result
 
-        return signal
+        current_price = float(df_15m.iloc[-1]["close"])
+        atr = self._calc_atr(df_15m, 14)
+        result["atr"] = atr
 
-    # =================================================================
-    #  BÖLÜM 19 — API UYUMLU ANALİZ (calculate_confluence)
-    # =================================================================
+        narrative = self.analyze_narrative(df_4h, df_1h)
+        result["narrative"] = narrative
 
-    def calculate_confluence(self, df, multi_tf_data=None, override_direction=None):
-        """
-        API uyumlu analiz — /api/analyze endpoint'i için.
+        sh, sl_pts = self._find_swing_points(df_15m, lookback=self.params.get("swing_lookback", 5))
+        result["swing_points"] = {"highs": sh[-10:], "lows": sl_pts[-10:]}
+        result["order_blocks"] = self._find_order_blocks(df_15m, narrative["bias"])
+        result["fvgs"] = self._find_fvg(df_15m)
+        result["liquidity"] = self._find_liquidity_pools(sh, sl_pts, current_price)
+        result["pd_zone"] = self._calculate_premium_discount(sh, sl_pts, current_price)
 
-        ★ Puanlama sistemi KALDIRILDI.
-        ★ Her bileşen Boolean olarak raporlanır.
-        ★ confluence_score artık gate geçiş sayısını temsil eder.
-        """
-        analysis = {}
+        if narrative["bias"] != "NEUTRAL":
+            result["pois"] = self.find_poi_zones(df_15m, df_1h, narrative["bias"], current_price)
+
+        return result
+
+    def calculate_confluence(self, symbol: str, multi_tf: Dict) -> Dict:
+        """Uyumluluk metodu — eski API/frontend ile çalışması için."""
+        analysis = self.full_analysis(symbol, multi_tf)
+        narrative = analysis.get("narrative", {})
+        pois = analysis.get("pois", [])
+
+        direction = narrative.get("bias", "NEUTRAL")
         components = []
-        current_price = df["close"].iloc[-1]
-        analysis["current_price"] = current_price
-
-        # Session
-        session_info = self.get_session_info()
-        analysis["session"] = session_info
-        analysis["is_weekend"] = session_info["is_weekend"]
-        if session_info["is_valid_killzone"]:
-            components.append("KILLZONE")
-
-        # Ranging
-        analysis["is_ranging"] = self.detect_ranging_market(df)
-
-        # Market Structure
-        structure = self.detect_market_structure(df)
-        analysis["structure"] = structure
-        if structure["trend"] in ("BULLISH", "BEARISH"):
-            components.append("MARKET_STRUCTURE")
-
-        # HTF Bias
-        htf_result = self._analyze_htf_bias(multi_tf_data)
-        analysis["htf_result"] = htf_result
-        if htf_result:
-            analysis["htf_trend"] = htf_result["htf_trend"]
-            analysis["htf_structure"] = htf_result.get("structure")
-            analysis["htf_liquidity"] = htf_result.get("liquidity", [])
+        if direction != "NEUTRAL":
             components.append("HTF_BIAS")
-            bias = htf_result["bias"]
-        else:
-            analysis["htf_trend"] = "UNKNOWN"
-            analysis["htf_structure"] = None
-            analysis["htf_liquidity"] = []
-            bias = override_direction
+        if pois:
+            components.append("POI_ZONE")
+            if any(p.get("confluence_count", 0) >= 2 for p in pois):
+                components.append("MULTI_CONFLUENCE")
 
-        analysis["direction"] = bias or "UNKNOWN"
-
-        # Premium/Discount
-        pd_zone = self.calculate_premium_discount(df, structure)
-        analysis["premium_discount"] = pd_zone
-        if pd_zone:
-            if (bias == "LONG" and pd_zone["zone"] == "DISCOUNT") or \
-               (bias == "SHORT" and pd_zone["zone"] == "PREMIUM"):
-                components.append("PREMIUM_DISCOUNT")
-
-        # Liquidity Sweep
-        analysis["sweep"] = None
-        analysis["post_sweep_confirmation"] = None
-        analysis["displacement_fvg"] = None
-        if bias:
-            sweep = self._find_sweep_event(df, bias)
-            analysis["sweep"] = sweep
-            if sweep:
-                components.append("LIQUIDITY_SWEEP")
-                confirmation = self._find_post_sweep_confirmation(df, sweep, bias)
-                analysis["post_sweep_confirmation"] = confirmation
-                if confirmation:
-                    components.append("DISPLACEMENT")
-                    components.append("MSS")
-                    components.append("VOLUME_CONFIRMED")
-                    disp_fvg = self._find_displacement_fvg(
-                        df, confirmation["displacement"]["index"], bias
-                    )
-                    analysis["displacement_fvg"] = disp_fvg
-                    if disp_fvg:
-                        components.append("FVG")
-
-        # Order Blocks
-        active_obs, all_obs = self.find_order_blocks(df, structure)
-        analysis["order_blocks"] = active_obs
-        analysis["all_order_blocks"] = all_obs
-
-        # Breaker Blocks
-        analysis["breaker_blocks"] = self.find_breaker_blocks(all_obs, df)
-
-        # FVGs
-        analysis["fvgs"] = self.find_fvg(df)
-
-        # Displacements
-        analysis["displacements"] = self.detect_displacement(df)
-
-        # Liquidity Levels
-        analysis["liquidity"] = self.find_liquidity_levels(df)
-
-        # Gate geçiş sayısı (5 üzerinden)
-        total_gates = 5
-        gates_passed = 0
-        if "KILLZONE" in components:
-            gates_passed += 1
-        if "HTF_BIAS" in components and "PREMIUM_DISCOUNT" in components:
-            gates_passed += 1
-        if "LIQUIDITY_SWEEP" in components:
-            gates_passed += 1
-        if "DISPLACEMENT" in components and "MSS" in components and "VOLUME_CONFIRMED" in components:
-            gates_passed += 1
-        if "FVG" in components:
-            gates_passed += 1
-
-        analysis["confluence_score"] = round((gates_passed / total_gates) * 100)
-        analysis["gates_passed"] = gates_passed
-        analysis["total_gates"] = total_gates
-        analysis["components"] = components
-        analysis["penalties"] = []
-
-        return analysis
-
-    # =================================================================
-    #  BÖLÜM 20 — YARDIMCI FONKSİYONLAR
-    # =================================================================
-
-    def _get_tp_type(self, tp, direction, multi_tf_data, structure):
-        """TP seviyesinin ICT kaynağını belirle."""
-        # HTF likidite
-        if multi_tf_data:
-            for tf in ["4H", "1H"]:
-                if tf in multi_tf_data and multi_tf_data[tf] is not None and not multi_tf_data[tf].empty:
-                    htf_liq = self.find_liquidity_levels(multi_tf_data[tf])
-                    for liq in htf_liq:
-                        if direction == "LONG" and liq["type"] == "EQUAL_HIGHS" and not liq["swept"]:
-                            if abs(tp - liq["price"]) / tp < 0.005:
-                                return "HTF Draw on Liquidity (Equal Highs)"
-                        elif direction == "SHORT" and liq["type"] == "EQUAL_LOWS" and not liq["swept"]:
-                            if abs(tp - liq["price"]) / tp < 0.005:
-                                return "HTF Draw on Liquidity (Equal Lows)"
-                    break
-
-        # LTF liquidity — structure-based check
-        # Structure-based
-        if structure:
-            if direction == "LONG" and structure.get("last_swing_high"):
-                if abs(tp - structure["last_swing_high"]["price"]) / tp < 0.005:
-                    return "Swing High Yapısal Hedef"
-            elif direction == "SHORT" and structure.get("last_swing_low"):
-                if abs(tp - structure["last_swing_low"]["price"]) / tp < 0.005:
-                    return "Swing Low Yapısal Hedef"
-
-        return "Opposing Liquidity"
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "confluence_score": 100 if direction != "NEUTRAL" and pois else 0,
+            "components": components,
+            "narrative": narrative,
+            "poi_count": len(pois),
+            "best_rr": pois[0]["rr"] if pois else 0,
+        }
 
 
 # Global instance
