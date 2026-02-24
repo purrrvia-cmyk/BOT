@@ -758,33 +758,33 @@ class TradeManager:
             symbol = item["symbol"]
             candles_watched = int(item.get("candles_watched", 0))
             max_watch = item.get("max_watch_candles", WATCH_CONFIRM_CANDLES)
-            stored_ts = item.get("last_5m_candle_ts") or ""  # DB field ismi 5m ama artık 15m kullanıyoruz
+            stored_ts = item.get("last_5m_candle_ts") or ""  # Son görülen 5m mum timestamp'i
 
-            # 15m veri çek — son mum timestamp kontrolü (v3.4: TF değişti)
+            # 5m veri çek — 3 mum = 15dk izleme (v3.6: 15m→5m)
             try:
-                df_15m = data_fetcher.get_candles(symbol, "15m", 10)
+                df_ltf = data_fetcher.get_candles(symbol, WATCH_CONFIRM_TIMEFRAME, 15)
             except Exception as e:
-                logger.debug(f"Watchlist 15m veri hatası ({symbol}): {e}")
+                logger.debug(f"Watchlist {WATCH_CONFIRM_TIMEFRAME} veri hatası ({symbol}): {e}")
                 continue
 
-            if df_15m is None or df_15m.empty:
+            if df_ltf is None or df_ltf.empty:
                 continue
 
-            # Son kapanmış 15m mum timestamp'i (iloc kullan, index RangeIndex olabilir)
-            current_ts = str(df_15m.iloc[-1]["timestamp"])
+            # Son kapanmış 5m mum timestamp'i (iloc kullan, index RangeIndex olabilir)
+            current_ts = str(df_ltf.iloc[-1]["timestamp"])
 
             # Aynı mum → henüz yeni mum kapanmadı, atla
             if current_ts == stored_ts:
                 continue
 
-            # Yeni 15m mum kapandı → sayacı artır (v3.4: 1 mum yeterli)
+            # Yeni 5m mum kapandı → sayacı artır (3 mum = 15dk)
             candles_watched += 1
-            logger.info(f"📊 {symbol} yeni 15m mum ({candles_watched}/{max_watch})")
+            logger.info(f"📊 {symbol} yeni 5m mum ({candles_watched}/{max_watch})")
 
-            # 15m verisi ve multi-TF verisi ile yeniden analiz et
+            # 5m verisi ve multi-TF verisi ile yeniden analiz et
             try:
                 multi_tf = data_fetcher.get_multi_timeframe_data(symbol)
-                ltf_df = df_15m  # Zaten 15m çektik
+                ltf_df = df_ltf  # 5m veri
             except Exception as e:
                 logger.debug(f"Watchlist veri hatası ({symbol}): {e}")
                 update_watchlist_item(item["id"], candles_watched, 0,
@@ -809,7 +809,7 @@ class TradeManager:
                 if not setup_valid:
                     expire_watchlist_item(
                         item["id"],
-                        reason=f"Setup invalidated (SL/HTF) - {candles_watched}. 15m mum"
+                        reason=f"Setup invalidated (SL/HTF) - {candles_watched}. 5m mum"
                     )
                     logger.info(f"❌ SETUP INVALIDATED: {symbol} (SL veya HTF bias değişti)")
                     continue
@@ -821,15 +821,15 @@ class TradeManager:
                 if not setup_valid:
                     expire_watchlist_item(
                         item["id"],
-                        reason=f"Setup bozuldu ({candles_watched}. 15m mum)"
+                        reason=f"Setup bozuldu ({candles_watched}. 5m mum)"
                     )
-                    logger.info(f"❌ SETUP BOZULDU: {symbol} ({candles_watched}. 15m mum)")
+                    logger.info(f"❌ SETUP BOZULDU: {symbol} ({candles_watched}. 5m mum)")
                     continue
 
             # 1 mum doldu ve setup hâlâ geçerli → PROMOTE → işlem aç (v3.4: 1 mum yeterli)
             if candles_watched >= max_watch:
                 promote_watchlist_item(item["id"])
-                logger.info(f"✅ 15dk İZLEME TAMAM: {symbol} — setup hâlâ geçerli, işlem açılıyor")
+                logger.info(f"✅ 15dk İZLEME TAMAM (3×5m): {symbol} — setup hâlâ geçerli, işlem açılıyor")
 
                 # v3.5: signal_result None olabilir (tamamlanmış setup için)
                 if signal_result and signal_result.get("action") == "SIGNAL":
@@ -859,7 +859,7 @@ class TradeManager:
                         "action": "PROMOTED",
                         "trade_result": trade_result,
                     })
-                    logger.info(f"⬆️ İZLEMEDEN AKTİF SİNYALE: {symbol} (15dk izleme sonrası)")
+                    logger.info(f"⬆️ İZLEMEDEN AKTİF SİNYALE: {symbol} (3×5m / 15dk izleme sonrası)")
                 continue
 
             # Henüz 1 mum dolmadı, setup geçerli → izlemeye devam

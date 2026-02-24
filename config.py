@@ -110,12 +110,12 @@ OPTIMIZER_PARAM_BOUNDS = {
 SCAN_INTERVAL_SECONDS = 180  # Tarama aralığı (100 coin × 4 TF ≈ 165s, 180s güvenli)
 TRADE_CHECK_INTERVAL = 5    # Açık işlem kontrolü (saniye) — 10→5: daha hızlı SL/TP tepkisi
 
-# İzleme Onay Akışı (v3.4: 15m mum bazlı)
-WATCH_CONFIRM_TIMEFRAME = "15m"         # İzleme zaman dilimi (TF consistency)
-WATCH_CONFIRM_CANDLES = 1               # 15m mumda 1 mum bekle (15dk)
-WATCH_CHECK_INTERVAL = 180              # İzleme kontrolü aralığı (saniye = 3dk)
+# İzleme Onay Akışı (v3.6: 3×5m mum = 15dk)
+WATCH_CONFIRM_TIMEFRAME = "5m"          # İzleme zaman dilimi: 5 dakikalık grafikte izle
+WATCH_CONFIRM_CANDLES = 3               # 3 × 5m mum bekle = toplam 15dk
+WATCH_CHECK_INTERVAL = 60               # İzleme kontrolü aralığı (saniye) — 5m mum için 60s yeterli
 WATCH_REQUIRED_CONFIRMATIONS = 1        # Onay gerekli
-# Akış: ICT WATCH sinyali → 1 × 15m mum bekle → hâlâ geçerliyse SIGNAL'e promote
+# Akış: ICT WATCH sinyali → 3 × 5m mum bekle → hâlâ geçerliyse SIGNAL'e promote
 
 # Web Server
 HOST = "0.0.0.0"
