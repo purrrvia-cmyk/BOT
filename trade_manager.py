@@ -187,7 +187,7 @@ class TradeManager:
         direction = signal.get("direction", "LONG")
 
         # ══ MAX EŞZAMANLI İŞLEM ══
-        max_concurrent = int(self._param("max_concurrent_trades"))
+        max_concurrent = int(self._param("max_concurrent_trades") or 3)
         active_count = get_active_trade_count()
         if active_count >= max_concurrent:
             logger.warning(f"⛔ {symbol} reddedildi: Max eşzamanlı işlem limiti ({max_concurrent})")
@@ -212,7 +212,7 @@ class TradeManager:
 
         # ══ COOLDOWN KONTROLÜ ══
         recent_history = get_signal_history(30)
-        cooldown_minutes = int(self._param("signal_cooldown_minutes"))
+        cooldown_minutes = int(self._param("signal_cooldown_minutes") or 30)
         now = datetime.now()
         for s in recent_history:
             if s["symbol"] == symbol:
@@ -770,8 +770,8 @@ class TradeManager:
             if df_15m is None or df_15m.empty:
                 continue
 
-            # Son kapanmış 15m mum timestamp'i
-            current_ts = str(df_15m.index[-1])
+            # Son kapanmış 15m mum timestamp'i (iloc kullan, index RangeIndex olabilir)
+            current_ts = str(df_15m.iloc[-1]["timestamp"])
 
             # Aynı mum → henüz yeni mum kapanmadı, atla
             if current_ts == stored_ts:
