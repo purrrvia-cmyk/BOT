@@ -681,21 +681,75 @@ class TradeManager:
     #  İZLEME LİSTESİ (Basitleştirilmiş)
     # =================================================================
 
+    def _validate_completed_setup(self, symbol, item, ltf_df, multi_tf):
+        """
+        Tamamlanmış setup için basit invalidation check.
+        Gate'leri tekrar kontrol ETMEZ — sadece:
+          1. SL tetiklendi mi?
+          2. HTF bias değişti mi?
+        
+        Returns:
+            bool: Setup hala valid mi?
+        """
+        direction = item["direction"]
+        potential_sl = item.get("potential_sl")
+        
+        if not potential_sl or ltf_df is None or ltf_df.empty:
+            return False
+        
+        # Son fiyat
+        last_candle = ltf_df.iloc[-1]
+        current_high = last_candle.get("high", 0)
+        current_low = last_candle.get("low", 0)
+        
+        # SL invalidation check
+        if direction == "LONG":
+            if current_low <= potential_sl:
+                logger.debug(f"  {symbol} LONG setup invalidated: SL {potential_sl:.5f} tetiklendi (low={current_low:.5f})")
+                return False
+        else:  # SHORT
+            if current_high >= potential_sl:
+                logger.debug(f"  {symbol} SHORT setup invalidated: SL {potential_sl:.5f} tetiklendi (high={current_high:.5f})")
+                return False
+        
+        # HTF bias check (opsiyonel - strict değil)
+        if multi_tf and "4h" in multi_tf:
+            df_4h = multi_tf["4h"]
+            if not df_4h.empty and len(df_4h) >= 20:
+                ema_20 = df_4h["close"].iloc[-20:].mean()
+                current_price = df_4h["close"].iloc[-1]
+                
+                bias_changed = False
+                if direction == "LONG" and current_price < ema_20:
+                    bias_changed = True
+                elif direction == "SHORT" and current_price > ema_20:
+                    bias_changed = True
+                
+                if bias_changed:
+                    logger.debug(f"  {symbol} HTF bias değişti (setup geçersiz)")
+                    return False
+        
+        return True
+
     def check_watchlist(self, strategy_engine):
         """
-        15 dakikalık mum bazlı izleme listesi kontrolü — v3.4 crypto-optimized.
+        15 dakikalık mum bazlı izleme listesi kontrolü — v3.5 hybrid validation.
 
         Akış:
           1. ICT setup bulundu → watchlist'e alındı
           2. 1 × 15m mum kapanışı beklenir (15dk)
-          3. Mum kapandığında yeniden analiz edilir:
-             - SIGNAL veya WATCH (setup hâlâ geçerli) → PROMOTE → işlem aç
-             - None (setup bozuldu) → EXPIRE
+          3. Mum kapandığında analiz:
+             a) Setup tamamlanmışsa ("Tüm gate'ler geçti"):
+                → Gate'leri TEKRAR CHECK ETME
+                → Sadece SL/HTF invalidation check
+             b) Setup henüz tamamlanmamışsa ("Gate4/5 bekleniyor"):
+                → Normal gate validation (generate_signal)
           
-        v3.4 Değişiklikler:
-        - 5m mum sayma sistemi KALDIRILDI
-        - Direkt 15m TF üzerinden 1 mum izleme (TF consistency)
-        - Daha stabil, daha az noise
+        v3.5 Değişiklikler (HYBRID VALIDATION):
+        - Setup tamamlandıysa → displacement/FVG tekrar aranmaz
+        - ICT mantığı: displacement geçmişte oluştu, kaybolması normal
+        - Sadece invalidation (SL/HTF) check edilir
+        - v3.4'teki %100 expire sorunu çözüldü
         """
         watching_items = get_watching_items()
         promoted = []
@@ -742,29 +796,46 @@ class TradeManager:
                                      last_5m_candle_ts=current_ts)
                 continue
 
-            # Yeniden sinyal üret
-            signal_result = strategy_engine.generate_signal(symbol, ltf_df, multi_tf)
-            setup_valid = signal_result is not None and signal_result.get("action") in ("SIGNAL", "WATCH")
-
-            # Setup bozuldu → erken expire
-            if not setup_valid:
-                expire_watchlist_item(
-                    item["id"],
-                    reason=f"Setup bozuldu ({candles_watched}. 15m mum)"
-                )
-                logger.info(f"❌ SETUP BOZULDU: {symbol} ({candles_watched}. 15m mum)")
-                continue
+            # v3.5 HYBRID VALIDATION:
+            # Setup tamamlanmışsa → gate'leri tekrar check etme
+            # Setup tamamlanmamışsa → normal validation
+            watch_reason = item.get("watch_reason", "")
+            
+            if "Tüm gate'ler geçti" in watch_reason:
+                # Setup TAMAMLANMIŞ → sadece invalidation check
+                setup_valid = self._validate_completed_setup(symbol, item, ltf_df, multi_tf)
+                signal_result = None  # Kullanılmayacak, watchlist data'dan trade oluşturulacak
+                
+                if not setup_valid:
+                    expire_watchlist_item(
+                        item["id"],
+                        reason=f"Setup invalidated (SL/HTF) - {candles_watched}. 15m mum"
+                    )
+                    logger.info(f"❌ SETUP INVALIDATED: {symbol} (SL veya HTF bias değişti)")
+                    continue
+            else:
+                # Setup TAMAMLANMAMIŞ → normal gate validation
+                signal_result = strategy_engine.generate_signal(symbol, ltf_df, multi_tf)
+                setup_valid = signal_result is not None and signal_result.get("action") in ("SIGNAL", "WATCH")
+                
+                if not setup_valid:
+                    expire_watchlist_item(
+                        item["id"],
+                        reason=f"Setup bozuldu ({candles_watched}. 15m mum)"
+                    )
+                    logger.info(f"❌ SETUP BOZULDU: {symbol} ({candles_watched}. 15m mum)")
+                    continue
 
             # 1 mum doldu ve setup hâlâ geçerli → PROMOTE → işlem aç (v3.4: 1 mum yeterli)
             if candles_watched >= max_watch:
                 promote_watchlist_item(item["id"])
                 logger.info(f"✅ 15dk İZLEME TAMAM: {symbol} — setup hâlâ geçerli, işlem açılıyor")
 
-                # Son sinyal SIGNAL ise onu kullan, değilse watchlist verilerinden sinyal oluştur
-                if signal_result.get("action") == "SIGNAL":
+                # v3.5: signal_result None olabilir (tamamlanmış setup için)
+                if signal_result and signal_result.get("action") == "SIGNAL":
                     trade_signal = signal_result
                 else:
-                    # WATCH sinyalinden trade bilgilerini al
+                    # Watchlist verilerinden trade bilgilerini al
                     trade_signal = {
                         "symbol": symbol,
                         "direction": item["direction"],
@@ -772,13 +843,13 @@ class TradeManager:
                         "sl": item.get("potential_sl"),
                         "tp": item.get("potential_tp"),
                         "entry_mode": "LIMIT",  # v3.4: Her zaman LIMIT
-                        "rr_ratio": signal_result.get("rr_ratio", "?"),
-                        "components": signal_result.get("components", []),
-                        "htf_bias": signal_result.get("htf_bias", ""),
-                        "session": signal_result.get("session", ""),
-                        "entry_type": signal_result.get("entry_type", "ICT_WATCH"),
-                        "sl_type": signal_result.get("sl_type", ""),
-                        "tp_type": signal_result.get("tp_type", ""),
+                        "rr_ratio": signal_result.get("rr_ratio", "?") if signal_result else "?",
+                        "components": signal_result.get("components", []) if signal_result else [],
+                        "htf_bias": signal_result.get("htf_bias", "") if signal_result else "",
+                        "session": signal_result.get("session", "") if signal_result else "",
+                        "entry_type": signal_result.get("entry_type", "ICT_WATCH") if signal_result else "ICT_WATCH",
+                        "sl_type": signal_result.get("sl_type", "") if signal_result else "",
+                        "tp_type": signal_result.get("tp_type", "") if signal_result else "",
                     }
 
                 trade_result = self._open_trade(trade_signal)
