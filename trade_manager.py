@@ -62,28 +62,52 @@ class TradeManager:
         self._restore_trade_state()
 
     def _restore_trade_state(self):
-        """Restart sonrası ACTIVE sinyallerin breakeven/trailing durumunu geri yükle."""
+        """Restart sonrası ACTIVE sinyallerin breakeven/trailing durumunu geri yükle.
+
+        ★ Dikkat: SL < entry (SHORT) veya SL > entry (LONG) olması
+        her zaman breakeven demek değil — ters seviyeli sinyal de olabilir.
+        TP yönü ile çapraz kontrol yapılır.
+        """
         try:
             active = get_active_signals()
             for sig in active:
                 sid = sig["id"]
                 entry = sig.get("entry_price", 0)
                 sl = sig.get("stop_loss", 0)
+                tp = sig.get("take_profit", 0)
                 direction = sig.get("direction", "LONG")
-                if entry and sl:
-                    be_moved = False
-                    if direction == "LONG" and sl >= entry:
+                entry_time = sig.get("entry_time")
+
+                if not entry or not sl:
+                    continue
+
+                be_moved = False
+
+                if direction == "LONG" and sl >= entry:
+                    # LONG BE: SL entry üstüne taşınmış → kârı kilitlemiş
+                    # Doğrulama: TP hâlâ entry üstünde olmalı (yapısal bütünlük)
+                    if tp and tp > entry:
                         be_moved = True
-                    elif direction == "SHORT" and sl <= entry:
+                    else:
+                        logger.warning(f"⚠️ #{sid} {sig.get('symbol','?')} LONG ters seviyeler tespit edildi — BE olarak yüklenmedi")
+
+                elif direction == "SHORT" and sl <= entry:
+                    # SHORT BE: SL entry altına taşınmış → kârı kilitlemiş
+                    # Doğrulama: TP hâlâ entry altında ve SL > TP olmalı (yapısal bütünlük)
+                    if tp and tp < entry and sl > tp:
                         be_moved = True
-                    if be_moved:
-                        self._trade_state[sid] = {
-                            "breakeven_moved": True,
-                            "trailing_sl": sl,
-                            "breakeven_sl": sl,
-                            "early_protect_sl": None,
-                        }
-                        logger.info(f"♻️ {sig.get('symbol','?')} trade state restored: BE=True, SL={sl}")
+                    else:
+                        logger.warning(f"⚠️ #{sid} {sig.get('symbol','?')} SHORT ters seviyeler tespit edildi — BE olarak yüklenmedi")
+
+                if be_moved:
+                    self._trade_state[sid] = {
+                        "breakeven_moved": True,
+                        "trailing_sl": sl,
+                        "breakeven_sl": sl,
+                        "early_protect_sl": None,
+                    }
+                    logger.info(f"♻️ {sig.get('symbol','?')} trade state restored: BE=True, SL={sl}")
+
             if self._trade_state:
                 logger.info(f"♻️ {len(self._trade_state)} aktif sinyalin trade state'i geri yüklendi")
         except Exception as e:
@@ -113,6 +137,25 @@ class TradeManager:
         if action == "SIGNAL":
             logger.info(f"🎯 {signal_result['symbol']} → Tüm 5 gate geçti, işlem açılıyor")
             return self._open_trade(signal_result)
+
+        if action == "WATCH":
+            # Gate1-3 geçti, Gate4-5 teyit bekleniyor → watchlist'e ekle
+            try:
+                add_to_watchlist(
+                    symbol=signal_result["symbol"],
+                    direction=signal_result["direction"],
+                    potential_entry=signal_result.get("potential_entry"),
+                    potential_sl=signal_result.get("potential_sl"),
+                    potential_tp=signal_result.get("potential_tp"),
+                    watch_reason=signal_result.get("watch_reason", "Gate4 displacement bekleniyor"),
+                    initial_score=60,
+                    components=signal_result.get("components", []),
+                    max_watch=WATCH_CONFIRM_CANDLES,
+                )
+                logger.info(f"👁️ İZLEMEYE ALINDI: {signal_result['symbol']} ({signal_result['direction']}) Gate4 teyit bekleniyor")
+            except Exception as e:
+                logger.error(f"Watchlist ekleme hatası ({signal_result['symbol']}): {e}")
+            return None
 
         return None
 
@@ -359,7 +402,7 @@ class TradeManager:
                     }
 
         # ══ FİYAT FVG ENTRY'YE ULAŞTI MI? ══
-        entry_buffer = entry_price * 0.002
+        entry_buffer = entry_price * 0.0005  # %0.05 buffer (eskiden %0.2 → erken tetikleme)
 
         if direction == "LONG" and current_price <= entry_price + entry_buffer:
             activate_signal(signal_id)
@@ -423,7 +466,24 @@ class TradeManager:
         })
         is_be_trade = state.get("breakeven_moved", False)
 
-        # Seviye doğrulama (ters SL/TP kontrolü — BE trade'lerde atla)
+        # ══ TEMEL SEVİYE DOĞRULAMA ══
+        # ★ BE/non-BE fark etmez: TP her zaman SL'nin "öbür tarafında" olmalı
+        # LONG: TP > SL (kâr hedefi stop üstünde)
+        # SHORT: TP < SL (kâr hedefi stop altında)
+        structurally_valid = True
+        if direction == "LONG" and take_profit <= stop_loss:
+            structurally_valid = False
+        elif direction == "SHORT" and take_profit >= stop_loss:
+            structurally_valid = False
+
+        if not structurally_valid:
+            logger.warning(f"⚠️ #{signal_id} {symbol} {direction} yapısal olarak bozuk (TP vs SL ters) — iptal")
+            update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
+            self._trade_state.pop(signal_id, None)
+            result["status"] = "CANCELLED"
+            return result
+
+        # Seviye doğrulama (ters SL/TP kontrolü — BE trade'lerde SL entry tarafı atlanır)
         if direction == "LONG" and not is_be_trade and (stop_loss >= entry_price or take_profit <= entry_price):
             logger.warning(f"⚠️ #{signal_id} {symbol} LONG ters seviyeler — iptal")
             update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
@@ -621,10 +681,12 @@ class TradeManager:
         """
         İzleme listesi kontrolü.
 
-        ★ v3.0'da generate_signal sadece SIGNAL veya None döndürür.
-        ★ WATCH sinyalleri artık üretilmiyor.
-        ★ Bu metod geriye uyumluluk için korundu (app.py çağırıyor).
-        ★ Mevcut watchlist öğeleri tamamlanır veya expire edilir.
+        Gate1-3 geçmiş ama Gate4/5 henüz geçmemiş coinleri takip eder.
+        Her kontrol döngüsünde yeniden sinyal üretilir:
+          - SIGNAL → promote (işlem aç)
+          - WATCH → izlemeye devam (candles_watched artır)
+          - None → ilgi kaybolmuş, candles_watched artır
+        Max izleme süresi dolunca expire.
         """
         watching_items = get_watching_items()
         promoted = []
@@ -634,18 +696,23 @@ class TradeManager:
             candles_watched = int(item.get("candles_watched", 0)) + 1
             max_watch = item.get("max_watch_candles", WATCH_CONFIRM_CANDLES)
 
-            # Max mum sayısına ulaştıysa expire et
+            # Max izleme süresi doldu → expire
             if candles_watched >= max_watch:
                 expire_watchlist_item(
                     item["id"],
-                    reason="v3.0: Boolean gate sistemi — watchlist devre dışı"
+                    reason=f"İzleme süresi doldu ({max_watch} döngü)"
                 )
-                logger.debug(f"⏰ İZLEME BİTTİ: {symbol} (v3.0 watchlist expire)")
+                logger.info(f"⏰ İZLEME BİTTİ: {symbol} ({candles_watched}/{max_watch} döngü)")
                 continue
 
             # 15m verisi çek ve yeniden analiz et
-            multi_tf = data_fetcher.get_multi_timeframe_data(symbol)
-            ltf_df = data_fetcher.get_candles(symbol, "15m", 120)
+            try:
+                multi_tf = data_fetcher.get_multi_timeframe_data(symbol)
+                ltf_df = data_fetcher.get_candles(symbol, "15m", 120)
+            except Exception as e:
+                logger.debug(f"Watchlist veri hatası ({symbol}): {e}")
+                update_watchlist_item(item["id"], candles_watched, item.get("initial_score", 0))
+                continue
 
             if ltf_df is None or ltf_df.empty or multi_tf is None:
                 update_watchlist_item(item["id"], candles_watched, item.get("initial_score", 0))
@@ -655,6 +722,7 @@ class TradeManager:
             signal_result = strategy_engine.generate_signal(symbol, ltf_df, multi_tf)
 
             if signal_result and signal_result.get("action") == "SIGNAL":
+                # Tüm gate'ler geçti → watchlist'ten promote et ve işlem aç
                 promote_watchlist_item(item["id"])
                 trade_result = self._open_trade(signal_result)
 
@@ -667,8 +735,15 @@ class TradeManager:
                     logger.info(f"⬆️ İZLEMEDEN SİNYALE: {symbol} (tüm gate'ler geçti)")
                 continue
 
-            # Henüz sinyal yok — güncelle ve bekle
-            update_watchlist_item(item["id"], candles_watched, item.get("initial_score", 0))
+            # Hâlâ WATCH veya None → izlemeye devam
+            # WATCH ise skor güncelle (gate'ler hâlâ geçerli)
+            if signal_result and signal_result.get("action") == "WATCH":
+                new_score = min(90, item.get("initial_score", 60) + candles_watched * 2)
+                update_watchlist_item(item["id"], candles_watched, new_score)
+            else:
+                # None → gate'ler artık geçmiyor, skoru düşür
+                new_score = max(20, item.get("current_score", 60) - 5)
+                update_watchlist_item(item["id"], candles_watched, new_score)
 
         return promoted
 

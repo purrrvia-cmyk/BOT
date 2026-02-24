@@ -4,7 +4,7 @@ Market Regime Engine — Piyasa Rejimi, Piyasa Nabzı ve Rölatif Güç Analizi
 KATMAN 0: Piyasa nabzı (Altcoin sağlığı, Fear&Greed proxy, genel yorum)
 KATMAN 1: Makro rejim tespiti (BTC trend + BTC.D proxy + USDT.D proxy)
 KATMAN 2: Rölatif güç sıralaması (her coin vs BTC)
-KATMAN 3: Fırsat filtreleme (Top adaylar → ICT/QPA'ya gönder)
+KATMAN 3: Fırsat filtreleme (Top adaylar → ICT'ye gönder)
 
 OKX Public API kullanır, API key gerekmez.
 """
@@ -640,7 +640,7 @@ class MarketRegime:
     def _build_filtered_map(self, coin_list, rs_rankings, long_cands, short_cands, regime):
         """
         Her coin için izin verilen yönleri belirle.
-        Stratejiler (ICT/QPA) bu haritaya bakarak sadece izinli yönde sinyal üretecek.
+        Stratejiler (ICT) bu haritaya bakarak sadece izinli yönde sinyal üretecek.
         """
         rs_lookup = {r["symbol"]: r for r in rs_rankings}
         filtered = {}

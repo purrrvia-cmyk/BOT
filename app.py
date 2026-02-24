@@ -109,6 +109,7 @@ def scan_markets():
             regime = bot_state.get("current_regime", "UNKNOWN")
 
         # ── Tüm coinleri ICT ile tara (rejim filtresi yok) ──
+        gate_stats = {f"gate{i}": 0 for i in range(2, 6)}  # pass counts
         for symbol in active_coins:
             if market_regime._is_btc(symbol):
                 continue  # BTC referans, sinyale gerek yok
@@ -127,15 +128,26 @@ def scan_markets():
                 if result:
                     trade_result = trade_manager.process_signal(result)
                     if trade_result:
-                        trade_result["regime"] = regime
-                        new_signals.append(trade_result)
-                        socketio.emit("new_signal", trade_result)
+                        # REJECTED sinyalleri frontend'e gönderme (undefined toast engeli)
+                        if trade_result.get("status") not in ("REJECTED",):
+                            trade_result["regime"] = regime
+                            new_signals.append(trade_result)
+                            socketio.emit("new_signal", trade_result)
+                    elif result.get("action") == "WATCH":
+                        # WATCH sonuçları → frontend'te watchlist güncelle
+                        socketio.emit("watchlist_updated", {
+                            "symbol": result["symbol"],
+                            "direction": result["direction"],
+                            "reason": result.get("watch_reason", ""),
+                        })
 
                 symbols_scanned += 1
                 time.sleep(0.15)  # Rate limit
 
             except Exception as e:
                 logger.error(f"Hata ({symbol}): {e}")
+                import traceback
+                logger.error(traceback.format_exc())
                 bot_state["errors"].append({
                     "time": datetime.now().isoformat(),
                     "symbol": symbol,
@@ -144,7 +156,17 @@ def scan_markets():
                 bot_state["errors"] = bot_state["errors"][-20:]
 
         bot_state["symbols_scanned"] = symbols_scanned
-        logger.info(f"✅ Tarama tamamlandı: {symbols_scanned} coin, {len(new_signals)} sinyal | Rejim: {regime}")
+        logger.info(f"✅ ICT Tarama tamamlandı: {symbols_scanned} coin, {len(new_signals)} sinyal | Rejim: {regime}")
+
+        # ── İzleme listesi kontrolü (her tarama döngüsünde = 180s) ──
+        try:
+            promoted = trade_manager.check_watchlist(ict_strategy)
+            for p in promoted:
+                socketio.emit("watch_promoted", p)
+            if promoted:
+                logger.info(f"⬆️ Watchlist promote: {len(promoted)} sinyal")
+        except Exception as e:
+            logger.error(f"Watchlist kontrol hatası: {e}")
 
         # Dashboard güncelle
         socketio.emit("scan_complete", {
@@ -173,11 +195,6 @@ def check_trades():
         for r in results:
             if r["status"] in ["WON", "LOST"]:
                 socketio.emit("trade_closed", r)
-
-        # İzleme listesini kontrol et
-        promoted = trade_manager.check_watchlist(ict_strategy)
-        for p in promoted:
-            socketio.emit("watch_promoted", p)
 
         # Dashboard güncelle
         socketio.emit("trades_updated", {

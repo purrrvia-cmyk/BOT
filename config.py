@@ -51,9 +51,6 @@ ICT_PARAMS = {
     "liquidity_min_touches": 2,          # Minimum dokunma sayısı
     
     # Sinyal Üretimi
-    "min_confluence_score": 60,     # Minimum confluent skor (0-100) — 55→60: daha seçici sinyal filtreleme
-    "min_confidence": 60,           # Minimum güven skoru (0-100) — 55→60: kalitesiz sinyalleri ele
-    
     # Risk Yönetimi
     "default_sl_pct": 0.012,       # Varsayılan stop loss (%1.2) — yapısal SL öncelikli, bu sadece fallback
     "default_tp_ratio": 2.5,       # TP/SL oranı (Risk-Reward) — 2.0→2.5: daha iyi RR
@@ -73,7 +70,7 @@ ICT_PARAMS = {
 }
 
 # Limit Emir Ayarları
-LIMIT_ORDER_EXPIRY_HOURS = 0.75  # Limit emir geçerlilik süresi (saat) — 2h→45dk: kripto hızlı döner
+LIMIT_ORDER_EXPIRY_HOURS = 3.0   # Limit emir geçerlilik süresi (saat) — FVG pullback için yeterli süre
                                  # FVG'ye limit emir koyulduğunda max bekleme zamanı
 MAX_TRADE_DURATION_HOURS = 4     # Aktif işlem max yaşam süresi (saat) — 8h→4h: 15m TF için yeterli
                                  # 15m TF sinyal geçerliliği: uzun süren işlemler kaybetme eğiliminde
@@ -115,13 +112,10 @@ OPTIMIZER_PARAM_BOUNDS = {
 SCAN_INTERVAL_SECONDS = 180  # Tarama aralığı (100 coin × 4 TF ≈ 165s, 180s güvenli)
 TRADE_CHECK_INTERVAL = 5    # Açık işlem kontrolü (saniye) — 10→5: daha hızlı SL/TP tepkisi
 
-# QPA Tarama (ICT ile eşzamanlı ama bağımsız)
-QPA_SCAN_ENABLED = True     # QPA stratejisi aktif mi?
-
 # İzleme Onay Akışı (zorunlu)
 WATCH_CONFIRM_TIMEFRAME = "5m"          # İzleme zaman dilimi
-WATCH_CONFIRM_CANDLES = 3               # Kaç mum kapanışı izlenecek
-WATCH_REQUIRED_CONFIRMATIONS = 2        # 3 mum içinde 2 onay gerekli
+WATCH_CONFIRM_CANDLES = 24              # Kaç tarama döngüsü izlenecek (24 × 180s = ~72dk)
+WATCH_REQUIRED_CONFIRMATIONS = 2        # Onay gerekli
 # v2 kriterler: NEUTRAL trend → otomatik onay değil, mum gövde filtresi,
 # hacim doğrulaması (%80 ort.), entry mesafe kontrolü (max %2)
 

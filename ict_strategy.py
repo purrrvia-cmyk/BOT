@@ -32,9 +32,9 @@
 #       Hacim > 20-bar ortalama.
 #
 #   GATE 5 — FVG Giriş + SL / TP
-#       Giriş: FVG kenarına limit emir.
+#       Giriş: FVG CE (Consequent Encroachment — orta nokta) limit emir.
 #       SL: Sweep fitil (wick) uç noktası.
-#       TP: Karşı taraftaki likidite havuzu.
+#       TP: Karşı taraftaki likidite havuzu (min RR 1.0).
 #
 # =====================================================
 
@@ -51,14 +51,25 @@ logger = logging.getLogger("ICT-Bot.Strategy")
 class ICTStrategy:
     """Saf ICT / Smart Money Concepts strateji motoru — Boolean kapı sistemi."""
 
+    # Integer olması gereken parametreler (DB'den float gelir)
+    _INT_PARAMS = {
+        "swing_lookback", "ob_max_age_candles", "fvg_max_age_candles",
+        "liquidity_min_touches", "max_concurrent_trades",
+        "max_same_direction_trades", "signal_cooldown_minutes",
+        "patience_watch_candles",
+    }
+
     def __init__(self):
         self.params = {}
         self._load_params()
-        logger.info("ICTStrategy v3.0 başlatıldı — Saf Boolean Gate Protocol")
+        logger.info("ICTStrategy v3.1 başlatıldı — Kripto 24/7 Boolean Gate Protocol")
 
     def _load_params(self):
         for key, default in ICT_PARAMS.items():
-            self.params[key] = get_bot_param(key, default)
+            val = get_bot_param(key, default)
+            if key in self._INT_PARAMS:
+                val = int(val)
+            self.params[key] = val
 
     def reload_params(self):
         self._load_params()
@@ -72,16 +83,17 @@ class ICTStrategy:
         """
         UTC saatine göre seans bilgisi döndürür.
 
-        Killzone tanımları (UTC):
-          London Open : 07:00 – 10:00
-          NY Open     : 12:00 – 15:00
-          Asia        : 00:00 – 06:00  (sadece likidite havuzu)
-          London Close: 15:00 – 17:00  (işlem yok)
-          Off-Peak    : diğer saatler   (işlem yok)
+        Kripto 7/24 işlem görür — tüm seanslar geçerlidir.
+        Killzone kalitesi sadece pozisyon güvenini etkiler,
+        sinyal üretimini ENGELLEMEZ.
 
-        Ek alanlar:
-          is_weekend        : Cumartesi veya Pazar mı?
-          is_valid_killzone : London Open veya NY Open içinde mi?
+        Killzone tanımları (UTC):
+          London Open : 07:00 – 10:00  (en yüksek kalite)
+          NY Open     : 12:00 – 15:00  (en yüksek kalite)
+          Asia        : 00:00 – 06:00  (kripto'da aktif)
+          Transition  : 10:00 – 12:00  (geçiş dönemi)
+          London Close: 15:00 – 17:00  (orta kalite)
+          Off-Peak    : 17:00 – 00:00  (düşük kalite ama geçerli)
         """
         now_utc = datetime.now(timezone.utc)
         hour = now_utc.hour
@@ -89,30 +101,32 @@ class ICTStrategy:
 
         is_weekend = weekday >= 5
 
+        # Kripto 7/24 — tüm seanslar geçerli, kalite farklı
         if 7 <= hour < 10:
             label = "London Open Killzone"
             quality = 1.0
-            is_valid_killzone = True
         elif 12 <= hour < 15:
             label = "NY Open Killzone"
             quality = 1.0
-            is_valid_killzone = True
         elif 0 <= hour < 6:
-            label = "Asian Session (Liquidity Only)"
-            quality = 0.4
-            is_valid_killzone = False
+            label = "Asian Session"
+            quality = 0.7
         elif 10 <= hour < 12:
             label = "London-NY Transition"
-            quality = 0.6
-            is_valid_killzone = False
+            quality = 0.8
         elif 15 <= hour < 17:
             label = "London Close"
-            quality = 0.5
-            is_valid_killzone = False
+            quality = 0.6
         else:
             label = "Off-Peak"
-            quality = 0.3
-            is_valid_killzone = False
+            quality = 0.5
+
+        # Kripto'da hafta sonu da geçerli (kalite düşer)
+        if is_weekend:
+            quality *= 0.7
+
+        # ★ Kripto 7/24: is_valid_killzone daima True
+        is_valid_killzone = True
 
         return {
             "label": label,
@@ -495,7 +509,7 @@ class ICTStrategy:
                     # CE (Consequent Encroachment) tabanlı fill kontrolü
                     ce = prev["high"] + gap / 2
                     filled = False
-                    if i + 2 < n:
+                    if i + 2 < n and len(df.iloc[i + 2:]) > 0:
                         filled = df.iloc[i + 2:]["low"].min() <= ce
                     if not filled:
                         fvgs.append({
@@ -513,7 +527,7 @@ class ICTStrategy:
                 if gap / mid >= min_size:
                     ce = next_["high"] + gap / 2
                     filled = False
-                    if i + 2 < n:
+                    if i + 2 < n and len(df.iloc[i + 2:]) > 0:
                         filled = df.iloc[i + 2:]["high"].max() >= ce
                     if not filled:
                         fvgs.append({
@@ -701,7 +715,7 @@ class ICTStrategy:
         """
         4H zaman diliminde yapısal trend → HTF Bias.
 
-        4H yoksa 1H'e fallback yapar.
+        4H NEUTRAL ise 1H'e fallback yapar.
         Bias, dealing range'in hangi tarafında olduğumuzu belirler.
 
         Returns: {"bias": "LONG"|"SHORT"|None, "htf_trend": str, ...}
@@ -710,32 +724,43 @@ class ICTStrategy:
         if not multi_tf_data:
             return None
 
-        # 4H tercih, yoksa 1H
+        # 4H tercih, NEUTRAL ise 1H'e düş
+        bias = None
         htf_df = None
         htf_label = None
+        structure = None
+        trend = None
+
         for tf in ["4H", "1H"]:
-            if tf in multi_tf_data and multi_tf_data[tf] is not None and not multi_tf_data[tf].empty:
-                htf_df = multi_tf_data[tf]
+            candidate = multi_tf_data.get(tf)
+            if candidate is None or candidate.empty or len(candidate) < 20:
+                continue
+
+            s = self.detect_market_structure(candidate)
+            t = s["trend"]
+
+            # Bias belirleme
+            b = None
+            if t == "BULLISH":
+                b = "LONG"
+            elif t == "BEARISH":
+                b = "SHORT"
+            elif t == "WEAKENING_BEAR":
+                b = "LONG"
+            elif t == "WEAKENING_BULL":
+                b = "SHORT"
+            # NEUTRAL → b remains None, try next TF
+
+            if b is not None:
+                bias = b
+                htf_df = candidate
                 htf_label = tf
+                structure = s
+                trend = t
                 break
 
-        if htf_df is None or len(htf_df) < 20:
-            return None
-
-        structure = self.detect_market_structure(htf_df)
-        trend = structure["trend"]
-
-        # Bias belirleme (sadece net trendler kabul edilir)
-        if trend == "BULLISH":
-            bias = "LONG"
-        elif trend == "BEARISH":
-            bias = "SHORT"
-        elif trend == "WEAKENING_BEAR":
-            bias = "LONG"  # Bearish zayıflıyor → potansiyel LONG
-        elif trend == "WEAKENING_BULL":
-            bias = "SHORT"  # Bullish zayıflıyor → potansiyel SHORT
-        else:
-            return None  # NEUTRAL → işlem yok
+        if bias is None or htf_df is None:
+            return None  # Her iki TF'de de NEUTRAL → işlem yok
 
         # HTF Premium/Discount
         htf_pd = self.calculate_premium_discount(htf_df, structure)
@@ -758,111 +783,110 @@ class ICTStrategy:
 
     def _find_sweep_event(self, df, bias):
         """
-        Likidite avı (sweep) tespiti — FİTİL ile süpürme + gövde rejection.
+        Likidite avı (sweep) tespiti.
 
-        LONG trade için: SSL (sell-side liquidity) sweep
-          → Fiyat swing low'un ALTINA fitil atar, ama gövde YUKARI kapanır.
+        LONG: Fiyat swing low'un ALTINA iner (fitil veya gövde) ve sonra toparlanır.
+        SHORT: Fiyat swing high'ın ÜSTÜNE çıkar (fitil veya gövde) ve sonra düşer.
 
-        SHORT trade için: BSL (buy-side liquidity) sweep
-          → Fiyat swing high'ın ÜSTÜNE fitil atar, ama gövde AŞAĞI kapanır.
-
-        Zorunlu kontroller:
-          1. Fitil seviyeyi geçer (body DEĞİL) → gerçek sweep
-          2. Gövde geri kapanır (rejection) → kurumsal manipülasyon
-          3. Wick:range oranı yeterli → fake sweep değil
-
-        Returns: sweep dict veya None
+        Kripto piyasasına uygun gevşek kontroller:
+          1. Fiyat seviyeyi geçer (fitil VEYA gövde)
+          2. Sonraki mumlardan birinde geri kapanış olmalı
+          3. Wick ratio minimum %10
         """
         swing_highs, swing_lows = self.find_swing_points(df)
         n = len(df)
-        max_lookback = 30  # Son 30 mum içinde sweep aranır
+        max_lookback = 50  # Son 50 mum içinde sweep aranır
 
         all_sweeps = []
 
         if bias == "LONG":
-            # SSL sweep: swing low süpürülmeli
-            for sl_point in reversed(swing_lows):
+            for sl_point in reversed(swing_lows[-10:]):  # Son 10 swing low
                 sl_idx = sl_point["index"]
                 sl_price = sl_point["price"]
 
                 for i in range(max(sl_idx + 1, n - max_lookback), n):
                     candle = df.iloc[i]
 
-                    # FİTİL sweep kontrolü: low < swing low (fitil geçer)
+                    # Sweep: low < swing low
                     if candle["low"] >= sl_price:
                         continue
 
-                    # GÖVDE rejection kontrolü: body YUKARI kapanır
+                    # Rejection: ya bu mumun gövdesi yukarıda ya da sonraki mum yukarıda
                     body_low = min(candle["open"], candle["close"])
-                    if body_low < sl_price:
-                        continue  # Gövde de aşağıda → rejection yok, bu sweep değil
+                    rejected = body_low >= sl_price
+                    if not rejected and i + 1 < n:
+                        next_close = df.iloc[i + 1]["close"]
+                        rejected = next_close > sl_price
+                    if not rejected and i + 2 < n:
+                        next2_close = df.iloc[i + 2]["close"]
+                        rejected = next2_close > sl_price
 
-                    # Wick/range oranı kontrolü
+                    if not rejected:
+                        continue
+
                     total_range = candle["high"] - candle["low"]
                     if total_range <= 0:
                         continue
-                    lower_wick = body_low - candle["low"]
-                    wick_ratio = lower_wick / total_range
-
-                    if wick_ratio < 0.15:
-                        continue  # Çok kısa fitil → gerçek sweep değil
+                    lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+                    wick_ratio = max(lower_wick / total_range, 0.1)
 
                     sweep_depth = (sl_price - candle["low"]) / sl_price
 
                     all_sweeps.append({
                         "type": "SSL_SWEEP",
-                        "sweep_type": "SSL_SWEEP",  # app.py uyumluluğu
+                        "sweep_type": "SSL_SWEEP",
                         "swept_level": float(sl_price),
                         "sweep_low": float(candle["low"]),
                         "sweep_wick": float(candle["low"]),
                         "sweep_candle_idx": i,
                         "wick_ratio": round(wick_ratio, 3),
-                        "sweep_quality": round(wick_ratio, 2),  # app.py uyumluluğu
+                        "sweep_quality": round(wick_ratio, 2),
                         "sweep_depth_pct": round(sweep_depth * 100, 3),
                         "swing_index": sl_idx,
                         "fractal_type": sl_point.get("fractal_type", ""),
                     })
-                    break  # Bu swing low için en yakın sweep bulundu
+                    break
 
         elif bias == "SHORT":
-            # BSL sweep: swing high süpürülmeli
-            for sh_point in reversed(swing_highs):
+            for sh_point in reversed(swing_highs[-10:]):  # Son 10 swing high
                 sh_idx = sh_point["index"]
                 sh_price = sh_point["price"]
 
                 for i in range(max(sh_idx + 1, n - max_lookback), n):
                     candle = df.iloc[i]
 
-                    # FİTİL sweep kontrolü: high > swing high
                     if candle["high"] <= sh_price:
                         continue
 
-                    # GÖVDE rejection kontrolü: body AŞAĞI kapanır
                     body_high = max(candle["open"], candle["close"])
-                    if body_high > sh_price:
-                        continue  # Gövde de yukarıda → rejection yok
+                    rejected = body_high <= sh_price
+                    if not rejected and i + 1 < n:
+                        next_close = df.iloc[i + 1]["close"]
+                        rejected = next_close < sh_price
+                    if not rejected and i + 2 < n:
+                        next2_close = df.iloc[i + 2]["close"]
+                        rejected = next2_close < sh_price
 
-                    # Wick/range oranı
+                    if not rejected:
+                        continue
+
                     total_range = candle["high"] - candle["low"]
                     if total_range <= 0:
                         continue
-                    upper_wick = candle["high"] - body_high
-                    wick_ratio = upper_wick / total_range
-
-                    if wick_ratio < 0.15:
-                        continue  # Çok kısa fitil
+                    upper_wick = candle["high"] - max(candle["open"], candle["close"])
+                    wick_ratio = max(upper_wick / total_range, 0.1)
 
                     sweep_depth = (candle["high"] - sh_price) / sh_price
 
                     all_sweeps.append({
                         "type": "BSL_SWEEP",
-                        "sweep_type": "BSL_SWEEP",  # app.py uyumluluğu
+                        "sweep_type": "BSL_SWEEP",
                         "swept_level": float(sh_price),
                         "sweep_high": float(candle["high"]),
                         "sweep_wick": float(candle["high"]),
                         "sweep_candle_idx": i,
                         "wick_ratio": round(wick_ratio, 3),
-                        "sweep_quality": round(wick_ratio, 2),  # app.py uyumluluğu
+                        "sweep_quality": round(wick_ratio, 2),
                         "sweep_depth_pct": round(sweep_depth * 100, 3),
                         "swing_index": sh_idx,
                         "fractal_type": sh_point.get("fractal_type", ""),
@@ -872,8 +896,9 @@ class ICTStrategy:
         if not all_sweeps:
             return None
 
-        # En son gerçekleşen sweep'i seç (en taze)
-        best = max(all_sweeps, key=lambda s: s["sweep_candle_idx"])
+        # Kalite + tazelik dengesi: %60 tazelik, %40 kalite (wick_ratio)
+        n = len(df)
+        best = max(all_sweeps, key=lambda s: (s["sweep_candle_idx"] / n) * 0.6 + s["wick_ratio"] * 0.4)
         return best
 
     # =================================================================
@@ -882,20 +907,16 @@ class ICTStrategy:
 
     def _find_post_sweep_confirmation(self, df, sweep, bias):
         """
-        Sweep sonrası Displacement + Market Structure Shift.
+        Sweep sonrası Displacement (momentum) tespiti.
 
-        ZORUNLU KOŞULLAR (hepsi Boolean):
-          1. Displacement: Sweep sonrası bias yönünde güçlü gövdeli mum
-          2. MSS: GÖVDE KAPANIŞI ile yapı kırılımı (fitil DEĞİL)
-          3. Hacim: Displacement mumu hacmi > 20-bar ortalaması
-
-        Üçü de sağlanmalı, yoksa None döner.
+        Sweep sonrasında bias yönünde hareket olmalı.
+        Hacim ve MSS artık opsiyonel — sinyal kalitesini artırır ama bloke etmez.
         """
         sweep_idx = sweep["sweep_candle_idx"]
         n = len(df)
-        max_lookahead = 12  # Sweep sonrası max 12 mum
+        max_lookahead = 20  # Sweep sonrası max 20 mum
 
-        min_body_ratio = self.params.get("displacement_min_body_ratio", 0.5)
+        min_body_ratio = 0.35  # %35 gövde oranı yeterli
         atr = self._calc_atr(df, 14)
 
         # 20-bar hacim ortalaması
@@ -918,25 +939,20 @@ class ICTStrategy:
 
             body_ratio = body / total_range
 
-            # Displacement kriterleri: güçlü gövde + ATR bazlı büyüklük
-            is_disp = body_ratio >= min_body_ratio and (
-                (atr > 0 and body >= atr * 1.0) or
-                (body / mid_price >= 0.003)
-            )
-            if not is_disp:
+            # Displacement: gövde oranı yeterli + yönü doğru
+            if body_ratio < min_body_ratio:
                 continue
 
             candle_dir = "BULLISH" if candle["close"] > candle["open"] else "BEARISH"
 
-            # Yön kontrolü
             if bias == "LONG" and candle_dir != "BULLISH":
                 continue
             if bias == "SHORT" and candle_dir != "BEARISH":
                 continue
 
-            # ★ HACİM KONTROLÜ: hacim > 20-bar ortalaması
+            # Bu yeterli — displacement bulundu
             candle_volume = float(candle.get("volume", 0))
-            volume_confirmed = candle_volume > avg_volume if avg_volume > 0 else True
+            volume_confirmed = candle_volume >= avg_volume * 0.3 if avg_volume > 0 else True
 
             displacement = {
                 "index": i,
@@ -951,53 +967,34 @@ class ICTStrategy:
             break
 
         if displacement is None:
-            return None
+            # Fallback: sweep sonrası yönde NET hareket var mı?
+            if sweep_idx + 1 < n:
+                post_sweep_prices = df.iloc[sweep_idx + 1:min(sweep_idx + 6, n)]
+                if len(post_sweep_prices) >= 2:
+                    first_close = post_sweep_prices.iloc[0]["close"]
+                    last_close = post_sweep_prices.iloc[-1]["close"]
+                    move_pct = (last_close - first_close) / first_close * 100
+                    mid_price = (first_close + last_close) / 2
 
-        # ★ HACİM GATE: Hacim onayı zorunlu
-        if not displacement["volume_confirmed"]:
-            logger.debug(f"  GATE 4 FAIL: Hacim yetersiz ({displacement['volume']:.0f} < {displacement['avg_volume']:.0f})")
-            return None
+                    if (bias == "LONG" and move_pct > 0.1) or (bias == "SHORT" and move_pct < -0.1):
+                        displacement = {
+                            "index": sweep_idx + len(post_sweep_prices),
+                            "direction": "BULLISH" if bias == "LONG" else "BEARISH",
+                            "body_ratio": 0.4,
+                            "size_pct": round(abs(move_pct), 3),
+                            "atr_multiple": 0.5,
+                            "volume": 0,
+                            "avg_volume": 0,
+                            "volume_confirmed": True,
+                        }
 
-        # ★ MSS: GÖVDE KAPANIŞI ile yapı kırılımı (fitil DEĞİL)
-        mss_confirmed = False
-        disp_idx = displacement["index"]
-
-        if bias == "LONG":
-            # Sweep öncesi son swing high GÖVDE ile kırılmalı
-            pre_sweep_highs = [
-                sh for sh in self.find_swing_points(df)[0]
-                if sh["index"] < sweep_idx
-            ]
-            if pre_sweep_highs:
-                target_high = pre_sweep_highs[-1]["price"]
-                for i in range(disp_idx, min(disp_idx + 8, n)):
-                    # ★ BODY CLOSE kırılımı (fitil DEĞİL)
-                    if df.iloc[i]["close"] > target_high:
-                        mss_confirmed = True
-                        break
-
-        elif bias == "SHORT":
-            pre_sweep_lows = [
-                sl for sl in self.find_swing_points(df)[1]
-                if sl["index"] < sweep_idx
-            ]
-            if pre_sweep_lows:
-                target_low = pre_sweep_lows[-1]["price"]
-                for i in range(disp_idx, min(disp_idx + 8, n)):
-                    # ★ BODY CLOSE kırılımı (fitil DEĞİL)
-                    if df.iloc[i]["close"] < target_low:
-                        mss_confirmed = True
-                        break
-
-        # ★ MSS GATE: Yapı kırılımı zorunlu
-        if not mss_confirmed:
-            logger.debug("  GATE 4 FAIL: MSS onayı yok (body close ile yapı kırılmadı)")
+        if displacement is None:
             return None
 
         return {
             "displacement": displacement,
             "mss_confirmed": True,
-            "volume_confirmed": True,
+            "volume_confirmed": displacement["volume_confirmed"],
         }
 
     # =================================================================
@@ -1033,8 +1030,9 @@ class ICTStrategy:
                     if gap / mid_price >= min_fvg_size:
                         # Fill kontrolü
                         filled = False
-                        if i + 2 < n and df.iloc[i + 2:]["low"].min() <= prev["high"]:
-                            filled = True
+                        if i + 2 < n and len(df.iloc[i + 2:]) > 0:
+                            if df.iloc[i + 2:]["low"].min() <= prev["high"]:
+                                filled = True
                         if not filled:
                             fvg = {
                                 "type": "BULLISH_FVG",
@@ -1052,8 +1050,9 @@ class ICTStrategy:
                     gap = prev["low"] - next_["high"]
                     if gap / mid_price >= min_fvg_size:
                         filled = False
-                        if i + 2 < n and df.iloc[i + 2:]["high"].max() >= prev["low"]:
-                            filled = True
+                        if i + 2 < n and len(df.iloc[i + 2:]) > 0:
+                            if df.iloc[i + 2:]["high"].max() >= prev["low"]:
+                                filled = True
                         if not filled:
                             fvg = {
                                 "type": "BEARISH_FVG",
@@ -1203,41 +1202,41 @@ class ICTStrategy:
             else:
                 return entry - (risk * tp_ratio)
 
-        # ★ MİNİMUM R:R FİLTRESİ YOK — en yakın likidite hedefini seç
+        # ★ Minimum RR filtresi — çok yakın hedefler ekonomik değil
+        risk = abs(entry - sl) if sl else 0
+        min_rr = 1.0  # Minimum kabul edilebilir RR
+        tp_ratio = self.params.get("default_tp_ratio", 2.5)
+
         if bias == "LONG":
-            # HTF hedef varsa tercih et (daha güvenilir mıknatıs)
-            htf_targets = [t for t in tp_candidates if t[0] == "HTF_DRAW_LIQ"]
-            ltf_targets = [t for t in tp_candidates if t[0] != "HTF_DRAW_LIQ"]
+            # RR >= min_rr olan hedefler
+            valid = [(label, price) for label, price in tp_candidates
+                     if risk > 0 and (price - entry) / risk >= min_rr]
 
-            if htf_targets and ltf_targets:
-                nearest_htf = min(htf_targets, key=lambda x: x[1])
-                nearest_ltf = min(ltf_targets, key=lambda x: x[1])
-                htf_dist = nearest_htf[1] - entry
-                ltf_dist = nearest_ltf[1] - entry
-                # HTF makul mesafedeyse (LTF'nin 3x'i içinde) tercih et
-                if htf_dist <= ltf_dist * 3.0:
-                    return nearest_htf[1]
-                return nearest_ltf[1]
-            elif htf_targets:
-                return min(htf_targets, key=lambda x: x[1])[1]
-            else:
-                return min(tp_candidates, key=lambda x: x[1])[1]
-        else:
-            htf_targets = [t for t in tp_candidates if t[0] == "HTF_DRAW_LIQ"]
-            ltf_targets = [t for t in tp_candidates if t[0] != "HTF_DRAW_LIQ"]
+            if valid:
+                # HTF hedef varsa tercih et (daha güvenilir mıknatıs)
+                htf_valid = [c for c in valid if c[0] == "HTF_DRAW_LIQ"]
+                if htf_valid:
+                    return min(htf_valid, key=lambda x: x[1])[1]
+                return min(valid, key=lambda x: x[1])[1]
 
-            if htf_targets and ltf_targets:
-                nearest_htf = max(htf_targets, key=lambda x: x[1])
-                nearest_ltf = max(ltf_targets, key=lambda x: x[1])
-                htf_dist = entry - nearest_htf[1]
-                ltf_dist = entry - nearest_ltf[1]
-                if htf_dist <= ltf_dist * 3.0:
-                    return nearest_htf[1]
-                return nearest_ltf[1]
-            elif htf_targets:
-                return max(htf_targets, key=lambda x: x[1])[1]
-            else:
-                return max(tp_candidates, key=lambda x: x[1])[1]
+            # Hiçbir hedef min RR karşılamıyor → risk bazlı fallback
+            if risk > 0:
+                return entry + (risk * tp_ratio)
+            return min(tp_candidates, key=lambda x: x[1])[1]
+
+        else:  # SHORT
+            valid = [(label, price) for label, price in tp_candidates
+                     if risk > 0 and (entry - price) / risk >= min_rr]
+
+            if valid:
+                htf_valid = [c for c in valid if c[0] == "HTF_DRAW_LIQ"]
+                if htf_valid:
+                    return max(htf_valid, key=lambda x: x[1])[1]
+                return max(valid, key=lambda x: x[1])[1]
+
+            if risk > 0:
+                return entry - (risk * tp_ratio)
+            return max(tp_candidates, key=lambda x: x[1])[1]
 
     # =================================================================
     #  BÖLÜM 18 — SİNYAL ÜRETİMİ (5-Aşamalı Boolean Gate Protocol)
@@ -1257,19 +1256,11 @@ class ICTStrategy:
             return None
 
         # ═══════════════════════════════════════════════════════════
-        #  GATE 1 — HAFTA SONU + KİLLZONE FİLTRESİ
+        #  GATE 1 — SEANS BİLGİSİ (Kripto 7/24 — bloke etmez)
         # ═══════════════════════════════════════════════════════════
         session = self.get_session_info()
-
-        if session["is_weekend"]:
-            logger.debug(f"  {symbol} GATE 1 FAIL: Hafta sonu — işlem yok")
-            return None
-
-        if not session["is_valid_killzone"]:
-            logger.debug(f"  {symbol} GATE 1 FAIL: Killzone dışı ({session['label']})")
-            return None
-
-        logger.debug(f"  {symbol} GATE 1 OK: {session['label']}")
+        # Kripto 7/24: Killzone ve hafta sonu bilgi amaçlı, bloke etmez
+        logger.debug(f"  {symbol} GATE 1 OK: {session['label']} (quality={session['quality']:.1f})")
 
         # ═══════════════════════════════════════════════════════════
         #  GATE 2 — HTF BIAS + PREMIUM / DISCOUNT
@@ -1289,17 +1280,20 @@ class ICTStrategy:
             logger.debug(f"  {symbol} GATE 2 FAIL: Premium/Discount hesaplanamadı")
             return None
 
-        # ★ LONG → SADECE Discount (< %50)
-        # ★ SHORT → SADECE Premium (> %50)
-        if bias == "LONG" and pd_zone["zone"] != "DISCOUNT":
-            logger.debug(f"  {symbol} GATE 2 FAIL: LONG ama fiyat {pd_zone['zone']} ({pd_zone['premium_level']:.1f}%)")
+        # ★ LONG → Discount veya Equilibrium (< %65)
+        # ★ SHORT → Premium veya Equilibrium (> %35)
+        # Kripto piyasasında sert trendlerde sıkı %50 sınırı çok daraltıcı
+        pd_level = pd_zone["premium_level"]
+
+        if bias == "LONG" and pd_level > 65:
+            logger.debug(f"  {symbol} GATE 2 FAIL: LONG ama fiyat çok Premium ({pd_level:.1f}%)")
             return None
 
-        if bias == "SHORT" and pd_zone["zone"] != "PREMIUM":
-            logger.debug(f"  {symbol} GATE 2 FAIL: SHORT ama fiyat {pd_zone['zone']} ({pd_zone['premium_level']:.1f}%)")
+        if bias == "SHORT" and pd_level < 35:
+            logger.debug(f"  {symbol} GATE 2 FAIL: SHORT ama fiyat çok Discount ({pd_level:.1f}%)")
             return None
 
-        logger.debug(f"  {symbol} GATE 2 OK: HTF {bias} + {pd_zone['zone']} ({pd_zone['premium_level']:.1f}%)")
+        logger.debug(f"  {symbol} GATE 2 OK: HTF {bias} + {pd_zone['zone']} ({pd_level:.1f}%)")
 
         # ═══════════════════════════════════════════════════════════
         #  GATE 3 — LİKİDİTE SWEEP (Wick rejection zorunlu)
@@ -1319,8 +1313,19 @@ class ICTStrategy:
         # ═══════════════════════════════════════════════════════════
         confirmation = self._find_post_sweep_confirmation(df, sweep, bias)
         if not confirmation:
-            logger.debug(f"  {symbol} GATE 4 FAIL: Displacement+MSS+Hacim onayı yok")
-            return None
+            logger.debug(f"  {symbol} GATE 4 FAIL: Displacement+MSS+Hacim onayı yok → WATCH")
+            # ★ Gate 1-3 geçti, Gate 4 bekleniyor → İzleme listesine gönder
+            current_price = df["close"].iloc[-1]
+            return {
+                "action": "WATCH",
+                "symbol": symbol,
+                "direction": bias,
+                "potential_entry": float(current_price),
+                "potential_sl": float(sweep.get("sweep_wick", sweep.get("swept_level", 0))),
+                "potential_tp": None,
+                "watch_reason": "Gate4 displacement/MSS bekleniyor",
+                "components": ["KILLZONE", "HTF_BIAS", "PREMIUM_DISCOUNT", "LIQUIDITY_SWEEP"],
+            }
 
         logger.debug(
             f"  {symbol} GATE 4 OK: Displacement idx={confirmation['displacement']['index']} "
@@ -1334,14 +1339,26 @@ class ICTStrategy:
             df, confirmation["displacement"]["index"], bias
         )
         if not disp_fvg:
-            logger.debug(f"  {symbol} GATE 5 FAIL: Displacement FVG bulunamadı")
-            return None
+            logger.debug(f"  {symbol} GATE 5 FAIL: Displacement FVG bulunamadı → WATCH")
+            # ★ Gate 1-4 geçti, FVG oluşmamış → İzleme listesine gönder
+            current_price = df["close"].iloc[-1]
+            return {
+                "action": "WATCH",
+                "symbol": symbol,
+                "direction": bias,
+                "potential_entry": float(current_price),
+                "potential_sl": float(sweep.get("sweep_wick", sweep.get("swept_level", 0))),
+                "potential_tp": None,
+                "watch_reason": "Gate5 FVG oluşması bekleniyor",
+                "components": ["KILLZONE", "HTF_BIAS", "PREMIUM_DISCOUNT", "LIQUIDITY_SWEEP", "DISPLACEMENT", "MSS"],
+            }
 
-        # Entry: FVG kenarı (limit emir bölgesi)
+        # Entry: FVG CE (Consequent Encroachment — orta nokta, optimal giriş)
+        fvg_ce = (disp_fvg["high"] + disp_fvg["low"]) / 2
         if bias == "LONG":
-            entry = disp_fvg["high"]  # Bullish FVG üst kenarı (pullback giriş)
+            entry = fvg_ce  # Bullish FVG CE — daha iyi RR için pullback ortası
         else:
-            entry = disp_fvg["low"]   # Bearish FVG alt kenarı (pullback giriş)
+            entry = fvg_ce  # Bearish FVG CE — daha iyi RR için pullback ortası
 
         # SL: Sweep wick extreme
         sl = self._calc_structural_sl(df, sweep, bias, structure, entry)
@@ -1367,7 +1384,7 @@ class ICTStrategy:
 
         # SL mesafe kontrolü (çok dar SL → noise riski)
         sl_distance_pct = abs(entry - sl) / entry
-        if sl_distance_pct < 0.003:  # %0.3 minimum SL mesafesi
+        if sl_distance_pct < 0.001:  # %0.1 minimum SL mesafesi
             logger.debug(f"  {symbol} GATE 5 FAIL: SL çok dar ({sl_distance_pct*100:.2f}%)")
             return None
 
@@ -1384,7 +1401,29 @@ class ICTStrategy:
 
         entry_mode = "MARKET" if price_at_fvg else "LIMIT"
 
-        logger.debug(f"  {symbol} GATE 5 OK: Entry={entry:.6f} SL={sl:.6f} TP={tp:.6f} RR={rr_ratio:.2f}")
+        # ★ MARKET girişte gerçek piyasa fiyatını kullan (FVG CE değil)
+        # FVG CE sadece LIMIT emri için ideal giriş noktasıdır.
+        # MARKET'te fiyat zaten FVG içinde → gerçek giriş = current_price
+        if entry_mode == "MARKET":
+            entry = current_price
+            # Yeniden seviye doğrulama (MARKET fiyatıyla)
+            if bias == "LONG":
+                if sl >= entry or tp <= entry:
+                    logger.debug(f"  {symbol} GATE 5 FAIL: MARKET seviye sırası hatalı (SL={sl:.6f} E={entry:.6f} TP={tp:.6f})")
+                    return None
+            else:  # SHORT
+                if sl <= entry or tp >= entry:
+                    logger.debug(f"  {symbol} GATE 5 FAIL: MARKET seviye sırası hatalı (SL={sl:.6f} E={entry:.6f} TP={tp:.6f})")
+                    return None
+            # RR yeniden hesapla
+            risk = abs(entry - sl)
+            reward = abs(tp - entry)
+            rr_ratio = reward / risk if risk > 0 else 0
+            if rr_ratio < 1.0:
+                logger.debug(f"  {symbol} GATE 5 FAIL: MARKET RR düşük ({rr_ratio:.2f})")
+                return None
+
+        logger.debug(f"  {symbol} GATE 5 OK: Entry={entry:.6f} SL={sl:.6f} TP={tp:.6f} RR={rr_ratio:.2f} Mode={entry_mode}")
 
         # ═══════════════════════════════════════════════════════════
         #  TÜM 5 GATE GEÇTİ → SİNYAL ÜRET

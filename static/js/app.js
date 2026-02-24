@@ -23,15 +23,22 @@ socket.on("bot_status", (data) => {
 });
 
 socket.on("new_signal", (data) => {
+    const sym = data.symbol || "?";
     const dir = data.direction || "";
-    const statusLabel = data.status === "WATCHING" ? "İzleme" : "Sinyal";
+    const mode = data.entry_mode || "";
+    const status = data.status || "";
+    if (status === "REJECTED") return; // Reddedilen sinyalleri gösterme
+    const statusLabel = status === "LIMIT_PLACED" ? "Limit Emir" : "Sinyal";
     showToast(
-        `ICT ${statusLabel}: ${data.symbol} ${dir}`.trim(),
-        data.status === "OPENED" ? "success" : "info"
+        `ICT ${statusLabel}: ${sym.split("-")[0]} ${dir} ${mode}`.trim(),
+        status === "OPENED" ? "success" : "info"
     );
     loadActiveSignals();
-    if (data.status === "WATCHING") loadWatchlist();
     loadPerformance();
+});
+
+socket.on("watchlist_updated", (data) => {
+    loadWatchlist();
 });
 
 socket.on("trade_closed", (data) => {
