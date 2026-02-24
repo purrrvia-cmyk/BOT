@@ -381,33 +381,29 @@ class TradeManager:
                 "reason": "SL ihlali (entry olmadan)",
             }
 
-        # ══ ESKİMİŞ SİNYAL ══
+        # ══ TP GEÇİLMİŞ (Setup artık geçersiz) ══
+        # ICT mantığı: displacement → pullback (FVG) → devam
+        # TP'ye pullback beklenmeden ulaşıldıysa setup bozulmuş demektir
         take_profit = signal.get("take_profit", 0)
-        if take_profit and entry_price:
-            if direction == "LONG" and current_price > entry_price:
-                tp_distance = take_profit - entry_price
-                price_moved = current_price - entry_price
-                if tp_distance > 0 and price_moved / tp_distance > 0.40:
-                    update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
-                    move_pct = (price_moved / entry_price) * 100
-                    logger.info(f"⏭️ ESKİMİŞ SİNYAL: #{signal_id} {symbol} LONG (+{move_pct:.2f}%) → iptal")
-                    return {
-                        "signal_id": signal_id, "symbol": symbol,
-                        "direction": direction, "status": "CANCELLED",
-                        "reason": f"Fiyat TP yönüne gitmiş (+{move_pct:.2f}%)",
-                    }
-            elif direction == "SHORT" and current_price < entry_price:
-                tp_distance = entry_price - take_profit
-                price_moved = entry_price - current_price
-                if tp_distance > 0 and price_moved / tp_distance > 0.40:
-                    update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
-                    move_pct = (price_moved / entry_price) * 100
-                    logger.info(f"⏭️ ESKİMİŞ SİNYAL: #{signal_id} {symbol} SHORT (-{move_pct:.2f}%) → iptal")
-                    return {
-                        "signal_id": signal_id, "symbol": symbol,
-                        "direction": direction, "status": "CANCELLED",
-                        "reason": f"Fiyat TP yönüne gitmiş (-{move_pct:.2f}%)",
-                    }
+        if take_profit:
+            if direction == "LONG" and current_price >= take_profit:
+                update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
+                move_pct = ((current_price - entry_price) / entry_price) * 100
+                logger.info(f"⏭️ TP GEÇİLDİ (entry olmadan): #{signal_id} {symbol} LONG (+{move_pct:.2f}%) → iptal")
+                return {
+                    "signal_id": signal_id, "symbol": symbol,
+                    "direction": direction, "status": "CANCELLED",
+                    "reason": f"TP seviyesi geçildi (entry olmadan +{move_pct:.2f}%)",
+                }
+            elif direction == "SHORT" and current_price <= take_profit:
+                update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
+                move_pct = ((entry_price - current_price) / entry_price) * 100
+                logger.info(f"⏭️ TP GEÇİLDİ (entry olmadan): #{signal_id} {symbol} SHORT (-{move_pct:.2f}%) → iptal")
+                return {
+                    "signal_id": signal_id, "symbol": symbol,
+                    "direction": direction, "status": "CANCELLED",
+                    "reason": f"TP seviyesi geçildi (entry olmadan -{move_pct:.2f}%)",
+                }
 
         # ══ FİYAT FVG ENTRY'YE ULAŞTI MI? ══
         entry_buffer = entry_price * 0.0005  # %0.05 buffer (eskiden %0.2 → erken tetikleme)
