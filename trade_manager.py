@@ -14,10 +14,9 @@
 #      Tüm sinyaller A+ tier (5/5 gate geçmiş). B-tier yok.
 #
 #   3. FONKSİYONLAR:
-#      process_signal → SIGNAL ise doğrudan aç, değilse None
+#      process_signal → SIGNAL veya WATCH → hepsi watchlist'e
+#      check_watchlist → 3×5m mum (15dk) izle → geçerliyse işlem aç
 #      check_open_trades → WAITING limit + ACTIVE SL/TP takibi
-#      check_watchlist → Basitleştirilmiş (ICT gate'lerinden geçmemiş
-#                         sinyaller için — genelde boş kalır)
 #
 #   4. BREAKEVEN / TRAILING SL:
 #      %25 → SL entry altına taşı (erken koruma)
@@ -125,36 +124,45 @@ class TradeManager:
         """
         Strateji motorundan gelen sinyal sonucunu işle.
 
-        ★ 5 Boolean gate'in tamamı strateji motorunda geçmiş.
-        ★ Burada ek puanlama / güven kontrolü YOK.
-        ★ SIGNAL → doğrudan işlem aç.
+        ★ ICT %100 uyumlu akış:
+          SIGNAL veya WATCH → hepsi önce İZLEME listesine girer.
+          15 dakika (3 × 5m mum) izleme sonrası hâlâ geçerliyse → işlem açılır.
+          Direkt işlem açılmaz. Skor/filtreleme yok.
         """
         if signal_result is None:
             return None
 
         action = signal_result.get("action")
 
-        if action == "SIGNAL":
-            logger.info(f"🎯 {signal_result['symbol']} → Tüm 5 gate geçti, işlem açılıyor")
-            return self._open_trade(signal_result)
+        if action in ("SIGNAL", "WATCH"):
+            symbol = signal_result["symbol"]
+            direction = signal_result["direction"]
 
-        if action == "WATCH":
-            # Gate1-3 geçti, Gate4-5 teyit bekleniyor → watchlist'e ekle
+            # Aynı coinde zaten aktif işlem varsa watchlist'e de ekleme
+            active_signals = get_active_signals()
+            for s in active_signals:
+                if s["symbol"] == symbol and s["status"] in ("ACTIVE", "WAITING"):
+                    return {"status": "REJECTED", "reason": "Aktif/bekleyen işlem mevcut"}
+
+            # Watchlist'e ekle (SIGNAL dahil — hepsi 15dk izleme sonrası açılır)
+            reason = "Tüm gate'ler geçti, 15dk izleme başladı" if action == "SIGNAL" else signal_result.get("watch_reason", "Gate teyit bekleniyor")
             try:
-                add_to_watchlist(
-                    symbol=signal_result["symbol"],
-                    direction=signal_result["direction"],
-                    potential_entry=signal_result.get("potential_entry"),
-                    potential_sl=signal_result.get("potential_sl"),
-                    potential_tp=signal_result.get("potential_tp"),
-                    watch_reason=signal_result.get("watch_reason", "Gate4 displacement bekleniyor"),
-                    initial_score=60,
+                wl_id = add_to_watchlist(
+                    symbol=symbol,
+                    direction=direction,
+                    potential_entry=signal_result.get("entry") or signal_result.get("potential_entry"),
+                    potential_sl=signal_result.get("sl") or signal_result.get("potential_sl"),
+                    potential_tp=signal_result.get("tp") or signal_result.get("potential_tp"),
+                    watch_reason=reason,
+                    initial_score=100 if action == "SIGNAL" else 60,
                     components=signal_result.get("components", []),
                     max_watch=WATCH_CONFIRM_CANDLES,
                 )
-                logger.info(f"👁️ İZLEMEYE ALINDI: {signal_result['symbol']} ({signal_result['direction']}) Gate4 teyit bekleniyor")
+                if wl_id:
+                    logger.info(f"👁️ İZLEMEYE ALINDI: {symbol} ({direction}) — {reason}")
+                    return {"status": "WATCHING", "symbol": symbol, "direction": direction, "reason": reason}
             except Exception as e:
-                logger.error(f"Watchlist ekleme hatası ({signal_result['symbol']}): {e}")
+                logger.error(f"Watchlist ekleme hatası ({symbol}): {e}")
             return None
 
         return None
@@ -679,31 +687,47 @@ class TradeManager:
 
     def check_watchlist(self, strategy_engine):
         """
-        İzleme listesi kontrolü.
+        5 dakikalık mum bazlı izleme listesi kontrolü — ICT %100 uyumlu.
 
-        Gate1-3 geçmiş ama Gate4/5 henüz geçmemiş coinleri takip eder.
-        Her kontrol döngüsünde yeniden sinyal üretilir:
-          - SIGNAL → promote (işlem aç)
-          - WATCH → izlemeye devam (candles_watched artır)
-          - None → ilgi kaybolmuş, candles_watched artır
-        Max izleme süresi dolunca expire.
+        Akış:
+          1. ICT setup bulundu → watchlist'e alındı
+          2. Her yeni 5m mum kapanışında yeniden analiz edilir
+          3. 3 mum (15dk) dolunca → son kontrol:
+             - SIGNAL veya WATCH (setup hâlâ geçerli) → PROMOTE → işlem aç
+             - None (setup bozuldu) → EXPIRE
+          4. 3 mum dolmadan setup bozulursa (None) → erken expire
+
+        Skor/filtreleme YOK — sadece ICT gate geçerliliği kontrol edilir.
         """
         watching_items = get_watching_items()
         promoted = []
 
         for item in watching_items:
             symbol = item["symbol"]
-            candles_watched = int(item.get("candles_watched", 0)) + 1
+            candles_watched = int(item.get("candles_watched", 0))
             max_watch = item.get("max_watch_candles", WATCH_CONFIRM_CANDLES)
+            stored_ts = item.get("last_5m_candle_ts") or ""
 
-            # Max izleme süresi doldu → expire
-            if candles_watched >= max_watch:
-                expire_watchlist_item(
-                    item["id"],
-                    reason=f"İzleme süresi doldu ({max_watch} döngü)"
-                )
-                logger.info(f"⏰ İZLEME BİTTİ: {symbol} ({candles_watched}/{max_watch} döngü)")
+            # 5m veri çek — son mum timestamp kontrolü
+            try:
+                df_5m = data_fetcher.get_candles(symbol, "5m", 10)
+            except Exception as e:
+                logger.debug(f"Watchlist 5m veri hatası ({symbol}): {e}")
                 continue
+
+            if df_5m is None or df_5m.empty:
+                continue
+
+            # Son kapanmış 5m mum timestamp'i
+            current_ts = str(df_5m.index[-1])
+
+            # Aynı mum → henüz yeni mum kapanmadı, atla
+            if current_ts == stored_ts:
+                continue
+
+            # Yeni 5m mum kapandı → sayacı artır
+            candles_watched += 1
+            logger.info(f"🕯️ {symbol} yeni 5m mum ({candles_watched}/{max_watch})")
 
             # 15m verisi çek ve yeniden analiz et
             try:
@@ -711,39 +735,67 @@ class TradeManager:
                 ltf_df = data_fetcher.get_candles(symbol, "15m", 120)
             except Exception as e:
                 logger.debug(f"Watchlist veri hatası ({symbol}): {e}")
-                update_watchlist_item(item["id"], candles_watched, item.get("initial_score", 0))
+                update_watchlist_item(item["id"], candles_watched, 0,
+                                     last_5m_candle_ts=current_ts)
                 continue
 
             if ltf_df is None or ltf_df.empty or multi_tf is None:
-                update_watchlist_item(item["id"], candles_watched, item.get("initial_score", 0))
+                update_watchlist_item(item["id"], candles_watched, 0,
+                                     last_5m_candle_ts=current_ts)
                 continue
 
             # Yeniden sinyal üret
             signal_result = strategy_engine.generate_signal(symbol, ltf_df, multi_tf)
+            setup_valid = signal_result is not None and signal_result.get("action") in ("SIGNAL", "WATCH")
 
-            if signal_result and signal_result.get("action") == "SIGNAL":
-                # Tüm gate'ler geçti → watchlist'ten promote et ve işlem aç
+            # Setup bozuldu → erken expire
+            if not setup_valid:
+                expire_watchlist_item(
+                    item["id"],
+                    reason=f"Setup bozuldu ({candles_watched}. mumda)"
+                )
+                logger.info(f"❌ SETUP BOZULDU: {symbol} ({candles_watched}. 5m mum)")
+                continue
+
+            # 3 mum doldu ve setup hâlâ geçerli → PROMOTE → işlem aç
+            if candles_watched >= max_watch:
                 promote_watchlist_item(item["id"])
-                trade_result = self._open_trade(signal_result)
+                logger.info(f"✅ 15dk İZLEME TAMAM: {symbol} — setup hâlâ geçerli, işlem açılıyor")
 
+                # Son sinyal SIGNAL ise onu kullan, değilse watchlist verilerinden sinyal oluştur
+                if signal_result.get("action") == "SIGNAL":
+                    trade_signal = signal_result
+                else:
+                    # WATCH sinyalinden trade bilgilerini al
+                    trade_signal = {
+                        "symbol": symbol,
+                        "direction": item["direction"],
+                        "entry": item.get("potential_entry"),
+                        "sl": item.get("potential_sl"),
+                        "tp": item.get("potential_tp"),
+                        "entry_mode": "MARKET",
+                        "rr_ratio": signal_result.get("rr_ratio", "?"),
+                        "components": signal_result.get("components", []),
+                        "htf_bias": signal_result.get("htf_bias", ""),
+                        "session": signal_result.get("session", ""),
+                        "entry_type": signal_result.get("entry_type", "ICT_WATCH"),
+                        "sl_type": signal_result.get("sl_type", ""),
+                        "tp_type": signal_result.get("tp_type", ""),
+                    }
+
+                trade_result = self._open_trade(trade_signal)
                 if trade_result and trade_result.get("status") != "REJECTED":
                     promoted.append({
                         "symbol": symbol,
                         "action": "PROMOTED",
                         "trade_result": trade_result,
                     })
-                    logger.info(f"⬆️ İZLEMEDEN SİNYALE: {symbol} (tüm gate'ler geçti)")
+                    logger.info(f"⬆️ İZLEMEDEN AKTİF SİNYALE: {symbol} ({max_watch} mum = {max_watch*5}dk izleme sonrası)")
                 continue
 
-            # Hâlâ WATCH veya None → izlemeye devam
-            # WATCH ise skor güncelle (gate'ler hâlâ geçerli)
-            if signal_result and signal_result.get("action") == "WATCH":
-                new_score = min(90, item.get("initial_score", 60) + candles_watched * 2)
-                update_watchlist_item(item["id"], candles_watched, new_score)
-            else:
-                # None → gate'ler artık geçmiyor, skoru düşür
-                new_score = max(20, item.get("current_score", 60) - 5)
-                update_watchlist_item(item["id"], candles_watched, new_score)
+            # Henüz 3 mum dolmadı, setup geçerli → izlemeye devam
+            update_watchlist_item(item["id"], candles_watched, 0,
+                                 last_5m_candle_ts=current_ts)
 
         return promoted
 

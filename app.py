@@ -128,18 +128,19 @@ def scan_markets():
                 if result:
                     trade_result = trade_manager.process_signal(result)
                     if trade_result:
-                        # REJECTED sinyalleri frontend'e gönderme (undefined toast engeli)
-                        if trade_result.get("status") not in ("REJECTED",):
+                        status = trade_result.get("status")
+                        if status == "WATCHING":
+                            # İzleme listesine alındı → frontend güncelle
+                            socketio.emit("watchlist_updated", {
+                                "symbol": trade_result["symbol"],
+                                "direction": trade_result["direction"],
+                                "reason": trade_result.get("reason", ""),
+                            })
+                            new_signals.append(trade_result)
+                        elif status not in ("REJECTED", None):
                             trade_result["regime"] = regime
                             new_signals.append(trade_result)
                             socketio.emit("new_signal", trade_result)
-                    elif result.get("action") == "WATCH":
-                        # WATCH sonuçları → frontend'te watchlist güncelle
-                        socketio.emit("watchlist_updated", {
-                            "symbol": result["symbol"],
-                            "direction": result["direction"],
-                            "reason": result.get("watch_reason", ""),
-                        })
 
                 symbols_scanned += 1
                 time.sleep(0.15)  # Rate limit
@@ -157,16 +158,6 @@ def scan_markets():
 
         bot_state["symbols_scanned"] = symbols_scanned
         logger.info(f"✅ ICT Tarama tamamlandı: {symbols_scanned} coin, {len(new_signals)} sinyal | Rejim: {regime}")
-
-        # ── İzleme listesi kontrolü (her tarama döngüsünde = 180s) ──
-        try:
-            promoted = trade_manager.check_watchlist(ict_strategy)
-            for p in promoted:
-                socketio.emit("watch_promoted", p)
-            if promoted:
-                logger.info(f"⬆️ Watchlist promote: {len(promoted)} sinyal")
-        except Exception as e:
-            logger.error(f"Watchlist kontrol hatası: {e}")
 
         # Dashboard güncelle
         socketio.emit("scan_complete", {
@@ -204,6 +195,21 @@ def check_trades():
 
     except Exception as e:
         logger.error(f"İşlem kontrol hatası: {e}")
+
+
+def check_watchlist():
+    """İzleme listesi kontrolü — 5m mum bazlı, her 60s çalışır."""
+    if not bot_state["running"]:
+        return
+
+    try:
+        promoted = trade_manager.check_watchlist(ict_strategy)
+        for p in promoted:
+            socketio.emit("watch_promoted", p)
+        if promoted:
+            logger.info(f"⬆️ Watchlist promote: {len(promoted)} sinyal")
+    except Exception as e:
+        logger.error(f"Watchlist kontrol hatası: {e}")
 
 
 def run_optimizer():
@@ -361,6 +367,7 @@ def start_scheduler_jobs():
     for func, interval, job_id in [
         (scan_markets, SCAN_INTERVAL_SECONDS, "scan_markets"),
         (check_trades, TRADE_CHECK_INTERVAL, "check_trades"),
+        (check_watchlist, 60, "check_watchlist"),
         (run_optimizer, OPTIMIZER_CONFIG["optimization_interval_minutes"] * 60, "run_optimizer"),
         (ame_scan_markets, SCAN_INTERVAL_SECONDS, "ame_scan_markets"),
         (ame_check_trades, TRADE_CHECK_INTERVAL, "ame_check_trades"),

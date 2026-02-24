@@ -381,7 +381,7 @@ def get_active_trade_count():
 # =================== İZLEME LİSTESİ ===================
 
 def add_to_watchlist(symbol, direction, potential_entry, potential_sl, potential_tp,
-                     watch_reason, initial_score, components, max_watch=24):
+                     watch_reason, initial_score, components, max_watch=3):
     # Aynı sembol ve yönde zaten izleniyor mu?
     existing = _fetchone("""
         SELECT id FROM watchlist WHERE symbol=? AND direction=? AND status='WATCHING'

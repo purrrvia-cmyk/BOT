@@ -114,10 +114,10 @@ TRADE_CHECK_INTERVAL = 5    # Açık işlem kontrolü (saniye) — 10→5: daha 
 
 # İzleme Onay Akışı (zorunlu)
 WATCH_CONFIRM_TIMEFRAME = "5m"          # İzleme zaman dilimi
-WATCH_CONFIRM_CANDLES = 24              # Kaç tarama döngüsü izlenecek (24 × 180s = ~72dk)
+WATCH_CONFIRM_CANDLES = 3               # 5m mumda kaç mum izlenecek (3 × 5dk = 15dk)
+WATCH_CHECK_INTERVAL = 60               # İzleme kontrolü aralığı (saniye)
 WATCH_REQUIRED_CONFIRMATIONS = 2        # Onay gerekli
-# v2 kriterler: NEUTRAL trend → otomatik onay değil, mum gövde filtresi,
-# hacim doğrulaması (%80 ort.), entry mesafe kontrolü (max %2)
+# Akış: ICT WATCH sinyali → 5dk'lık 3 mum izle → hâlâ geçerliyse SIGNAL'e promote
 
 # Web Server
 HOST = "0.0.0.0"
