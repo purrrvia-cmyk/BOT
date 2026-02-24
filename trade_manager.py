@@ -32,7 +32,7 @@ from database import (
     get_active_trade_count, add_signal, add_to_watchlist,
     get_watching_items, update_watchlist_item, promote_watchlist_item,
     expire_watchlist_item, get_signal_history, get_bot_param,
-    update_signal_sl
+    update_signal_sl, _execute
 )
 from config import (
     ICT_PARAMS,
@@ -146,6 +146,8 @@ class TradeManager:
 
             # Watchlist'e ekle (SIGNAL dahil — hepsi 15dk izleme sonrası açılır)
             reason = "Tüm gate'ler geçti, 15dk izleme başladı" if action == "SIGNAL" else signal_result.get("watch_reason", "Gate teyit bekleniyor")
+            # SIGNAL (tamamlanmış) → 3×5m = 15dk; WATCH (eksik gate) → 9×5m = 45dk bekleme süresi
+            max_watch_candles = WATCH_CONFIRM_CANDLES if action == "SIGNAL" else WATCH_CONFIRM_CANDLES * 3
             try:
                 wl_id = add_to_watchlist(
                     symbol=symbol,
@@ -156,7 +158,7 @@ class TradeManager:
                     watch_reason=reason,
                     initial_score=100 if action == "SIGNAL" else 60,
                     components=signal_result.get("components", []),
-                    max_watch=WATCH_CONFIRM_CANDLES,
+                    max_watch=max_watch_candles,
                 )
                 if wl_id:
                     logger.info(f"👁️ İZLEMEYE ALINDI: {symbol} ({direction}) — {reason}")
@@ -796,17 +798,17 @@ class TradeManager:
                                      last_5m_candle_ts=current_ts)
                 continue
 
-            # v3.5 HYBRID VALIDATION:
-            # Setup tamamlanmışsa → gate'leri tekrar check etme
-            # Setup tamamlanmamışsa → normal validation
+            # v3.7 HYBRID VALIDATION:
+            # TAMAMLANMIŞ setup → sadece SL/HTF invalidasyon check
+            # EKSİK setup (Gate4/Gate5 bekleniyor) → SL check + gate tamamlandı mı diye bak,
+            #   gate hâlâ eksikse expire ETME, beklemeye devam et; sadece SL/timeout'ta expire et
             watch_reason = item.get("watch_reason", "")
-            
+            signal_result = None
+
             if "Tüm gate'ler geçti" in watch_reason:
-                # Setup TAMAMLANMIŞ → sadece invalidation check
-                setup_valid = self._validate_completed_setup(symbol, item, ltf_df, multi_tf)
-                signal_result = None  # Kullanılmayacak, watchlist data'dan trade oluşturulacak
-                
-                if not setup_valid:
+                # ── TAMAMLANMIŞ SETUP ──────────────────────────────────────
+                # Sadece SL tetiklendi mi / HTF bias değişti mi kontrol et
+                if not self._validate_completed_setup(symbol, item, ltf_df, multi_tf):
                     expire_watchlist_item(
                         item["id"],
                         reason=f"Setup invalidated (SL/HTF) - {candles_watched}. 5m mum"
@@ -814,19 +816,49 @@ class TradeManager:
                     logger.info(f"❌ SETUP INVALIDATED: {symbol} (SL veya HTF bias değişti)")
                     continue
             else:
-                # Setup TAMAMLANMAMIŞ → normal gate validation
-                signal_result = strategy_engine.generate_signal(symbol, ltf_df, multi_tf)
-                setup_valid = signal_result is not None and signal_result.get("action") in ("SIGNAL", "WATCH")
-                
-                if not setup_valid:
+                # ── EKSİK SETUP (Gate4/Gate5 bekleniyor) ──────────────────
+                # 1. Önce SL kontrolü — fiyat SL'yi geçti mi?
+                if not self._validate_completed_setup(symbol, item, ltf_df, multi_tf):
                     expire_watchlist_item(
                         item["id"],
-                        reason=f"Setup bozuldu ({candles_watched}. 5m mum)"
+                        reason=f"SL kırıldı - {candles_watched}. 5m mum"
                     )
-                    logger.info(f"❌ SETUP BOZULDU: {symbol} ({candles_watched}. 5m mum)")
+                    logger.info(f"❌ SL KIRILDI (eksik setup): {symbol}")
                     continue
 
-            # 1 mum doldu ve setup hâlâ geçerli → PROMOTE → işlem aç (v3.4: 1 mum yeterli)
+                # 2. Gate'ler tamamlandı mı kontrol et
+                signal_result = strategy_engine.generate_signal(symbol, ltf_df, multi_tf)
+                gates_complete = (
+                    signal_result is not None
+                    and signal_result.get("action") in ("SIGNAL", "WATCH")
+                )
+
+                if gates_complete:
+                    # Gate'ler tamamlandı → watch_reason güncelle, entry/sl/tp güncelle
+                    new_entry = signal_result.get("entry") or item.get("potential_entry")
+                    new_sl    = signal_result.get("sl")    or item.get("potential_sl")
+                    new_tp    = signal_result.get("tp")    or item.get("potential_tp")
+                    _execute(
+                        "UPDATE watchlist SET watch_reason=?, potential_entry=?, potential_sl=?, potential_tp=?, updated_at=datetime('now') WHERE id=?",
+                        ("Tüm gate'ler geçti, 15dk izleme başladı", new_entry, new_sl, new_tp, item["id"])
+                    )
+                    logger.info(f"✅ GATE'LER TAMAMLANDI: {symbol} — şimdi 3×5m izlemeye başlıyor")
+                    # candles_watched sıfırlanmıyor, sayım devam eder
+                else:
+                    # Gate'ler hâlâ eksik → expire ETME, beklemeye devam
+                    if candles_watched >= max_watch:
+                        expire_watchlist_item(
+                            item["id"],
+                            reason=f"Timeout - {candles_watched} mum beklendu, gate tamamlanmadı"
+                        )
+                        logger.info(f"⏰ TIMEOUT: {symbol} ({candles_watched} mum, gate tamamlanmadı)")
+                    else:
+                        update_watchlist_item(item["id"], candles_watched, 0,
+                                             last_5m_candle_ts=current_ts)
+                        logger.info(f"⏳ {symbol} gate bekleniyor ({candles_watched}/{max_watch})")
+                    continue
+
+            # 3 mum doldu ve setup hâlâ geçerli → PROMOTE → işlem aç
             if candles_watched >= max_watch:
                 promote_watchlist_item(item["id"])
                 logger.info(f"✅ 15dk İZLEME TAMAM (3×5m): {symbol} — setup hâlâ geçerli, işlem açılıyor")
