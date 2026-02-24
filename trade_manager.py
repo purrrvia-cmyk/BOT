@@ -683,17 +683,19 @@ class TradeManager:
 
     def check_watchlist(self, strategy_engine):
         """
-        5 dakikalık mum bazlı izleme listesi kontrolü — ICT %100 uyumlu.
+        15 dakikalık mum bazlı izleme listesi kontrolü — v3.4 crypto-optimized.
 
         Akış:
           1. ICT setup bulundu → watchlist'e alındı
-          2. Her yeni 5m mum kapanışında yeniden analiz edilir
-          3. 3 mum (15dk) dolunca → son kontrol:
+          2. 1 × 15m mum kapanışı beklenir (15dk)
+          3. Mum kapandığında yeniden analiz edilir:
              - SIGNAL veya WATCH (setup hâlâ geçerli) → PROMOTE → işlem aç
              - None (setup bozuldu) → EXPIRE
-          4. 3 mum dolmadan setup bozulursa (None) → erken expire
-
-        Skor/filtreleme YOK — sadece ICT gate geçerliliği kontrol edilir.
+          
+        v3.4 Değişiklikler:
+        - 5m mum sayma sistemi KALDIRILDI
+        - Direkt 15m TF üzerinden 1 mum izleme (TF consistency)
+        - Daha stabil, daha az noise
         """
         watching_items = get_watching_items()
         promoted = []
@@ -702,33 +704,33 @@ class TradeManager:
             symbol = item["symbol"]
             candles_watched = int(item.get("candles_watched", 0))
             max_watch = item.get("max_watch_candles", WATCH_CONFIRM_CANDLES)
-            stored_ts = item.get("last_5m_candle_ts") or ""
+            stored_ts = item.get("last_5m_candle_ts") or ""  # DB field ismi 5m ama artık 15m kullanıyoruz
 
-            # 5m veri çek — son mum timestamp kontrolü
+            # 15m veri çek — son mum timestamp kontrolü (v3.4: TF değişti)
             try:
-                df_5m = data_fetcher.get_candles(symbol, "5m", 10)
+                df_15m = data_fetcher.get_candles(symbol, "15m", 10)
             except Exception as e:
-                logger.debug(f"Watchlist 5m veri hatası ({symbol}): {e}")
+                logger.debug(f"Watchlist 15m veri hatası ({symbol}): {e}")
                 continue
 
-            if df_5m is None or df_5m.empty:
+            if df_15m is None or df_15m.empty:
                 continue
 
-            # Son kapanmış 5m mum timestamp'i
-            current_ts = str(df_5m.index[-1])
+            # Son kapanmış 15m mum timestamp'i
+            current_ts = str(df_15m.index[-1])
 
             # Aynı mum → henüz yeni mum kapanmadı, atla
             if current_ts == stored_ts:
                 continue
 
-            # Yeni 5m mum kapandı → sayacı artır
+            # Yeni 15m mum kapandı → sayacı artır (v3.4: 1 mum yeterli)
             candles_watched += 1
-            logger.info(f"🕯️ {symbol} yeni 5m mum ({candles_watched}/{max_watch})")
+            logger.info(f"📊 {symbol} yeni 15m mum ({candles_watched}/{max_watch})")
 
-            # 15m verisi çek ve yeniden analiz et
+            # 15m verisi ve multi-TF verisi ile yeniden analiz et
             try:
                 multi_tf = data_fetcher.get_multi_timeframe_data(symbol)
-                ltf_df = data_fetcher.get_candles(symbol, "15m", 120)
+                ltf_df = df_15m  # Zaten 15m çektik
             except Exception as e:
                 logger.debug(f"Watchlist veri hatası ({symbol}): {e}")
                 update_watchlist_item(item["id"], candles_watched, 0,
@@ -748,12 +750,12 @@ class TradeManager:
             if not setup_valid:
                 expire_watchlist_item(
                     item["id"],
-                    reason=f"Setup bozuldu ({candles_watched}. mumda)"
+                    reason=f"Setup bozuldu ({candles_watched}. 15m mum)"
                 )
-                logger.info(f"❌ SETUP BOZULDU: {symbol} ({candles_watched}. 5m mum)")
+                logger.info(f"❌ SETUP BOZULDU: {symbol} ({candles_watched}. 15m mum)")
                 continue
 
-            # 3 mum doldu ve setup hâlâ geçerli → PROMOTE → işlem aç
+            # 1 mum doldu ve setup hâlâ geçerli → PROMOTE → işlem aç (v3.4: 1 mum yeterli)
             if candles_watched >= max_watch:
                 promote_watchlist_item(item["id"])
                 logger.info(f"✅ 15dk İZLEME TAMAM: {symbol} — setup hâlâ geçerli, işlem açılıyor")
@@ -769,7 +771,7 @@ class TradeManager:
                         "entry": item.get("potential_entry"),
                         "sl": item.get("potential_sl"),
                         "tp": item.get("potential_tp"),
-                        "entry_mode": "MARKET",
+                        "entry_mode": "LIMIT",  # v3.4: Her zaman LIMIT
                         "rr_ratio": signal_result.get("rr_ratio", "?"),
                         "components": signal_result.get("components", []),
                         "htf_bias": signal_result.get("htf_bias", ""),
@@ -786,10 +788,10 @@ class TradeManager:
                         "action": "PROMOTED",
                         "trade_result": trade_result,
                     })
-                    logger.info(f"⬆️ İZLEMEDEN AKTİF SİNYALE: {symbol} ({max_watch} mum = {max_watch*5}dk izleme sonrası)")
+                    logger.info(f"⬆️ İZLEMEDEN AKTİF SİNYALE: {symbol} (15dk izleme sonrası)")
                 continue
 
-            # Henüz 3 mum dolmadı, setup geçerli → izlemeye devam
+            # Henüz 1 mum dolmadı, setup geçerli → izlemeye devam
             update_watchlist_item(item["id"], candles_watched, 0,
                                  last_5m_candle_ts=current_ts)
 

@@ -32,7 +32,8 @@ TIMEFRAMES = {
     "ltf": "15m",     # Lower Time Frame - giriş noktası
 }
 
-# ICT Strateji Parametreleri (başlangıç değerleri - optimizer tarafından güncellenir)
+# ICT Strateji Parametreleri (başlangıç değerleri - optimizer tarafından güncenlenir)
+# v3.4: Crypto-optimized, killzone bypass, RR-free, quality-first
 ICT_PARAMS = {
     # Market Structure
     "swing_lookback": 5,            # Swing high/low tespiti için bakılacak mum sayısı
@@ -50,23 +51,20 @@ ICT_PARAMS = {
     "liquidity_equal_tolerance": 0.001,  # Eşit dip/tepe toleransı (%0.1)
     "liquidity_min_touches": 2,          # Minimum dokunma sayısı
     
-    # Sinyal Üretimi
-    # Risk Yönetimi
-    "default_sl_pct": 0.012,       # Varsayılan stop loss (%1.2) — yapısal SL öncelikli, bu sadece fallback
-    "default_tp_ratio": 2.5,       # TP/SL oranı (Risk-Reward) — 2.0→2.5: daha iyi RR
-    "max_concurrent_trades": 2,    # Maksimum eşzamanlı işlem — 3→2: risk azaltma
-    "max_same_direction_trades": 1,  # Aynı yönde max işlem — 2→1: diversifikasyon
-    "min_sl_distance_pct": 0.010,  # Minimum SL mesafesi (%1.0) — 0.8→1.0: noise koruması
-    "signal_cooldown_minutes": 20, # Aynı coinde sinyal arası bekleme — 15→20 dakika
+    # Risk Yönetimi (RR kontrolsüz - manuel exit)
+    "default_sl_pct": 0.020,       # Varsayılan SL (%2.0) - sadece fallback, yapısal SL öncelikli
+    "max_sl_distance_pct": 0.030,  # Maximum SL mesafesi (%3.0) - risk limiti
+    "sl_buffer_pct": 0.01,         # SL buffer wick extreme'den (%1)
+    "max_concurrent_trades": 2,    # Maksimum eşzamanlı işlem
+    "max_same_direction_trades": 1,  # Aynı yönde max işlem
+    "min_sl_distance_pct": 0.005,  # Minimum SL mesafesi (%0.5) - çok dar SL'ye izin verme
+    "signal_cooldown_minutes": 20, # Aynı coinde sinyal arası bekleme
     
-    # Sabırlı Mod
-    "patience_watch_candles": 3,    # Sinyal öncesi izlenecek mum sayısı
-    "patience_confirm_threshold": 0.6,  # Onay eşiği
-    
-    # Displacement
-    "displacement_min_body_ratio": 0.5,  # Displacement mumu min gövde oranı (0.6→0.5: daha fazla displacement yakalanır)
-    "displacement_min_size_pct": 0.002,  # Min displacement boyutu (%0.2) (0.3→0.2: daha hassas)
-    "displacement_atr_multiplier": 1.2,  # ATR çarpanı (1.5→1.2: daha fazla displacement yakalanır)
+    # Displacement (v3.4: crypto volatility için yükseltildi)
+    "displacement_min_body_ratio": 0.55,  # 0.5→0.55: daha güçlü displacement
+    "displacement_min_size_pct": 0.006,   # 0.002→0.006: %0.6 minimum (%0.2 noise yakalıyordu)
+    "displacement_atr_multiplier": 1.5,   # 1.2→1.5: ATR × 1.5 (gerçek displacement)
+    "displacement_max_candles_after_sweep": 2,  # Sweep sonrası max 2 mum içinde displacement
 }
 
 # Limit Emir Ayarları
@@ -112,12 +110,12 @@ OPTIMIZER_PARAM_BOUNDS = {
 SCAN_INTERVAL_SECONDS = 180  # Tarama aralığı (100 coin × 4 TF ≈ 165s, 180s güvenli)
 TRADE_CHECK_INTERVAL = 5    # Açık işlem kontrolü (saniye) — 10→5: daha hızlı SL/TP tepkisi
 
-# İzleme Onay Akışı (zorunlu)
-WATCH_CONFIRM_TIMEFRAME = "5m"          # İzleme zaman dilimi
-WATCH_CONFIRM_CANDLES = 3               # 5m mumda kaç mum izlenecek (3 × 5dk = 15dk)
-WATCH_CHECK_INTERVAL = 60               # İzleme kontrolü aralığı (saniye)
-WATCH_REQUIRED_CONFIRMATIONS = 2        # Onay gerekli
-# Akış: ICT WATCH sinyali → 5dk'lık 3 mum izle → hâlâ geçerliyse SIGNAL'e promote
+# İzleme Onay Akışı (v3.4: 15m mum bazlı)
+WATCH_CONFIRM_TIMEFRAME = "15m"         # İzleme zaman dilimi (TF consistency)
+WATCH_CONFIRM_CANDLES = 1               # 15m mumda 1 mum bekle (15dk)
+WATCH_CHECK_INTERVAL = 180              # İzleme kontrolü aralığı (saniye = 3dk)
+WATCH_REQUIRED_CONFIRMATIONS = 1        # Onay gerekli
+# Akış: ICT WATCH sinyali → 1 × 15m mum bekle → hâlâ geçerliyse SIGNAL'e promote
 
 # Web Server
 HOST = "0.0.0.0"

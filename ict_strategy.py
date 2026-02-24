@@ -12,10 +12,10 @@
 #
 # 5 ZORUNLU AŞAMA (hepsi geçmeli, yoksa None döner):
 #
-#   GATE 1 — Hafta Sonu + Killzone Filtresi
-#       Cumartesi & Pazar → HİÇBİR sinyal üretilmez.
-#       Sadece London Open (07-10 UTC) ve NY Open (12-15 UTC).
-#       Asya seansı kırılımları reddedilir; sadece likidite olarak okunur.
+#   GATE 1 — Seans Bilgisi (Kripto 7/24 - Bypass)
+#       Kripto piyasaları 7/24 aktif.
+#       Killzone kontrolü YOK (forex killzone'ları kripto'da anlamsız).
+#       Seans bilgisi sadece loglama için tutulur.
 #
 #   GATE 2 — HTF Bias + Premium / Discount
 #       4H (veya 1H fallback) dealing range.
@@ -908,15 +908,22 @@ class ICTStrategy:
     def _find_post_sweep_confirmation(self, df, sweep, bias):
         """
         Sweep sonrası Displacement (momentum) tespiti.
-
-        Sweep sonrasında bias yönünde hareket olmalı.
-        Hacim ve MSS artık opsiyonel — sinyal kalitesini artırır ama bloke etmez.
+        
+        v3.4 Crypto-optimized stricter checks:
+        - Displacement sweep'ten max 2 mum sonra gelmeli
+        - Minimum %0.6 hareket (config: displacement_min_size_pct)
+        - Hacim destekli (avg'nin üstünde)
+        - Güçlü gövde (55%+)
         """
         sweep_idx = sweep["sweep_candle_idx"]
         n = len(df)
-        max_lookahead = 20  # Sweep sonrası max 20 mum
-
-        min_body_ratio = 0.35  # %35 gövde oranı yeterli
+        
+        # v3.4: Max 2-3 mum sonra displacement gelmeli (hızlı reaction)
+        max_lookahead = self.params.get("displacement_max_candles_after_sweep", 2)
+        min_body_ratio = self.params.get("displacement_min_body_ratio", 0.55)
+        min_size_pct = self.params.get("displacement_min_size_pct", 0.006)
+        atr_mult = self.params.get("displacement_atr_multiplier", 1.5)
+        
         atr = self._calc_atr(df, 14)
 
         # 20-bar hacim ortalaması
@@ -928,7 +935,8 @@ class ICTStrategy:
             avg_volume = 0
 
         displacement = None
-
+        
+        # Sweep'ten hemen sonraki 2-3 mumu kontrol et
         for i in range(sweep_idx + 1, min(sweep_idx + max_lookahead + 1, n)):
             candle = df.iloc[i]
             body = abs(candle["close"] - candle["open"])
@@ -938,55 +946,46 @@ class ICTStrategy:
                 continue
 
             body_ratio = body / total_range
-
-            # Displacement: gövde oranı yeterli + yönü doğru
+            size_pct = body / mid_price
+            
+            # v3.4: Daha sıkı kontroller
             if body_ratio < min_body_ratio:
+                continue
+                
+            # Minimum hareket kontrolü (%0.6)
+            if size_pct < min_size_pct:
                 continue
 
             candle_dir = "BULLISH" if candle["close"] > candle["open"] else "BEARISH"
 
+            # Yön kontrolü
             if bias == "LONG" and candle_dir != "BULLISH":
                 continue
             if bias == "SHORT" and candle_dir != "BEARISH":
                 continue
-
-            # Bu yeterli — displacement bulundu
+            
+            # Hacim kontrolü (avg'nin en az %80'i)
             candle_volume = float(candle.get("volume", 0))
-            volume_confirmed = candle_volume >= avg_volume * 0.3 if avg_volume > 0 else True
+            volume_confirmed = candle_volume >= avg_volume * 0.8 if avg_volume > 0 else False
+            
+            # ATR kontrolü opsiyonel
+            atr_check = (atr > 0 and body >= atr * atr_mult) or size_pct >= min_size_pct
+            
+            if not atr_check:
+                continue
 
+            # Tüm kriterler geçti
             displacement = {
                 "index": i,
                 "direction": candle_dir,
                 "body_ratio": round(body_ratio, 3),
-                "size_pct": round((body / mid_price) * 100, 3),
+                "size_pct": round(size_pct * 100, 3),
                 "atr_multiple": round(body / atr, 2) if atr > 0 else 0,
                 "volume": candle_volume,
                 "avg_volume": round(avg_volume, 2),
                 "volume_confirmed": volume_confirmed,
             }
             break
-
-        if displacement is None:
-            # Fallback: sweep sonrası yönde NET hareket var mı?
-            if sweep_idx + 1 < n:
-                post_sweep_prices = df.iloc[sweep_idx + 1:min(sweep_idx + 6, n)]
-                if len(post_sweep_prices) >= 2:
-                    first_close = post_sweep_prices.iloc[0]["close"]
-                    last_close = post_sweep_prices.iloc[-1]["close"]
-                    move_pct = (last_close - first_close) / first_close * 100
-                    mid_price = (first_close + last_close) / 2
-
-                    if (bias == "LONG" and move_pct > 0.1) or (bias == "SHORT" and move_pct < -0.1):
-                        displacement = {
-                            "index": sweep_idx + len(post_sweep_prices),
-                            "direction": "BULLISH" if bias == "LONG" else "BEARISH",
-                            "body_ratio": 0.4,
-                            "size_pct": round(abs(move_pct), 3),
-                            "atr_multiple": 0.5,
-                            "volume": 0,
-                            "avg_volume": 0,
-                            "volume_confirmed": True,
-                        }
 
         if displacement is None:
             return None
@@ -1084,33 +1083,35 @@ class ICTStrategy:
 
     def _calc_structural_sl(self, df, sweep, bias, structure, entry_price=None):
         """
-        SL = Sweep fitil (wick) uç noktası.
+        SL = Sweep fitil (wick) uç noktası + buffer.
 
-        LONG → SL = sweep mumunun en düşük noktası (low)
-        SHORT → SL = sweep mumunun en yüksek noktası (high)
-
-        Buffer: %0.2 ek güvenlik tamponu.
+        v3.4 Crypto-optimized:
+        - LONG → SL = sweep wick low × 0.99 (%1 buffer)
+        - SHORT → SL = sweep wick high × 1.01 (%1 buffer)
+        - Max SL mesafesi kontrol edilir (config'de)
         """
+        sl_buffer = self.params.get("sl_buffer_pct", 0.01)  # %1 default
+        
         if bias == "LONG":
             # Sweep wicki alt noktası
             sweep_wick = sweep.get("sweep_wick", sweep.get("sweep_low"))
             if sweep_wick and sweep_wick > 0:
-                sl = sweep_wick * 0.998  # %0.2 buffer
-                logger.debug(f"  LONG SL: Sweep Wick @ {sl:.8f}")
+                sl = sweep_wick * (1 - sl_buffer)  # %1 buffer aşağı
+                logger.debug(f"  LONG SL: Sweep Wick @ {sl:.8f} (buffer: {sl_buffer*100:.1f}%)")
                 return sl
 
             # Fallback: swept level
-            sl = sweep["swept_level"] * 0.997
+            sl = sweep["swept_level"] * (1 - sl_buffer * 1.5)
             return sl
 
         elif bias == "SHORT":
             sweep_wick = sweep.get("sweep_wick", sweep.get("sweep_high"))
             if sweep_wick and sweep_wick > 0:
-                sl = sweep_wick * 1.002  # %0.2 buffer
-                logger.debug(f"  SHORT SL: Sweep Wick @ {sl:.8f}")
+                sl = sweep_wick * (1 + sl_buffer)  # %1 buffer yukarı
+                logger.debug(f"  SHORT SL: Sweep Wick @ {sl:.8f} (buffer: {sl_buffer*100:.1f}%)")
                 return sl
 
-            sl = sweep["swept_level"] * 1.003
+            sl = sweep["swept_level"] * (1 + sl_buffer * 1.5)
             return sl
 
         return None
@@ -1256,11 +1257,11 @@ class ICTStrategy:
             return None
 
         # ═══════════════════════════════════════════════════════════
-        #  GATE 1 — SEANS BİLGİSİ (Kripto 7/24 — bloke etmez)
+        #  GATE 1 — SEANS BİLGİSİ (Kripto 7/24 — Bypass)
         # ═══════════════════════════════════════════════════════════
         session = self.get_session_info()
-        # Kripto 7/24: Killzone ve hafta sonu bilgi amaçlı, bloke etmez
-        logger.debug(f"  {symbol} GATE 1 OK: {session['label']} (quality={session['quality']:.1f})")
+        # v3.4: Killzone kontrolü YOK - kripto 7/24 aktif, seans bilgisi sadece log için
+        logger.debug(f"  {symbol} GATE 1 BYPASS: {session['label']} - Kripto 7/24 aktif")
 
         # ═══════════════════════════════════════════════════════════
         #  GATE 2 — HTF BIAS + PREMIUM / DISCOUNT
@@ -1382,10 +1383,16 @@ class ICTStrategy:
                 logger.debug(f"  {symbol} GATE 5 FAIL: Seviye sırası hatalı (SL={sl:.6f} E={entry:.6f} TP={tp:.6f})")
                 return None
 
-        # SL mesafe kontrolü (çok dar SL → noise riski)
+        # SL mesafe kontrolü (v3.4: min %0.5, max %3.0)
         sl_distance_pct = abs(entry - sl) / entry
-        if sl_distance_pct < 0.001:  # %0.1 minimum SL mesafesi
-            logger.debug(f"  {symbol} GATE 5 FAIL: SL çok dar ({sl_distance_pct*100:.2f}%)")
+        min_sl = self.params.get("min_sl_distance_pct", 0.005)
+        max_sl = self.params.get("max_sl_distance_pct", 0.030)
+        
+        if sl_distance_pct < min_sl:
+            logger.debug(f"  {symbol} GATE 5 FAIL: SL çok dar ({sl_distance_pct*100:.2f}% < {min_sl*100:.1f}%)")
+            return None
+        if sl_distance_pct > max_sl:
+            logger.debug(f"  {symbol} GATE 5 FAIL: SL çok geniş ({sl_distance_pct*100:.2f}% > {max_sl*100:.1f}%)")
             return None
 
         current_price = df["close"].iloc[-1]
@@ -1393,37 +1400,15 @@ class ICTStrategy:
         reward = abs(tp - entry)
         rr_ratio = reward / risk if risk > 0 else 0
 
-        # Entry modu: fiyat FVG'de mi?
-        if bias == "LONG":
-            price_at_fvg = disp_fvg["low"] * 0.998 <= current_price <= disp_fvg["high"] * 1.002
-        else:
-            price_at_fvg = disp_fvg["low"] * 0.998 <= current_price <= disp_fvg["high"] * 1.002
+        # v3.4: SADECE LIMIT entry - FVG CE optimal giriş
+        # MARKET entry kaldırıldı (RR kaybı + entry quality düşüklüğü)
+        # Her zaman FVG CE'ye limit order kurulur
+        entry_mode = "LIMIT"
+        
+        # Entry FVG CE'de sabit (pullback için optimal nokta)
+        # Fiyat FVG'de bile olsa LIMIT kullan (daha iyi RR + kontrol)
 
-        entry_mode = "MARKET" if price_at_fvg else "LIMIT"
-
-        # ★ MARKET girişte gerçek piyasa fiyatını kullan (FVG CE değil)
-        # FVG CE sadece LIMIT emri için ideal giriş noktasıdır.
-        # MARKET'te fiyat zaten FVG içinde → gerçek giriş = current_price
-        if entry_mode == "MARKET":
-            entry = current_price
-            # Yeniden seviye doğrulama (MARKET fiyatıyla)
-            if bias == "LONG":
-                if sl >= entry or tp <= entry:
-                    logger.debug(f"  {symbol} GATE 5 FAIL: MARKET seviye sırası hatalı (SL={sl:.6f} E={entry:.6f} TP={tp:.6f})")
-                    return None
-            else:  # SHORT
-                if sl <= entry or tp >= entry:
-                    logger.debug(f"  {symbol} GATE 5 FAIL: MARKET seviye sırası hatalı (SL={sl:.6f} E={entry:.6f} TP={tp:.6f})")
-                    return None
-            # RR yeniden hesapla
-            risk = abs(entry - sl)
-            reward = abs(tp - entry)
-            rr_ratio = reward / risk if risk > 0 else 0
-            if rr_ratio < 1.0:
-                logger.debug(f"  {symbol} GATE 5 FAIL: MARKET RR düşük ({rr_ratio:.2f})")
-                return None
-
-        logger.debug(f"  {symbol} GATE 5 OK: Entry={entry:.6f} SL={sl:.6f} TP={tp:.6f} RR={rr_ratio:.2f} Mode={entry_mode}")
+        logger.debug(f"  {symbol} GATE 5 OK: Entry={entry:.6f} (FVG CE LIMIT) SL={sl:.6f} TP={tp:.6f} RR={rr_ratio:.2f}")
 
         # ═══════════════════════════════════════════════════════════
         #  TÜM 5 GATE GEÇTİ → SİNYAL ÜRET
