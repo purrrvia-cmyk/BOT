@@ -71,6 +71,11 @@
                 <span class="nav-label">Forex & Altın</span>
                 <span class="nav-badge fx-badge" id="navBadgeForex"></span>
             </button>
+            <button class="nav-item" data-tab="ame" onclick="switchTab('ame')">
+                <i class="fas fa-atom"></i>
+                <span class="nav-label">AME Motor</span>
+                <span class="nav-badge ame-badge" id="navBadgeAME"></span>
+            </button>
         </nav>
 
         <div class="sidebar-footer">
@@ -866,6 +871,268 @@
                             <span>Teknik Göstergeler</span>
                         </div>
                         <div class="fx-indicators" id="fxIndicators"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- AME (Adaptive Microstructure Engine) SEKMESİ -->
+            <div class="tab-content" id="tab-ame">
+
+                <!-- ═══ AME HEADER ═══ -->
+                <div class="ame-hero">
+                    <div class="ame-hero-left">
+                        <div class="ame-hero-icon"><i class="fas fa-atom fa-spin-slow"></i></div>
+                        <div>
+                            <h2 class="ame-hero-title">Adaptive Microstructure Engine</h2>
+                            <span class="ame-hero-sub">v2.1 — Hurst · OrderFlow · Multi-TF · BTC · Likidite · VPOC · Funding · Wyckoff · Kelly</span>
+                        </div>
+                    </div>
+                    <div class="ame-hero-actions">
+                        <select id="ameModeSelect" onchange="ameChangeMode(this.value)" class="ame-mode-select">
+                            <option value="aggressive">🔥 Agresif</option>
+                            <option value="balanced" selected>⚖️ Dengeli</option>
+                            <option value="conservative">🛡️ Konservatif</option>
+                        </select>
+                        <button class="ame-btn ame-btn-scan" onclick="ameManualScan()" id="ameScanBtn">
+                            <i class="fas fa-satellite-dish"></i> Tara
+                        </button>
+                        <button class="btn-icon" onclick="refreshWithFeedback(this, loadAME)" title="Yenile">
+                            <i class="fas fa-arrows-rotate"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- ═══ SCAN STATUS BAR ═══ -->
+                <div class="ame-scan-bar" id="ameScanBar">
+                    <div class="ame-scan-left">
+                        <span class="ame-scan-dot" id="ameScanDot"></span>
+                        <span id="ameScanText">Tarama bekleniyor...</span>
+                    </div>
+                    <div class="ame-scan-right">
+                        <span id="ameScanCoins">—</span> coin · 
+                        <span id="ameScanCandidates">—</span> aday · 
+                        <span id="ameScanSignals">0</span> sinyal
+                    </div>
+                </div>
+
+                <!-- ═══ 4 ENGINE COMPONENTS (v2) ═══ -->
+                <div class="ame-engines">
+                    <div class="ame-engine-card" id="ameEngVol">
+                        <div class="ame-engine-icon" style="background:var(--purple-dim);color:var(--purple)">
+                            <i class="fas fa-wave-square"></i>
+                        </div>
+                        <div class="ame-engine-body">
+                            <div class="ame-engine-label">Hurst Rejim</div>
+                            <div class="ame-engine-value" id="ameVolRegime">—</div>
+                            <div class="ame-engine-detail" id="ameVolDetail">H: — · E: —</div>
+                        </div>
+                        <div class="ame-engine-bar">
+                            <div class="ame-engine-bar-fill" id="ameVolBar" style="width:0%;background:var(--purple)"></div>
+                        </div>
+                    </div>
+                    <div class="ame-engine-card" id="ameEngImp">
+                        <div class="ame-engine-icon" style="background:var(--cyan-dim);color:var(--cyan)">
+                            <i class="fas fa-water"></i>
+                        </div>
+                        <div class="ame-engine-body">
+                            <div class="ame-engine-label">Order Flow (CVD)</div>
+                            <div class="ame-engine-value" id="ameImpBias">—</div>
+                            <div class="ame-engine-detail" id="ameImpDetail">CVD: — · Sweep: —</div>
+                        </div>
+                        <div class="ame-engine-bar">
+                            <div class="ame-engine-bar-fill" id="ameImpBar" style="width:0%;background:var(--cyan)"></div>
+                        </div>
+                    </div>
+                    <div class="ame-engine-card" id="ameEngAcc">
+                        <div class="ame-engine-icon" style="background:var(--orange-dim);color:var(--orange)">
+                            <i class="fas fa-layer-group"></i>
+                        </div>
+                        <div class="ame-engine-body">
+                            <div class="ame-engine-label">Multi-TF Confluence</div>
+                            <div class="ame-engine-value" id="ameAccSignal">—</div>
+                            <div class="ame-engine-detail" id="ameAccDetail">4H: — · 1H: — · 15M: —</div>
+                        </div>
+                        <div class="ame-engine-bar">
+                            <div class="ame-engine-bar-fill" id="ameAccBar" style="width:0%;background:var(--orange)"></div>
+                        </div>
+                    </div>
+                    <div class="ame-engine-card" id="ameEngRisk">
+                        <div class="ame-engine-icon" style="background:var(--green-dim);color:var(--green)">
+                            <i class="fab fa-bitcoin"></i>
+                        </div>
+                        <div class="ame-engine-body">
+                            <div class="ame-engine-label">BTC Filtre + Risk</div>
+                            <div class="ame-engine-value" id="ameRiskMode">—</div>
+                            <div class="ame-engine-detail" id="ameRiskDetail">Corr: — · Session: —</div>
+                        </div>
+                        <div class="ame-engine-bar">
+                            <div class="ame-engine-bar-fill" id="ameRiskBar" style="width:0%;background:var(--green)"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ═══ 4 NEW ENGINE COMPONENTS (v2.1) ═══ -->
+                <div class="ame-engines" style="margin-top:6px;">
+                    <div class="ame-engine-card" id="ameEngLiq">
+                        <div class="ame-engine-icon" style="background:rgba(231,76,60,0.15);color:#e74c3c">
+                            <i class="fas fa-water"></i>
+                        </div>
+                        <div class="ame-engine-body">
+                            <div class="ame-engine-label">Likidite Havuzu</div>
+                            <div class="ame-engine-value" id="ameLiqRisk">—</div>
+                            <div class="ame-engine-detail" id="ameLiqDetail">EQH: — · EQL: — · Sweep: —</div>
+                        </div>
+                        <div class="ame-engine-bar">
+                            <div class="ame-engine-bar-fill" id="ameLiqBar" style="width:0%;background:#e74c3c"></div>
+                        </div>
+                    </div>
+                    <div class="ame-engine-card" id="ameEngVpoc">
+                        <div class="ame-engine-icon" style="background:rgba(155,89,182,0.15);color:#9b59b6">
+                            <i class="fas fa-chart-area"></i>
+                        </div>
+                        <div class="ame-engine-body">
+                            <div class="ame-engine-label">Volume Profile</div>
+                            <div class="ame-engine-value" id="ameVpocPos">—</div>
+                            <div class="ame-engine-detail" id="ameVpocDetail">VPOC: — · VAH: — · VAL: —</div>
+                        </div>
+                        <div class="ame-engine-bar">
+                            <div class="ame-engine-bar-fill" id="ameVpocBar" style="width:0%;background:#9b59b6"></div>
+                        </div>
+                    </div>
+                    <div class="ame-engine-card" id="ameEngFund">
+                        <div class="ame-engine-icon" style="background:rgba(241,196,15,0.15);color:#f1c40f">
+                            <i class="fas fa-percentage"></i>
+                        </div>
+                        <div class="ame-engine-body">
+                            <div class="ame-engine-label">Funding + OI</div>
+                            <div class="ame-engine-value" id="ameFundSent">—</div>
+                            <div class="ame-engine-detail" id="ameFundDetail">FR: — · OI: — · Squeeze: —</div>
+                        </div>
+                        <div class="ame-engine-bar">
+                            <div class="ame-engine-bar-fill" id="ameFundBar" style="width:0%;background:#f1c40f"></div>
+                        </div>
+                    </div>
+                    <div class="ame-engine-card" id="ameEngWyck">
+                        <div class="ame-engine-icon" style="background:rgba(26,188,156,0.15);color:#1abc9c">
+                            <i class="fas fa-diagram-project"></i>
+                        </div>
+                        <div class="ame-engine-body">
+                            <div class="ame-engine-label">Wyckoff Faz</div>
+                            <div class="ame-engine-value" id="ameWyckPhase">—</div>
+                            <div class="ame-engine-detail" id="ameWyckDetail">Sinyal: — · Güç: —</div>
+                        </div>
+                        <div class="ame-engine-bar">
+                            <div class="ame-engine-bar-fill" id="ameWyckBar" style="width:0%;background:#1abc9c"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ═══ KELLY + ADAPTIVE STATUS BAR ═══ -->
+                <div style="display:flex;gap:12px;margin:8px 0;padding:8px 14px;background:rgba(255,255,255,0.03);border-radius:8px;font-size:12px;align-items:center;flex-wrap:wrap;">
+                    <span style="opacity:0.5"><i class="fas fa-calculator"></i></span>
+                    <span id="ameKellyBadge" style="color:var(--text-muted)">Kelly: —</span>
+                    <span style="opacity:0.2">|</span>
+                    <span style="opacity:0.5"><i class="fas fa-brain"></i></span>
+                    <span id="ameAdaptBadge" style="color:var(--text-muted)">Adaptif: —</span>
+                </div>
+
+                <!-- ═══ STATS CARDS ═══ -->
+                <div class="ame-stats">
+                    <div class="ame-stat-card">
+                        <div class="ame-stat-icon" style="background:var(--blue-dim);color:var(--blue)"><i class="fas fa-bolt"></i></div>
+                        <div class="ame-stat-body">
+                            <span class="ame-stat-label">Aktif Trade</span>
+                            <span class="ame-stat-value" id="ameActiveTrades">0</span>
+                        </div>
+                    </div>
+                    <div class="ame-stat-card">
+                        <div class="ame-stat-icon" style="background:var(--purple-dim);color:var(--purple)"><i class="fas fa-chart-bar"></i></div>
+                        <div class="ame-stat-body">
+                            <span class="ame-stat-label">Toplam İşlem</span>
+                            <span class="ame-stat-value" id="ameTotalTrades">0</span>
+                        </div>
+                    </div>
+                    <div class="ame-stat-card">
+                        <div class="ame-stat-icon" style="background:var(--green-dim);color:var(--green)"><i class="fas fa-trophy"></i></div>
+                        <div class="ame-stat-body">
+                            <span class="ame-stat-label">Win Rate</span>
+                            <span class="ame-stat-value" id="ameWinRate">—</span>
+                        </div>
+                    </div>
+                    <div class="ame-stat-card">
+                        <div class="ame-stat-icon" style="background:var(--cyan-dim);color:var(--cyan)"><i class="fas fa-scale-balanced"></i></div>
+                        <div class="ame-stat-body">
+                            <span class="ame-stat-label">Ort. RR</span>
+                            <span class="ame-stat-value" id="ameAvgRR">—</span>
+                        </div>
+                    </div>
+                    <div class="ame-stat-card">
+                        <div class="ame-stat-icon pnl-icon" id="amePnlIcon" style="background:var(--green-dim);color:var(--green)"><i class="fas fa-coins"></i></div>
+                        <div class="ame-stat-body">
+                            <span class="ame-stat-label">Net PnL</span>
+                            <span class="ame-stat-value" id="ameNetPnL">0%</span>
+                        </div>
+                    </div>
+                    <div class="ame-stat-card">
+                        <div class="ame-stat-icon" style="background:var(--yellow-dim);color:var(--yellow)"><i class="fas fa-star"></i></div>
+                        <div class="ame-stat-body">
+                            <span class="ame-stat-label">Ort. Skor</span>
+                            <span class="ame-stat-value" id="ameAvgScore">—</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ═══ ACTIVE SIGNALS TABLE ═══ -->
+                <div class="card" style="margin-bottom:16px">
+                    <div class="card-header">
+                        <i class="fas fa-bolt" style="color:var(--cyan)"></i>
+                        <h3>Aktif Sinyaller</h3>
+                        <span class="ame-header-badge" id="ameActiveCount">0</span>
+                    </div>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Coin</th>
+                                    <th>Yön</th>
+                                    <th>Giriş</th>
+                                    <th>SL</th>
+                                    <th>TP1/TP2/TP3</th>
+                                    <th>RR</th>
+                                    <th>Skor</th>
+                                    <th>Rejim</th>
+                                    <th>Durum</th>
+                                    <th>Süre</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ameActiveTable"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- ═══ HISTORY TABLE ═══ -->
+                <div class="card">
+                    <div class="card-header">
+                        <i class="fas fa-clock-rotate-left" style="color:var(--purple)"></i>
+                        <h3>Geçmiş İşlemler</h3>
+                    </div>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Coin</th>
+                                    <th>Yön</th>
+                                    <th>Giriş</th>
+                                    <th>Çıkış</th>
+                                    <th>PnL</th>
+                                    <th>Sonuç</th>
+                                    <th>Skor</th>
+                                    <th>Mod</th>
+                                    <th>Tarih</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ameHistoryTable"></tbody>
+                        </table>
                     </div>
                 </div>
             </div>

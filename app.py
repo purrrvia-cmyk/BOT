@@ -30,6 +30,8 @@ from trade_manager import trade_manager
 from self_optimizer import self_optimizer
 from market_regime import market_regime
 from forex_ict import forex_ict, FOREX_INSTRUMENTS
+from ame_strategy import ame_strategy
+from ame_manager import ame_trade_manager
 
 # =================== LOGGING ===================
 
@@ -206,6 +208,120 @@ def run_optimizer():
         logger.error(f"Optimizasyon hatası: {e}")
 
 
+# ── AME Arka Plan Görevleri ──
+
+ame_scan_lock = threading.Lock()
+ame_last_scan = {"time": None, "coins": 0, "candidates": 0, "signals": 0, "scanning": False}
+
+def ame_scan_markets():
+    """AME v2 piyasa taraması — 2-pass multi-TF + BTC korelasyon."""
+    if not bot_state.get("running", False):
+        return
+
+    if not ame_scan_lock.acquire(blocking=False):
+        return
+
+    try:
+        ame_last_scan["scanning"] = True
+        logger.info("🔬 AME v2.1 piyasa taraması başlıyor...")
+
+        # 🧠 Performance-adaptive parameter tuning
+        try:
+            ame_trade_manager.adapt_parameters()
+        except Exception as e:
+            logger.error(f"AME adaptive error: {e}")
+
+        # BTC baseline (fetch once)
+        btc_1h = data_fetcher.get_candles("BTC-USDT-SWAP", "1H", 50)
+        time.sleep(0.1)
+
+        active_coins = data_fetcher.get_high_volume_coins()
+        if not active_coins:
+            return
+
+        # ═══ PASS 1: Quick screen (15m only) ═══
+        candidates = []
+        for symbol in active_coins:
+            try:
+                df_15m = data_fetcher.get_candles(symbol, "15m", 100)
+                if df_15m is not None and not df_15m.empty and ame_strategy.quick_screen(df_15m):
+                    candidates.append((symbol, df_15m))
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"AME screen hata ({symbol}): {e}")
+
+        logger.info(f"🔬 AME quick screen: {len(candidates)}/{len(active_coins)} coin geçti")
+
+        # ═══ PASS 2: Deep analysis (multi-TF + BTC + Funding/OI) ═══
+        new_signals = []
+        for symbol, df_15m in candidates:
+            try:
+                df_1h = data_fetcher.get_candles(symbol, "1H", 50)
+                time.sleep(0.1)
+                df_4h = data_fetcher.get_candles(symbol, "4H", 30)
+                time.sleep(0.1)
+
+                # Funding rate + Open Interest (new v2.1)
+                funding_data = None
+                oi_data = None
+                try:
+                    funding_data = data_fetcher.get_funding_rate(symbol)
+                    oi_data = data_fetcher.get_open_interest(symbol)
+                except Exception:
+                    pass
+
+                signal = ame_strategy.generate_signal(
+                    symbol, df_15m, df_1h, df_4h, btc_1h,
+                    funding_data=funding_data, oi_data=oi_data
+                )
+                if signal:
+                    trade_result = ame_trade_manager.process_signal(signal)
+                    if trade_result and trade_result.get("status") == "OPENED":
+                        new_signals.append(trade_result)
+                        socketio.emit("ame_new_signal", trade_result)
+            except Exception as e:
+                logger.error(f"AME analiz hata ({symbol}): {e}")
+
+        ame_last_scan["time"] = datetime.now().isoformat()
+        ame_last_scan["coins"] = len(active_coins)
+        ame_last_scan["candidates"] = len(candidates)
+        ame_last_scan["signals"] = len(new_signals)
+        ame_last_scan["scanning"] = False
+        logger.info(f"✅ AME v2 tarama: {len(active_coins)} coin → {len(candidates)} aday → {len(new_signals)} sinyal")
+
+        socketio.emit("ame_scan_complete", {
+            "symbols_scanned": len(active_coins),
+            "candidates": len(candidates),
+            "new_signals": len(new_signals),
+            "timestamp": datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        logger.error(f"AME tarama hatası: {e}")
+        ame_last_scan["scanning"] = False
+    finally:
+        ame_scan_lock.release()
+
+
+def ame_check_trades():
+    """AME açık işlem kontrol (ICT'den bağımsız)."""
+    if not bot_state.get("running", False):
+        return
+
+    try:
+        results = ame_trade_manager.check_open_trades()
+        for r in results:
+            if r and r.get("status") in ("WON", "LOST"):
+                socketio.emit("ame_trade_closed", r)
+
+        socketio.emit("ame_trades_updated", {
+            "results": results,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"AME işlem kontrol hatası: {e}")
+
+
 # ── Threading-based zamanlayıcı (eventlet yerine) ──
 _scheduler_threads = []
 
@@ -229,6 +345,8 @@ def start_scheduler_jobs():
         (scan_markets, SCAN_INTERVAL_SECONDS, "scan_markets"),
         (check_trades, TRADE_CHECK_INTERVAL, "check_trades"),
         (run_optimizer, OPTIMIZER_CONFIG["optimization_interval_minutes"] * 60, "run_optimizer"),
+        (ame_scan_markets, SCAN_INTERVAL_SECONDS, "ame_scan_markets"),
+        (ame_check_trades, TRADE_CHECK_INTERVAL, "ame_check_trades"),
     ]:
         t = threading.Thread(target=_scheduler_loop, args=(func, interval, job_id), daemon=True)
         t.start()
@@ -2513,6 +2631,103 @@ def api_forex_signal(instrument):
 def api_forex_kill_zones():
     """Aktif Kill Zone bilgisi"""
     return jsonify(forex_ict.detect_kill_zones())
+
+
+# =================== AME (Adaptive Microstructure Engine) API ===================
+
+@app.route("/api/ame/signals/active")
+def api_ame_active_signals():
+    """AME aktif sinyalleri"""
+    from database import get_ame_active_signals
+    return jsonify(get_ame_active_signals())
+
+
+@app.route("/api/ame/signals/history")
+def api_ame_signal_history():
+    """AME sinyal geçmişi"""
+    from database import get_ame_signal_history
+    limit = request.args.get("limit", 50, type=int)
+    return jsonify(get_ame_signal_history(limit))
+
+
+@app.route("/api/ame/signals/all")
+def api_ame_all_signals():
+    """AME tüm sinyaller"""
+    from database import get_ame_all_signals
+    limit = request.args.get("limit", 100, type=int)
+    return jsonify(get_ame_all_signals(limit))
+
+
+@app.route("/api/ame/performance")
+def api_ame_performance():
+    """AME performans istatistikleri"""
+    from database import get_ame_performance_summary
+    return jsonify(get_ame_performance_summary())
+
+
+@app.route("/api/ame/status")
+def api_ame_status():
+    """AME durum bilgisi"""
+    status = ame_trade_manager.get_status()
+    status["strategy_mode"] = ame_strategy.mode
+    status["params"] = ame_strategy.p
+    status["last_scan"] = ame_last_scan
+    return jsonify(status)
+
+
+@app.route("/api/ame/scan", methods=["POST"])
+def api_ame_manual_scan():
+    """AME manual tarama tetikle"""
+    threading.Thread(target=ame_scan_markets, daemon=True).start()
+    return jsonify({"status": "ok", "message": "AME tarama başlatıldı"})
+
+
+@app.route("/api/ame/mode", methods=["POST"])
+def api_ame_set_mode():
+    """AME çalışma modunu değiştir (aggressive/balanced/conservative)"""
+    data = request.get_json() or {}
+    mode = data.get("mode", "balanced")
+    if mode not in ("aggressive", "balanced", "conservative"):
+        return jsonify({"error": "Geçersiz mod. aggressive/balanced/conservative"}), 400
+    ame_strategy.set_mode(mode)
+    return jsonify({"status": "ok", "mode": mode, "params": ame_strategy.p})
+
+
+@app.route("/api/ame/analyze/<symbol>")
+def api_ame_analyze(symbol):
+    """Tek coin AME v2.1 analizi (multi-TF + BTC + Funding/OI + Liquidity + Wyckoff)."""
+    symbol = symbol.upper()
+    if not symbol.endswith("-USDT-SWAP") and not symbol.endswith("-USDT"):
+        symbol = symbol + "-USDT-SWAP"
+    try:
+        df_15m = data_fetcher.get_candles(symbol, "15m", 100)
+        if df_15m is None or df_15m.empty:
+            return jsonify({"error": f"Veri bulunamadı: {symbol}"}), 404
+        df_1h = data_fetcher.get_candles(symbol, "1H", 50)
+        df_4h = data_fetcher.get_candles(symbol, "4H", 30)
+        btc_1h = data_fetcher.get_candles("BTC-USDT-SWAP", "1H", 50)
+
+        # Funding + OI (new v2.1)
+        funding_data = None
+        oi_data = None
+        try:
+            funding_data = data_fetcher.get_funding_rate(symbol)
+            oi_data = data_fetcher.get_open_interest(symbol)
+        except Exception:
+            pass
+
+        analysis = ame_strategy.analyze(symbol, df_15m, df_1h, df_4h, btc_1h,
+                                        funding_data=funding_data, oi_data=oi_data)
+        signal = ame_strategy.generate_signal(symbol, df_15m, df_1h, df_4h, btc_1h,
+                                              funding_data=funding_data, oi_data=oi_data)
+        return jsonify({
+            "analysis": analysis,
+            "signal": signal,
+            "symbol": symbol,
+        })
+    except Exception as e:
+        logger.error(f"AME analiz hatası ({symbol}): {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # =================== WEBSOCKET ===================

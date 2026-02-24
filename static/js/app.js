@@ -227,6 +227,7 @@ const pageTitles = {
     optimizer: { icon: "fas fa-brain", text: "Optimizasyon" },
 
     forex: { icon: "fas fa-chart-line", text: "Forex & Altın ICT" },
+    ame: { icon: "fas fa-atom", text: "AME Motor" },
     coindetail: { icon: "fas fa-magnifying-glass-chart", text: "Coin Detay Analizi" }
 };
 
@@ -248,7 +249,7 @@ function switchTab(tabName) {
     // Coin detay sekmesinde stats-row gizle (daha fazla alan)
     const statsRow = document.getElementById("statsRow");
     if (statsRow) {
-        statsRow.classList.toggle("hidden", tabName === "coindetail" || tabName === "forex");
+        statsRow.classList.toggle("hidden", tabName === "coindetail" || tabName === "forex" || tabName === "ame");
     }
 
     // Auto-refresh: coindetail'den çıkınca durdur
@@ -271,6 +272,7 @@ function switchTab(tabName) {
         case "optimizer": loadOptimization(); break;
         case "performance": loadPerformance(); break;
         case "forex": initForexAutoScan(); break;
+        case "ame": loadAME(); break;
     }
 }
 
@@ -3234,3 +3236,437 @@ document.addEventListener("keydown", (e) => {
         }
     }
 });
+
+
+// =================== AME (Adaptive Microstructure Engine) ===================
+
+// ═══════════════════════════════════════════════════════
+// AME — Adaptive Microstructure Engine Frontend
+// ═══════════════════════════════════════════════════════
+
+let _ameAnalysisCache = null;
+
+async function loadAME() {
+    try {
+        const [activeData, historyData, perfData, statusData] = await Promise.all([
+            apiFetch("/api/ame/signals/active"),
+            apiFetch("/api/ame/signals/history?limit=30"),
+            apiFetch("/api/ame/performance"),
+            apiFetch("/api/ame/status"),
+        ]);
+
+        // ── Performance stats ──
+        if (perfData) {
+            setText("ameTotalTrades", perfData.total_trades || 0);
+            setText("ameWinRate", perfData.total_trades > 0 ? perfData.win_rate + "%" : "—");
+            setText("ameAvgRR", perfData.avg_rr ? parseFloat(perfData.avg_rr).toFixed(1) : "—");
+            const pnl = perfData.total_pnl || 0;
+            const pnlEl = document.getElementById("ameNetPnL");
+            if (pnlEl) {
+                pnlEl.textContent = (pnl >= 0 ? "+" : "") + pnl.toFixed(2) + "%";
+                pnlEl.style.color = pnl >= 0 ? "var(--green)" : "var(--red)";
+            }
+            const iconEl = document.getElementById("amePnlIcon");
+            if (iconEl) {
+                iconEl.style.background = pnl >= 0 ? "var(--green-dim)" : "var(--red-dim)";
+                iconEl.style.color = pnl >= 0 ? "var(--green)" : "var(--red)";
+            }
+            setText("ameAvgScore", perfData.avg_score ? parseFloat(perfData.avg_score).toFixed(0) : "—");
+        }
+
+        // ── Status / Mode ──
+        if (statusData) {
+            setText("ameActiveTrades", statusData.active_trades || 0);
+            const sel = document.getElementById("ameModeSelect");
+            if (sel) sel.value = statusData.strategy_mode || "balanced";
+
+            // Active count badge
+            const countBadge = document.getElementById("ameActiveCount");
+            if (countBadge) countBadge.textContent = activeData ? activeData.length : 0;
+
+            // Nav badge
+            const badge = document.getElementById("navBadgeAME");
+            if (badge) {
+                const count = activeData ? activeData.length : 0;
+                badge.textContent = count > 0 ? count : "";
+                badge.style.display = count > 0 ? "inline-flex" : "none";
+            }
+
+            // ── Scan status bar ──
+            const ls = statusData.last_scan;
+            if (ls) {
+                const scanDot = document.getElementById("ameScanDot");
+                const scanText = document.getElementById("ameScanText");
+                if (ls.scanning) {
+                    scanDot && scanDot.classList.add("scanning");
+                    scanText && (scanText.textContent = "Tarama devam ediyor...");
+                } else if (ls.time) {
+                    scanDot && scanDot.classList.remove("scanning");
+                    const ago = getElapsed(ls.time);
+                    scanText && (scanText.textContent = `Son tarama: ${ago} önce`);
+                }
+                setText("ameScanCoins", ls.coins || "—");
+                setText("ameScanCandidates", ls.candidates || "—");
+                setText("ameScanSignals", ls.signals || 0);
+            }
+
+            // ── BTC filter / risk engine card (mode display) ──
+            const modeLabels = { aggressive: "🔥 Agresif", balanced: "⚖️ Dengeli", conservative: "🛡️ Konservatif" };
+            const p = statusData.params || {};
+            const riskDetail = `TP: ${p.tp1_rr || 1}R/${p.tp2_rr || 2}R/${p.tp3_rr || 3.5}R · Max: ${p.max_concurrent || 5}`;
+            const riskDetailEl = document.getElementById("ameRiskDetail");
+            // Only set if not already populated by analysis
+            if (riskDetailEl && riskDetailEl.textContent.startsWith("Corr: —")) {
+                riskDetailEl.textContent = riskDetail;
+            }
+
+            // ── Kelly + Adaptive Badge ──
+            const kelly = statusData.kelly || {};
+            const adaptive = statusData.adaptive || {};
+            const kellyBadge = document.getElementById("ameKellyBadge");
+            if (kellyBadge) {
+                if (kelly.sufficient_data) {
+                    kellyBadge.textContent = `Kelly: ${kelly.position_pct}% | f*=${kelly.kelly_full}`;
+                    kellyBadge.style.color = "var(--cyan)";
+                } else {
+                    kellyBadge.textContent = `Kelly: Veri yetersiz (default ${p.default_position_pct || 2}%)`;
+                    kellyBadge.style.color = "var(--text-muted)";
+                }
+            }
+            const adaptBadge = document.getElementById("ameAdaptBadge");
+            if (adaptBadge) {
+                if (adaptive.enabled) {
+                    adaptBadge.textContent = `Adaptif: MinScore=${adaptive.min_signal_score} · MaxPos=${adaptive.max_concurrent} · Cooldown=${adaptive.cooldown_minutes}dk`;
+                    adaptBadge.style.color = "var(--orange)";
+                } else {
+                    adaptBadge.textContent = "Adaptif: Kapalı";
+                    adaptBadge.style.color = "var(--text-muted)";
+                }
+            }
+        }
+
+        // ── Tables (use enriched active signals from status if available) ──
+        const enrichedActive = statusData && statusData.active_signals ? statusData.active_signals : (activeData || []);
+        renderAMEActiveTable(enrichedActive);
+        renderAMEHistoryTable(historyData || []);
+
+        // ── Load BTC analysis for engine components ──
+        loadAMEAnalysis();
+
+    } catch (e) {
+        console.error("AME load error:", e);
+    }
+}
+
+async function loadAMEAnalysis() {
+    try {
+        const data = await apiFetch("/api/ame/analyze/BTC-USDT-SWAP");
+        if (!data || !data.analysis) return;
+        const a = data.analysis;
+        _ameAnalysisCache = a;
+
+        // ── 1. Hurst Regime Engine ──
+        const regime = a.regime || {};
+        const regimeType = regime.regime || "UNKNOWN";
+        const regimeColors = {
+            TREND_BULLISH: "var(--green)", TREND_BULL: "var(--green)", TREND_BEARISH: "var(--red)", TREND_BEAR: "var(--red)",
+            MEAN_REVERT: "var(--yellow)", TRANSITION: "var(--orange)", CHAOS: "var(--red)", UNKNOWN: "var(--text-muted)"
+        };
+        const regimeLabels = {
+            TREND_BULLISH: "📈 Trend Bull", TREND_BULL: "📈 Trend Bull", TREND_BEARISH: "📉 Trend Bear", TREND_BEAR: "📉 Trend Bear",
+            MEAN_REVERT: "🔄 Mean Revert", TRANSITION: "⚡ Transition", CHAOS: "🌀 Chaos", UNKNOWN: "◆ Bilinmiyor"
+        };
+        setText("ameVolRegime", regimeLabels[regimeType] || regimeType);
+        const volEl = document.getElementById("ameVolRegime");
+        if (volEl) volEl.style.color = regimeColors[regimeType] || "var(--text-secondary)";
+        const hurst = regime.hurst || 0.5;
+        const efficiency = regime.efficiency || 0.5;
+        setText("ameVolDetail", `H: ${hurst.toFixed(3)} · E: ${efficiency.toFixed(3)}`);
+        const volBar = document.getElementById("ameVolBar");
+        if (volBar) volBar.style.width = Math.min(100, hurst * 100) + "%";
+
+        // ── 2. Order Flow Engine ──
+        const of = a.orderflow || {};
+        const ofBias = of.bias || "NEUTRAL";
+        const biasColors = { LONG: "var(--green)", SHORT: "var(--red)", NEUTRAL: "var(--text-muted)" };
+        const bLabel = ofBias === "LONG" ? "▲ Long Bias" : ofBias === "SHORT" ? "▼ Short Bias" : "◆ Nötr";
+        setText("ameImpBias", bLabel);
+        const impEl = document.getElementById("ameImpBias");
+        if (impEl) impEl.style.color = biasColors[ofBias] || "var(--text-secondary)";
+        const cvdDiv = of.cvd ? of.cvd.divergence || "NONE" : "NONE";
+        const sweepType = of.sweep ? of.sweep.type || "—" : "—";
+        const cvdLabel = cvdDiv === "CONFIRMING" ? "✓ Confirm" : cvdDiv.includes("DIVERGENCE") ? "⚠ Div" : "— Nötr";
+        const sweepLabel = sweepType.includes("BULLISH") ? "▲ Sweep" : sweepType.includes("BEARISH") ? "▼ Sweep" : "—";
+        setText("ameImpDetail", `CVD: ${cvdLabel} · Sweep: ${sweepLabel}`);
+        const impBar = document.getElementById("ameImpBar");
+        if (impBar) impBar.style.width = Math.min(100, (of.strength || 0) * 100) + "%";
+
+        // ── 3. Multi-TF Confluence ──
+        const conf = a.confluence || {};
+        const confDir = conf.direction || "NEUTRAL";
+        const confCount = conf.count || 0;
+        const confColors = { LONG: "var(--green)", SHORT: "var(--red)", NEUTRAL: "var(--text-muted)" };
+        const confLabel = confDir === "LONG" ? `▲ LONG (${confCount}/3)` : confDir === "SHORT" ? `▼ SHORT (${confCount}/3)` : `◆ Nötr (${confCount}/3)`;
+        setText("ameAccSignal", confLabel);
+        const accEl = document.getElementById("ameAccSignal");
+        if (accEl) accEl.style.color = confColors[confDir] || "var(--text-secondary)";
+        const tf4h = conf.tf_4h ? conf.tf_4h.direction || "—" : "—";
+        const tf1h = conf.tf_1h ? conf.tf_1h.direction || "—" : "—";
+        const tf15m = conf.tf_15m ? conf.tf_15m.direction || "—" : "—";
+        setText("ameAccDetail", `4H: ${tf4h.substring(0,4)} · 1H: ${tf1h.substring(0,4)} · 15M: ${tf15m.substring(0,4)}`);
+        const accBar = document.getElementById("ameAccBar");
+        if (accBar) accBar.style.width = Math.min(100, confCount / 3 * 100) + "%";
+
+        // ── 4. BTC Filter + Risk ──
+        const btc = a.btc || {};
+        const btcCorr = btc.correlation || 0;
+        const btcTrend = btc.trend ? btc.trend.direction || "NEUTRAL" : "NEUTRAL";
+        const btcLabel = btcTrend === "BULLISH" ? "BTC ▲" : btcTrend === "BEARISH" ? "BTC ▼" : "BTC ◆";
+        const session = a.session || "—";
+        setText("ameRiskMode", `${btcLabel} · r=${btcCorr.toFixed(2)}`);
+        const riskEl = document.getElementById("ameRiskMode");
+        if (riskEl) riskEl.style.color = btcCorr > 0.7 ? "var(--yellow)" : "var(--green)";
+        setText("ameRiskDetail", `Corr: ${(btcCorr * 100).toFixed(0)}% · Session: ${session}`);
+        const riskBar = document.getElementById("ameRiskBar");
+        if (riskBar) riskBar.style.width = Math.min(100, Math.abs(btcCorr) * 100) + "%";
+
+        // ── 5. Likidite Havuzu (v2.1) ──
+        const liq = a.liquidity || {};
+        const sweepRisk = liq.sweep_risk || "LOW";
+        const eqhCount = liq.equal_highs ? liq.equal_highs.length : 0;
+        const eqlCount = liq.equal_lows ? liq.equal_lows.length : 0;
+        const liqColors = { HIGH: "#e74c3c", MEDIUM: "#f39c12", LOW: "#2ecc71" };
+        const liqLabels = { HIGH: "🔴 Yüksek Risk", MEDIUM: "🟡 Orta Risk", LOW: "🟢 Düşük Risk" };
+        setText("ameLiqRisk", liqLabels[sweepRisk] || "—");
+        const liqValEl = document.getElementById("ameLiqRisk");
+        if (liqValEl) liqValEl.style.color = liqColors[sweepRisk] || "#888";
+        setText("ameLiqDetail", `EQH: ${eqhCount} · EQL: ${eqlCount} · Sweep: ${sweepRisk}`);
+        const liqBar = document.getElementById("ameLiqBar");
+        if (liqBar) liqBar.style.width = sweepRisk === "HIGH" ? "90%" : sweepRisk === "MEDIUM" ? "55%" : "20%";
+
+        // ── 6. Volume Profile (v2.1) ──
+        const vp = a.volume_profile || {};
+        const vpPos = vp.position || "UNKNOWN";
+        const vpoc = vp.vpoc || 0;
+        const vah = vp.vah || 0;
+        const val_ = vp.val || 0;
+        const vpColors = { ABOVE_VA: "#e74c3c", BELOW_VA: "#2ecc71", INSIDE_VA: "#9b59b6", AT_VPOC: "#f1c40f" };
+        const vpLabels = { ABOVE_VA: "▲ VA Üstü", BELOW_VA: "▼ VA Altı", INSIDE_VA: "◆ VA İçi", AT_VPOC: "⊕ VPOC'ta" };
+        setText("ameVpocPos", vpLabels[vpPos] || vpPos);
+        const vpValEl = document.getElementById("ameVpocPos");
+        if (vpValEl) vpValEl.style.color = vpColors[vpPos] || "#888";
+        const fmtP = (v) => v > 1000 ? v.toFixed(1) : v > 1 ? v.toFixed(4) : v.toFixed(6);
+        setText("ameVpocDetail", `VPOC: ${fmtP(vpoc)} · VAH: ${fmtP(vah)} · VAL: ${fmtP(val_)}`);
+        const vpBar = document.getElementById("ameVpocBar");
+        if (vpBar) vpBar.style.width = vpPos === "AT_VPOC" ? "90%" : vpPos === "INSIDE_VA" ? "55%" : "30%";
+
+        // ── 7. Funding + OI (v2.1) ──
+        const fund = a.funding_oi || {};
+        const fundSent = fund.sentiment || "NEUTRAL";
+        const fundRate = fund.funding_rate || 0;
+        const fundOi = fund.oi_direction || "—";
+        const sqRisk = fund.squeeze_risk || false;
+        const fundColors = { BULLISH: "#2ecc71", BEARISH: "#e74c3c", NEUTRAL: "#888", EXTREME_LONG: "#e74c3c", EXTREME_SHORT: "#2ecc71" };
+        const fundLabels = { BULLISH: "▲ Bullish", BEARISH: "▼ Bearish", NEUTRAL: "◆ Nötr", EXTREME_LONG: "🔴 Aşırı Long", EXTREME_SHORT: "🟢 Aşırı Short" };
+        setText("ameFundSent", fundLabels[fundSent] || fundSent);
+        const fundValEl = document.getElementById("ameFundSent");
+        if (fundValEl) fundValEl.style.color = fundColors[fundSent] || "#888";
+        setText("ameFundDetail", `FR: ${(fundRate * 100).toFixed(4)}% · OI: ${fundOi} · Squeeze: ${sqRisk ? "⚠ Evet" : "Hayır"}`);
+        const fundBar = document.getElementById("ameFundBar");
+        if (fundBar) fundBar.style.width = Math.min(100, Math.abs(fundRate) * 10000) + "%";
+
+        // ── 8. Wyckoff Faz (v2.1) ──
+        const wyck = a.wyckoff || {};
+        const wyckPhase = wyck.phase || "NONE";
+        const wyckSignal = wyck.signal || "NONE";
+        const wyckStr = wyck.strength || 0;
+        const wyckColors = { ACCUMULATION: "#2ecc71", DISTRIBUTION: "#e74c3c", MARKUP: "#27ae60", MARKDOWN: "#c0392b", NONE: "#888" };
+        const wyckLabels = { ACCUMULATION: "📦 Birikim", DISTRIBUTION: "📤 Dağıtım", MARKUP: "🚀 Markup", MARKDOWN: "📉 Markdown", NONE: "◆ Belirsiz" };
+        setText("ameWyckPhase", wyckLabels[wyckPhase] || wyckPhase);
+        const wyckValEl = document.getElementById("ameWyckPhase");
+        if (wyckValEl) wyckValEl.style.color = wyckColors[wyckPhase] || "#888";
+        const wyckSigLabel = wyckSignal === "SPRING" ? "🔺 Spring" : wyckSignal === "UPTHRUST" ? "🔻 Upthrust" : "—";
+        setText("ameWyckDetail", `Sinyal: ${wyckSigLabel} · Güç: ${(wyckStr * 100).toFixed(0)}%`);
+        const wyckBar = document.getElementById("ameWyckBar");
+        if (wyckBar) wyckBar.style.width = Math.min(100, wyckStr * 100) + "%";
+
+        // ── Overall score ──
+        setText("ameScoreVal", a.score ? a.score.toFixed(0) : "0");
+
+    } catch (e) {
+        console.error("AME analysis error:", e);
+    }
+}
+
+function renderAMEActiveTable(signals) {
+    const tbody = document.getElementById("ameActiveTable");
+    if (!tbody) return;
+
+    if (!signals || signals.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="10" class="ame-empty-state">
+            <div class="ame-empty-icon"><i class="fas fa-atom fa-spin-slow"></i></div>
+            <div class="ame-empty-title">Aktif sinyal yok</div>
+            <div class="ame-empty-desc">Motor çalışıyor — Multi-TF confluence bekleniyor</div>
+        </td></tr>`;
+        return;
+    }
+
+    tbody.innerHTML = signals.map(s => {
+        const dir = s.direction === "LONG"
+            ? '<span class="ame-dir long">▲ LONG</span>'
+            : '<span class="ame-dir short">▼ SHORT</span>';
+        const elapsed = s.created_at ? getElapsed(s.created_at) : "—";
+        const regCls = (s.regime || "").toLowerCase().replace("_", "-");
+        const tp1Hit = s.tp1_hit ? "✓" : "·";
+        const tp2Hit = s.tp2_hit ? "✓" : "·";
+        const tp1 = s.tp1 ? fmtPrice(s.tp1) : "—";
+        const tp2 = s.tp2 ? fmtPrice(s.tp2) : "—";
+        const tp3 = s.tp3 ? fmtPrice(s.tp3) : fmtPrice(s.take_profit);
+        const tpCell = `<span style="font-size:0.75rem">${tp1Hit}${tp1} / ${tp2Hit}${tp2} / ${tp3}</span>`;
+        const partialPnl = s.accumulated_pnl ? `<span style="color:var(--green);font-size:0.7rem">+${s.accumulated_pnl.toFixed(1)}%</span>` : "";
+        const remaining = s.remaining_size ? `<span style="color:var(--text-muted);font-size:0.7rem">${(s.remaining_size*100).toFixed(0)}%</span>` : "";
+        const statusCell = partialPnl || remaining ? `${partialPnl} ${remaining}` : "100%";
+        return `<tr>
+            <td><strong>${(s.symbol || "").replace("-USDT-SWAP","").replace("-USDT","")}</strong></td>
+            <td>${dir}</td>
+            <td class="mono">${fmtPrice(s.entry_price)}</td>
+            <td class="mono td-sl">${fmtPrice(s.effective_sl || s.stop_loss)}</td>
+            <td class="mono" style="font-size:0.78rem">${tpCell}</td>
+            <td><span class="ame-rr-badge">${s.rr_ratio ? s.rr_ratio.toFixed(1) + "R" : "—"}</span></td>
+            <td><span class="ame-score-badge">${s.score ? s.score.toFixed(0) : "—"}</span></td>
+            <td><span class="ame-regime-tag ${regCls}">${s.regime || "—"}</span></td>
+            <td>${statusCell}</td>
+            <td class="td-muted">${elapsed}</td>
+        </tr>`;
+    }).join("");
+}
+
+function renderAMEHistoryTable(signals) {
+    const tbody = document.getElementById("ameHistoryTable");
+    if (!tbody) return;
+
+    if (!signals || signals.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="9" class="ame-empty-state">
+            <div class="ame-empty-icon" style="opacity:0.3"><i class="fas fa-clock-rotate-left"></i></div>
+            <div class="ame-empty-desc">Henüz kapanmış AME işlemi yok</div>
+        </td></tr>`;
+        return;
+    }
+
+    tbody.innerHTML = signals.map(s => {
+        const dir = s.direction === "LONG"
+            ? '<span class="ame-dir long">▲ LONG</span>'
+            : '<span class="ame-dir short">▼ SHORT</span>';
+        const pnl = s.pnl_pct || 0;
+        const pnlStr = (pnl >= 0 ? "+" : "") + pnl.toFixed(2) + "%";
+        const pnlColor = pnl >= 0 ? "var(--green)" : "var(--red)";
+        const statusBadge = s.status === "WON"
+            ? '<span class="ame-result-badge won">WON</span>'
+            : s.status === "LOST"
+            ? '<span class="ame-result-badge lost">LOST</span>'
+            : `<span class="ame-result-badge">${s.status}</span>`;
+        const date = s.close_time ? new Date(s.close_time).toLocaleString("tr-TR", {day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}) : "—";
+        return `<tr>
+            <td><strong>${(s.symbol || "").replace("-USDT-SWAP","").replace("-USDT","")}</strong></td>
+            <td>${dir}</td>
+            <td class="mono">${fmtPrice(s.entry_price)}</td>
+            <td class="mono">${fmtPrice(s.close_price)}</td>
+            <td style="color:${pnlColor};font-weight:700;font-family:var(--mono)">${pnlStr}</td>
+            <td>${statusBadge}</td>
+            <td>${s.score ? s.score.toFixed(0) : "—"}</td>
+            <td>${s.mode || "—"}</td>
+            <td class="td-date">${date}</td>
+        </tr>`;
+    }).join("");
+}
+
+function getElapsed(isoStr) {
+    try {
+        const diff = Date.now() - new Date(isoStr).getTime();
+        const mins = Math.floor(diff / 60000);
+        if (mins < 1) return "<1dk";
+        if (mins < 60) return mins + "dk";
+        const hours = Math.floor(mins / 60);
+        return hours + "sa " + (mins % 60) + "dk";
+    } catch { return "—"; }
+}
+
+function fmtPrice(p) {
+    if (!p) return "—";
+    if (p >= 100) return p.toFixed(2);
+    if (p >= 1) return p.toFixed(4);
+    return p.toFixed(6);
+}
+
+function setText(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+}
+
+async function ameChangeMode(mode) {
+    try {
+        const res = await fetch("/api/ame/mode", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ mode })
+        });
+        if (res.ok) {
+            showToast(`AME modu değiştirildi: ${mode}`, "info");
+            loadAME();
+        }
+    } catch (e) {
+        console.error("AME mode change error:", e);
+    }
+}
+
+async function ameManualScan() {
+    const btn = document.getElementById("ameScanBtn");
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Tarıyor...'; }
+    const dot = document.getElementById("ameScanDot");
+    if (dot) dot.classList.add("scanning");
+    setText("ameScanText", "Tarama devam ediyor...");
+    try {
+        await fetch("/api/ame/scan", { method: "POST" });
+        showToast("AME tarama başlatıldı", "info");
+        // Poll for completion
+        let checks = 0;
+        const pollId = setInterval(async () => {
+            checks++;
+            if (checks > 30) { clearInterval(pollId); }
+            try {
+                const st = await apiFetch("/api/ame/status");
+                if (st && st.last_scan && !st.last_scan.scanning) {
+                    clearInterval(pollId);
+                    loadAME();
+                    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-satellite-dish"></i> Tara'; }
+                }
+            } catch {}
+        }, 2000);
+    } catch (e) {
+        console.error("AME manual scan error:", e);
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-satellite-dish"></i> Tara'; }
+    }
+}
+
+// AME WebSocket events
+if (typeof socket !== "undefined") {
+    socket.on("ame_new_signal", (data) => {
+        showToast(`AME Sinyal: ${data?.symbol || "?"} ${data?.direction || ""}`, "success");
+        if (isActiveTab("ame")) loadAME();
+    });
+    socket.on("ame_trade_closed", (data) => {
+        const won = data?.status === "WON";
+        showToast(`AME ${data?.symbol || ""} ${won ? "KAZANDI" : "KAYBETTİ"} | PnL: ${data?.pnl_pct || 0}%`, won ? "success" : "error");
+        if (isActiveTab("ame")) loadAME();
+    });
+    socket.on("ame_scan_complete", (data) => {
+        if (isActiveTab("ame")) loadAME();
+        const n = data?.new_signals || 0;
+        if (n > 0) showToast(`AME tarama: ${n} yeni sinyal!`, "success");
+    });
+}
+
+function isActiveTab(name) {
+    const el = document.getElementById("tab-" + name);
+    return el && el.classList.contains("active");
+}

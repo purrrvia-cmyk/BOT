@@ -51,8 +51,8 @@ ICT_PARAMS = {
     "liquidity_min_touches": 2,          # Minimum dokunma sayısı
     
     # Sinyal Üretimi
-    "min_confluence_score": 55,     # Minimum confluent skor (0-100) — 50→55: daha seçici
-    "min_confidence": 55,           # Minimum güven skoru (0-100) — 62→55: daha fazla sinyal alınması
+    "min_confluence_score": 60,     # Minimum confluent skor (0-100) — 55→60: daha seçici sinyal filtreleme
+    "min_confidence": 60,           # Minimum güven skoru (0-100) — 55→60: kalitesiz sinyalleri ele
     
     # Risk Yönetimi
     "default_sl_pct": 0.012,       # Varsayılan stop loss (%1.2) — yapısal SL öncelikli, bu sadece fallback
@@ -73,39 +73,47 @@ ICT_PARAMS = {
 }
 
 # Limit Emir Ayarları
-LIMIT_ORDER_EXPIRY_HOURS = 2  # Limit emir geçerlilik süresi (saat)
-                              # FVG'ye limit emir koyulduğunda max bekleme zamanı
-MAX_TRADE_DURATION_HOURS = 8  # Aktif işlem max yaşam süresi (saat)
-                              # 15m TF sinyal geçerliliği: uzun süren işlemler kaybetme eğiliminde
+LIMIT_ORDER_EXPIRY_HOURS = 0.75  # Limit emir geçerlilik süresi (saat) — 2h→45dk: kripto hızlı döner
+                                 # FVG'ye limit emir koyulduğunda max bekleme zamanı
+MAX_TRADE_DURATION_HOURS = 4     # Aktif işlem max yaşam süresi (saat) — 8h→4h: 15m TF için yeterli
+                                 # 15m TF sinyal geçerliliği: uzun süren işlemler kaybetme eğiliminde
 
-# Optimizer Parametreleri
+# Optimizer Parametreleri (v3.0 — SMC Threshold Optimizer)
 OPTIMIZER_CONFIG = {
-    "min_trades_for_optimization": 15,   # Optimizasyon için minimum işlem — 5→15: istatistiksel anlamlılık
-    "optimization_interval_minutes": 30, # Optimizasyon aralığı — 15→30: daha stabil
-    "learning_rate": 0.03,              # Öğrenme hızı — 0.05→0.03: daha muhafazakar
-    "max_param_change_pct": 0.10,       # Tek seferde max parametre değişimi — %15→%10
-    "win_rate_target": 0.55,            # Hedef kazanma oranı — %60→%55: daha gerçekçi
+    "min_trades_for_optimization": 20,   # Optimizasyon için minimum işlem — 15→20: daha güvenilir istatistik
+    "optimization_interval_minutes": 30, # Optimizasyon aralığı (dakika)
+    "learning_rate": 0.03,              # Öğrenme hızı — küçük adımlarla yakınsama
+    "max_param_change_pct": 0.10,       # Tek seferde max parametre değişimi (%10)
+    "win_rate_target": 0.55,            # Hedef kazanma oranı (%55)
 }
 
-# Optimizer Parametre Sınırları (death spiral koruması — sıkılaştırıldı)
+# Optimizer Parametre Sınırları (v3.0 — SMC Threshold Optimizer)
+# Her parametre için [min, max] güvenli aralık.
+# Death spiral koruması: optimizer asla bu sınırların dışına çıkamaz.
+# NOT: min_confidence ve min_confluence_score artık v3.0'da optimize EDİLMEZ
+#      (Boolean gate sistemi — tüm sinyaller 100/100 ile gelir).
 OPTIMIZER_PARAM_BOUNDS = {
-    "swing_lookback": (3, 7),
-    "fvg_min_size_pct": (0.0005, 0.003),
-    "displacement_min_body_ratio": (0.4, 0.60),
-    "liquidity_equal_tolerance": (0.0005, 0.002),
-    "ob_body_ratio_min": (0.3, 0.55),
-    "min_confidence": (48, 68),        # Tavan: 72→68 (sinyal üretimi durmasın)
-    "min_confluence_score": (40, 62),   # Tavan: 65→62
-    "default_sl_pct": (0.008, 0.020),   # Tavan: 0.025→0.020 (max %2)
-    "default_tp_ratio": (1.8, 3.0),     # Taban: 1.5→1.8 (min 1.8 RR)
-    "displacement_min_size_pct": (0.001, 0.004),
-    "displacement_atr_multiplier": (1.0, 1.8),
-    "ob_max_age_candles": (15, 40),
+    # Gate 4: Displacement
+    "displacement_min_body_ratio": (0.40, 0.75),
+    "displacement_min_size_pct": (0.001, 0.005),
+    "displacement_atr_multiplier": (0.80, 2.00),
+    # Gate 5: FVG
+    "fvg_min_size_pct": (0.0003, 0.004),
+    "fvg_max_age_candles": (10, 40),
+    # Gate 3: Liquidity
+    "liquidity_equal_tolerance": (0.0003, 0.003),
+    # Yapısal: OB & Swing
+    "ob_body_ratio_min": (0.25, 0.65),
+    "ob_max_age_candles": (15, 50),
+    "swing_lookback": (3, 8),
+    # Risk: SL & TP
+    "default_sl_pct": (0.006, 0.025),
+    "default_tp_ratio": (1.50, 4.00),
 }
 
 # Tarama Aralıkları
 SCAN_INTERVAL_SECONDS = 180  # Tarama aralığı (100 coin × 4 TF ≈ 165s, 180s güvenli)
-TRADE_CHECK_INTERVAL = 10   # Açık işlem kontrolü (saniye) — 30→10: slippage azaltma
+TRADE_CHECK_INTERVAL = 5    # Açık işlem kontrolü (saniye) — 10→5: daha hızlı SL/TP tepkisi
 
 # QPA Tarama (ICT ile eşzamanlı ama bağımsız)
 QPA_SCAN_ENABLED = True     # QPA stratejisi aktif mi?

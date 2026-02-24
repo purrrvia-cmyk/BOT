@@ -325,6 +325,34 @@ def init_db():
         )
     """)
 
+    # =================== AME TABLOLARI ===================
+
+    # AME Sinyalleri (ICT ve QPA'dan tamamen bağımsız)
+    _execute(f"""
+        CREATE TABLE IF NOT EXISTS ame_signals (
+            id {_AUTO_ID},
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry_price {_FLOAT} NOT NULL,
+            stop_loss {_FLOAT} NOT NULL,
+            take_profit {_FLOAT} NOT NULL,
+            score {_FLOAT} NOT NULL,
+            rr_ratio {_FLOAT},
+            regime TEXT,
+            mode TEXT DEFAULT 'balanced',
+            impulse_score {_FLOAT},
+            velocity {_FLOAT},
+            status TEXT DEFAULT 'ACTIVE',
+            entry_time TEXT,
+            close_time TEXT,
+            close_price {_FLOAT},
+            pnl_pct {_FLOAT},
+            notes TEXT,
+            created_at {_TS_DEFAULT},
+            updated_at {_TS_DEFAULT}
+        )
+    """)
+
 
 def _migrate_columns():
     """Eski tablolara eksik sütunları ekle"""
@@ -827,6 +855,97 @@ def get_loss_analysis(limit=30):
             )
 
     return analysis
+
+
+# =================== AME SİNYAL İŞLEMLERİ ===================
+
+def add_ame_signal(symbol, direction, entry_price, stop_loss, take_profit,
+                   score, rr_ratio=None, regime="", mode="balanced",
+                   impulse_score=0, velocity=0, notes=""):
+    """Yeni AME sinyal kaydet — ICT/QPA'dan tamamen bağımsız."""
+    now = datetime.now().isoformat()
+    return _execute_returning_id("""
+        INSERT INTO ame_signals (symbol, direction, entry_price, stop_loss, take_profit,
+                           score, rr_ratio, regime, mode, impulse_score, velocity,
+                           status, entry_time, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
+    """, (symbol, direction, entry_price, stop_loss, take_profit,
+          score, rr_ratio, regime, mode, impulse_score, velocity, now, notes))
+
+
+def update_ame_signal_status(signal_id, status, close_price=None, pnl_pct=None):
+    now = datetime.now().isoformat()
+    if close_price is not None:
+        _execute("""
+            UPDATE ame_signals SET status=?, close_price=?, pnl_pct=?, close_time=?, updated_at=?
+            WHERE id=?
+        """, (status, close_price, pnl_pct, now, now, signal_id))
+    else:
+        _execute("""
+            UPDATE ame_signals SET status=?, updated_at=? WHERE id=?
+        """, (status, now, signal_id))
+
+
+def get_ame_active_signals():
+    return _fetchall("""
+        SELECT * FROM ame_signals WHERE status = 'ACTIVE' ORDER BY created_at DESC
+    """)
+
+
+def get_ame_signal_history(limit=50):
+    return _fetchall("""
+        SELECT * FROM ame_signals WHERE status IN ('WON', 'LOST', 'CANCELLED')
+        ORDER BY close_time DESC, created_at DESC LIMIT ?
+    """, (limit,))
+
+
+def get_ame_all_signals(limit=100):
+    return _fetchall("""
+        SELECT * FROM ame_signals ORDER BY created_at DESC LIMIT ?
+    """, (limit,))
+
+
+def get_ame_active_trade_count():
+    row = _fetchone("SELECT COUNT(*) as cnt FROM ame_signals WHERE status = 'ACTIVE'")
+    return row["cnt"] if row else 0
+
+
+def get_ame_performance_summary():
+    """AME performans istatistikleri."""
+    stats = {}
+
+    row = _fetchone("SELECT COUNT(*) as cnt FROM ame_signals WHERE status IN ('WON','LOST')")
+    stats["total_trades"] = row["cnt"] if row else 0
+
+    row = _fetchone("SELECT COUNT(*) as cnt FROM ame_signals WHERE status='WON'")
+    stats["winning_trades"] = row["cnt"] if row else 0
+
+    row = _fetchone("SELECT COUNT(*) as cnt FROM ame_signals WHERE status='LOST'")
+    stats["losing_trades"] = row["cnt"] if row else 0
+
+    if stats["total_trades"] > 0:
+        stats["win_rate"] = round(stats["winning_trades"] / stats["total_trades"] * 100, 1)
+    else:
+        stats["win_rate"] = 0
+
+    row = _fetchone("SELECT COALESCE(SUM(pnl_pct), 0) as total FROM ame_signals WHERE status IN ('WON','LOST')")
+    stats["total_pnl"] = round(row["total"], 2) if row else 0
+
+    row = _fetchone("SELECT COUNT(*) as cnt FROM ame_signals WHERE status='ACTIVE'")
+    stats["active_trades"] = row["cnt"] if row else 0
+
+    # Ortalama RR
+    row = _fetchone("SELECT AVG(ABS(pnl_pct)) as avg_pnl FROM ame_signals WHERE status='WON'")
+    avg_win = row["avg_pnl"] if row and row["avg_pnl"] else 0
+    row = _fetchone("SELECT AVG(ABS(pnl_pct)) as avg_pnl FROM ame_signals WHERE status='LOST'")
+    avg_loss = row["avg_pnl"] if row and row["avg_pnl"] else 1
+    stats["avg_rr"] = round(avg_win / avg_loss, 2) if avg_loss > 0 else 0
+
+    # Ortalama skor
+    row = _fetchone("SELECT AVG(score) as avg_score FROM ame_signals WHERE status IN ('WON','LOST')")
+    stats["avg_score"] = round(row["avg_score"], 1) if row and row["avg_score"] else 0
+
+    return stats
 
 
 # =================== QPA SİNYAL İŞLEMLERİ ===================

@@ -2866,3 +2866,343 @@ button:focus:not(:focus-visible) { outline: none; }
     .ict-chart-legend { display: none; }
     .ict-footer-sep { display: none; }
 }
+
+/* =====================================================
+   § AME — Adaptive Microstructure Engine Styles
+   ===================================================== */
+
+/* ── Hero Header ── */
+.ame-hero {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 22px;
+    margin-bottom: 14px;
+    border-radius: var(--radius-lg);
+    background: linear-gradient(135deg, rgba(99,102,241,0.12) 0%, rgba(168,85,247,0.08) 50%, rgba(6,182,212,0.06) 100%);
+    border: 1px solid rgba(99,102,241,0.15);
+    backdrop-filter: blur(12px);
+    position: relative;
+    overflow: hidden;
+}
+.ame-hero::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, var(--blue), var(--purple), var(--cyan));
+}
+.ame-hero-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+.ame-hero-icon {
+    width: 44px; height: 44px;
+    border-radius: 14px;
+    background: linear-gradient(135deg, var(--blue), var(--purple));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; color: #fff;
+    box-shadow: 0 4px 20px rgba(99,102,241,0.3);
+    flex-shrink: 0;
+}
+.ame-hero-title {
+    font-size: 16px;
+    font-weight: 800;
+    color: var(--text-bright);
+    letter-spacing: -0.3px;
+}
+.ame-hero-sub {
+    font-size: 11px;
+    color: var(--text-secondary);
+    display: block;
+    margin-top: 2px;
+}
+.ame-hero-actions {
+    display: flex; gap: 8px; align-items: center;
+}
+.ame-mode-select {
+    padding: 7px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border-light);
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all .2s;
+}
+.ame-mode-select:hover { border-color: var(--blue); }
+.ame-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 14px;
+    border: 1px solid var(--border-light);
+    border-radius: 10px;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 12px; font-weight: 600;
+    cursor: pointer;
+    transition: all .2s;
+}
+.ame-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+.ame-btn:disabled { opacity: .5; cursor: not-allowed; }
+.ame-btn-scan i { font-size: 13px; }
+
+/* ── Scan Status Bar ── */
+.ame-scan-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    margin-bottom: 14px;
+    border-radius: var(--radius-md);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.ame-scan-left {
+    display: flex; align-items: center; gap: 8px;
+}
+.ame-scan-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    flex-shrink: 0;
+    transition: all .3s;
+}
+.ame-scan-dot.scanning {
+    background: var(--cyan);
+    box-shadow: 0 0 8px var(--cyan), 0 0 20px rgba(6,182,212,0.3);
+    animation: amePulse 1.2s ease-in-out infinite;
+}
+@keyframes amePulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: .6; transform: scale(1.3); }
+}
+.ame-scan-right {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* ── 4 Engine Component Cards ── */
+.ame-engines {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-bottom: 14px;
+}
+.ame-engine-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 14px 16px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: all .25s;
+    position: relative;
+    overflow: hidden;
+}
+.ame-engine-card:hover {
+    border-color: var(--border-light);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md);
+}
+.ame-engine-icon {
+    width: 32px; height: 32px;
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+}
+.ame-engine-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+.ame-engine-label {
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+.ame-engine-value {
+    font-size: 14px;
+    font-weight: 800;
+    color: var(--text-bright);
+    font-family: var(--mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.ame-engine-detail {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: var(--mono);
+}
+.ame-engine-bar {
+    width: 100%;
+    height: 3px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.ame-engine-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width .6s ease;
+}
+
+/* ── Stats Row ── */
+.ame-stats {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 8px;
+    margin-bottom: 16px;
+}
+.ame-stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    transition: all .2s;
+}
+.ame-stat-card:hover {
+    border-color: var(--border-light);
+    transform: translateY(-1px);
+}
+.ame-stat-icon {
+    width: 30px; height: 30px;
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px;
+    flex-shrink: 0;
+}
+.ame-stat-body {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+.ame-stat-label {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--text-muted);
+    font-weight: 600;
+    white-space: nowrap;
+}
+.ame-stat-value {
+    font-size: 16px;
+    font-weight: 800;
+    color: var(--text-bright);
+    font-family: var(--mono);
+    line-height: 1.2;
+    letter-spacing: -0.3px;
+}
+
+/* ── Table Badges ── */
+.ame-header-badge {
+    background: var(--blue-dim);
+    color: var(--blue);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-family: var(--mono);
+    margin-left: auto;
+}
+.ame-dir {
+    font-weight: 700;
+    font-size: 12px;
+}
+.ame-dir.long { color: var(--green); }
+.ame-dir.short { color: var(--red); }
+
+.ame-rr-badge {
+    background: var(--blue-dim);
+    color: var(--blue);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 6px;
+    font-family: var(--mono);
+}
+.ame-score-badge {
+    background: var(--purple-dim);
+    color: var(--purple);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 6px;
+    font-family: var(--mono);
+}
+.ame-regime-tag {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+.ame-regime-tag.expansion { background: var(--green-dim); color: var(--green); }
+.ame-regime-tag.compression { background: var(--yellow-dim); color: var(--yellow); }
+.ame-regime-tag.exhaustion { background: var(--red-dim); color: var(--red); }
+.ame-result-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: 6px;
+    text-transform: uppercase;
+}
+.ame-result-badge.won { background: var(--green); color: #fff; }
+.ame-result-badge.lost { background: var(--red); color: #fff; }
+
+.mono { font-family: var(--mono); }
+
+/* ── Empty State ── */
+.ame-empty-state {
+    text-align: center;
+    padding: 40px 20px !important;
+}
+.ame-empty-icon {
+    font-size: 2.5rem;
+    margin-bottom: 10px;
+    color: var(--blue);
+    opacity: 0.5;
+}
+.ame-empty-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+}
+.ame-empty-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+/* ── Slow spin for atom icon ── */
+.fa-spin-slow { animation: fa-spin 4s linear infinite; }
+@keyframes fa-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* ── AME Responsive ── */
+@media (max-width: 1200px) {
+    .ame-engines { grid-template-columns: repeat(2, 1fr); }
+    .ame-stats { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 768px) {
+    .ame-hero { flex-direction: column; align-items: flex-start; gap: 12px; }
+    .ame-hero-actions { width: 100%; }
+    .ame-engines { grid-template-columns: 1fr; }
+    .ame-stats { grid-template-columns: repeat(2, 1fr); }
+}

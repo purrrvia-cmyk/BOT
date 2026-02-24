@@ -1,25 +1,28 @@
 # =====================================================
-# ICT Trading Bot - Trade Yönetim Modülü v2.0
-# (Smart Money Concepts - Limit Emir Protokolü)
+# ICT Trading Bot — Trade Yönetim Modülü v3.0
+# (Pure SMC — Boolean Gate Protocol)
 # =====================================================
 #
-# DEĞİŞİKLİKLER (v2.0):
-#   1. LIMIT EMİR KONSEPTİ:
-#      Strateji motoru FVG entry bölgesinde sinyal üretir.
-#      Fiyat FVG'de değilse → WAITING (Limit emir bekliyor)
-#      Fiyat FVG'ye ulaştığında → ACTIVE (Emir gerçekleşti)
+# SIFIRDAN YAZILDI: Saf ICT / Smart Money Concepts
 #
-#   2. EMİR ZAMAN AŞIMI:
-#      Limit emirler LIMIT_ORDER_EXPIRY_HOURS saat içinde
-#      gerçekleşmezse otomatik iptal edilir.
+# DEĞİŞİKLİKLER (v3.0):
+#   1. PUANLAMA KAPISI KALDIRILDI:
+#      Strateji motoru 5 Boolean gate'in tamamını geçen
+#      sinyaller üretir. Trade manager sadece risk yönetimi yapar.
 #
-#   3. YAPISAL SEVIYELER:
-#      SL her zaman yapısal seviyede (% tabanlı yedek yok).
-#      TP her zaman karşı likidite hedefinde.
+#   2. TIER SİSTEMİ KALDIRILDI:
+#      Tüm sinyaller A+ tier (5/5 gate geçmiş). B-tier yok.
+#
+#   3. FONKSİYONLAR:
+#      process_signal → SIGNAL ise doğrudan aç, değilse None
+#      check_open_trades → WAITING limit + ACTIVE SL/TP takibi
+#      check_watchlist → Basitleştirilmiş (ICT gate'lerinden geçmemiş
+#                         sinyaller için — genelde boş kalır)
 #
 #   4. BREAKEVEN / TRAILING SL:
-#      TP'nin %50'sinde → SL entry'ye taşınır
-#      TP'nin %75'inde → SL kârın %50'sini korur
+#      %25 → SL entry altına taşı (erken koruma)
+#      %40 → SL entry'ye taşı (breakeven)
+#      %60 → SL kârın %50'sinde tut (trailing)
 # =====================================================
 
 import logging
@@ -46,23 +49,20 @@ logger = logging.getLogger("ICT-Bot.TradeManager")
 
 class TradeManager:
     """
-    Açık işlemlerin yönetimi ve takibi.
-    
+    Açık işlemlerin yönetimi — saf Boolean gate protocol.
+
     Akış:
-      process_signal → _add_to_watch (zorunlu 5m onay)
-      check_watchlist → _open_trade (onay gelirse)
-      _open_trade → WAITING (limit) veya ACTIVE (market)
+      process_signal → SIGNAL ise → _open_trade (doğrudan)
       check_open_trades → WAITING→ACTIVE + SL/TP takibi
+      check_watchlist → Basitleştirilmiş izleme
     """
 
     def __init__(self):
-        # Breakeven / Trailing SL takibi
-        # {signal_id: {"breakeven_moved": bool, "trailing_sl": float}}
         self._trade_state = {}
         self._restore_trade_state()
 
     def _restore_trade_state(self):
-        """Restart sonrası ACTIVE sinyallerin breakeven/trailing SL durumunu DB'den geri yükle."""
+        """Restart sonrası ACTIVE sinyallerin breakeven/trailing durumunu geri yükle."""
         try:
             active = get_active_signals()
             for sig in active:
@@ -71,7 +71,6 @@ class TradeManager:
                 sl = sig.get("stop_loss", 0)
                 direction = sig.get("direction", "LONG")
                 if entry and sl:
-                    # SL entry'den daha iyi bir yere taşınmışsa breakeven yapılmış demektir
                     be_moved = False
                     if direction == "LONG" and sl >= entry:
                         be_moved = True
@@ -81,7 +80,7 @@ class TradeManager:
                         self._trade_state[sid] = {
                             "breakeven_moved": True,
                             "trailing_sl": sl,
-                            "breakeven_sl": sl,  # ★ FIX: BE SL değerini de sakla
+                            "breakeven_sl": sl,
                             "early_protect_sl": None,
                         }
                         logger.info(f"♻️ {sig.get('symbol','?')} trade state restored: BE=True, SL={sl}")
@@ -91,109 +90,81 @@ class TradeManager:
             logger.error(f"Trade state geri yükleme hatası: {e}")
 
     def _param(self, name):
-        """Optimizer ile güncellenen parametreleri DB'den oku, yoksa config varsayılanı kullan."""
+        """Parametre oku: DB varsa DB, yoksa config varsayılanı."""
         return get_bot_param(name, ICT_PARAMS.get(name))
+
+    # =================================================================
+    #  SİNYAL İŞLEME — Puanlama Kapısı YOK
+    # =================================================================
 
     def process_signal(self, signal_result):
         """
-        Strateji motorundan gelen sonucu işle.
-        
-        A+ / A tier SIGNAL → doğrudan işlem aç (sweep + displacement geçmiş)
-        B tier SIGNAL ve WATCH → izleme listesine al, 5m onay bekle
+        Strateji motorundan gelen sinyal sonucunu işle.
+
+        ★ 5 Boolean gate'in tamamı strateji motorunda geçmiş.
+        ★ Burada ek puanlama / güven kontrolü YOK.
+        ★ SIGNAL → doğrudan işlem aç.
         """
         if signal_result is None:
             return None
 
         action = signal_result.get("action")
-        quality_tier = signal_result.get("quality_tier", "?")
 
-        if action == "SIGNAL" and quality_tier in ("A+", "A"):
-            # A-tier sinyal: Tüm gate'ler geçmiş, doğrudan işlem aç
-            logger.info(f"🎯 {signal_result['symbol']} Tier-{quality_tier} SIGNAL → doğrudan işlem")
+        if action == "SIGNAL":
+            logger.info(f"🎯 {signal_result['symbol']} → Tüm 5 gate geçti, işlem açılıyor")
             return self._open_trade(signal_result)
-        elif action in ["SIGNAL", "WATCH"]:
-            if action == "SIGNAL":
-                signal_result = dict(signal_result)
-                signal_result["watch_reason"] = f"Tier-{quality_tier} onay bekleniyor, 5m doğrulama"
-            return self._add_to_watch(signal_result)
 
         return None
+
+    # =================================================================
+    #  İŞLEM AÇMA — Sadece Risk Yönetimi Kontrolleri
+    # =================================================================
 
     def _open_trade(self, signal):
         """
         Yeni işlem aç.
-        
-        entry_mode:
-          "MARKET" → Fiyat şu an FVG bölgesinde → hemen ACTIVE
-          "LIMIT"  → Fiyat FVG bölgesinin dışında → WAITING (limit emir bekliyor)
-          "PENDING"→ Potansiyel sinyal → MARKET gibi işle
+
+        ★ Puanlama kapısı YOK (strateji motoru 5 gate'i zaten geçirdi).
+        ★ Tier kapısı YOK (tüm sinyaller A+ = 5/5 gate).
+        ★ Sadece risk yönetimi kontrolleri:
+            - Max eşzamanlı işlem limiti
+            - Aynı coinde aktif işlem kontrolü
+            - Aynı yönde max işlem kontrolü
+            - Cooldown (son kapanan işlemden bekleme)
         """
-        # ══ KALİTE KAPISI: Yapısal olmayan sinyalleri reddet ══
-        # "Potansiyel" entry/SL = _build_signal_dict'ten gelen, ICT gate'leri
-        # geçmemiş, sabit % SL'li zayıf sinyaller → bunlar trade olmamalı
-        entry_type = signal.get("entry_type", "")
-        sl_type = signal.get("sl_type", "")
-        quality_tier = signal.get("quality_tier", "?")
-        if "Potansiyel" in entry_type or "Tahmini" in sl_type:
-            logger.info(
-                f"⛔ {signal['symbol']} reddedildi: Yapısal entry/SL yok "
-                f"(entry_type={entry_type}, sl_type={sl_type}) → ICT gate'leri geçmemiş"
-            )
-            return {"status": "REJECTED", "reason": "Yapısal entry/SL yok — potansiyel sinyal"}
+        symbol = signal["symbol"]
+        direction = signal.get("direction", "LONG")
 
-        # ══ MİNİMUM SKOR KAPISI ══
-        min_confluence = int(self._param("min_confluence_score"))
-        min_confidence = int(self._param("min_confidence"))
-        score = signal.get("confluence_score", 0)
-        conf = signal.get("confidence", 0)
-        if score < min_confluence * 0.5 or conf < min_confidence * 0.5:
-            logger.info(
-                f"⛔ {signal['symbol']} reddedildi: Skor çok düşük "
-                f"(score={score} < {min_confluence * 0.5}, conf={conf}% < {min_confidence * 0.5}%)"
-            )
-            return {"status": "REJECTED", "reason": f"Skor yetersiz: {score}/{min_confluence}"}
-
-        # ══ TİER KAPISI: Bilinmeyen tier trade açamaz ══
-        if quality_tier not in ("A+", "A"):
-            logger.info(
-                f"⛔ {signal['symbol']} reddedildi: Tier={quality_tier} "
-                f"(sadece A+ ve A tier trade açabilir)"
-            )
-            return {"status": "REJECTED", "reason": f"Tier {quality_tier} trade açamaz"}
-
-        # Max eşzamanlı işlem kontrolü
+        # ══ MAX EŞZAMANLI İŞLEM ══
         max_concurrent = int(self._param("max_concurrent_trades"))
         active_count = get_active_trade_count()
         if active_count >= max_concurrent:
-            logger.warning(f"⛔ Max eşzamanlı işlem limitine ulaşıldı ({max_concurrent})")
+            logger.warning(f"⛔ {symbol} reddedildi: Max eşzamanlı işlem limiti ({max_concurrent})")
             return {"status": "REJECTED", "reason": "Maksimum işlem limiti"}
 
-        # Aynı coinde aktif işlem var mı?
+        # ══ AYNI COİNDE AKTİF İŞLEM ══
         active_signals = get_active_signals()
         for s in active_signals:
-            if s["symbol"] == signal["symbol"] and s["status"] in ("ACTIVE", "WAITING"):
-                logger.info(f"⏭️ {signal['symbol']} için zaten aktif/bekleyen işlem var, atlanıyor.")
+            if s["symbol"] == symbol and s["status"] in ("ACTIVE", "WAITING"):
+                logger.info(f"⏭️ {symbol} için zaten aktif/bekleyen işlem var, atlanıyor")
                 return {"status": "REJECTED", "reason": "Aktif/bekleyen işlem mevcut"}
 
-        # Aynı yönde max işlem kontrolü (4/4 LONG kaybetme riski azaltma)
+        # ══ AYNI YÖNDE MAX İŞLEM ══
         max_same_dir = int(self._param("max_same_direction_trades") or 2)
-        direction = signal.get("direction", "LONG")
         same_dir_count = sum(
             1 for s in active_signals
             if s.get("direction") == direction and s["status"] in ("ACTIVE", "WAITING")
         )
         if same_dir_count >= max_same_dir:
-            logger.warning(f"⛔ Aynı yönde ({direction}) max {max_same_dir} işlem limiti → reddedildi")
+            logger.warning(f"⛔ {symbol} reddedildi: Aynı yönde ({direction}) max {max_same_dir} işlem limiti")
             return {"status": "REJECTED", "reason": f"Max {direction} işlem limiti ({max_same_dir})"}
 
-        # Cooldown kontrolü: Sadece KAPANMIŞ işlemler (WON/LOST/CANCELLED) için
-        # Watchlist expire ve bekleyen sinyaller cooldown'a dahil DEĞİL
+        # ══ COOLDOWN KONTROLÜ ══
         recent_history = get_signal_history(30)
         cooldown_minutes = int(self._param("signal_cooldown_minutes"))
         now = datetime.now()
         for s in recent_history:
-            if s["symbol"] == signal["symbol"]:
-                # Sadece gerçekten kapanmış işlemler cooldown oluşturur
+            if s["symbol"] == symbol:
                 if s.get("status") not in ("WON", "LOST", "CANCELLED"):
                     continue
                 close_time = s.get("close_time") or s.get("created_at", "")
@@ -201,55 +172,39 @@ class TradeManager:
                     try:
                         close_dt = datetime.fromisoformat(close_time)
                         if (now - close_dt).total_seconds() < cooldown_minutes * 60:
-                            logger.info(f"⏳ {signal['symbol']} için {cooldown_minutes}dk cooldown aktif ({s['status']}).")
+                            logger.info(f"⏳ {symbol} için {cooldown_minutes}dk cooldown aktif")
                             return {"status": "REJECTED", "reason": f"{cooldown_minutes}dk cooldown"}
                     except Exception:
                         pass
 
-        # Entry modu belirleme
+        # ══ ENTRY MODU ══
         entry_mode = signal.get("entry_mode", "MARKET")
         if entry_mode == "PENDING":
             entry_mode = "MARKET"
 
-        # LIMIT ise status=WAITING, MARKET ise status=ACTIVE
         initial_status = "WAITING" if entry_mode == "LIMIT" else "ACTIVE"
 
-        # Giriş sebeplerini kaydet (optimizer öğrensin)
-        quality_tier = signal.get("quality_tier", "?")
-
-        # B-tier risk yönetimi: Pozisyon büyüklüğü tavsiyesi
-        position_note = ""
-        if quality_tier == "B":
-            position_note = " | ⚠️ B-TIER: %50 pozisyon önerilir (sweep yok)"
-        elif quality_tier == "A":
-            position_note = " | A-TIER: %75 pozisyon (MSS yok)"
-        # A+ = tam pozisyon (varsayılan)
-
+        # Giriş notları
         components = signal.get("components", [])
         entry_reasons = (
-            f"Tier: {quality_tier} | "
             f"Mode: {entry_mode} | "
             f"RR: {signal.get('rr_ratio', '?')} | "
-            f"Score: {signal.get('confluence_score', 0)} | "
-            f"Conf: {signal.get('confidence', 0)}% | "
             f"HTF: {signal.get('htf_bias', '?')} | "
             f"Session: {signal.get('session', '')} | "
             f"Entry: {signal.get('entry_type', '?')} | "
             f"SL: {signal.get('sl_type', '?')} | "
             f"TP: {signal.get('tp_type', '?')} | "
-            f"Bileşenler: {', '.join(components)} | "
-            f"Cezalar: {', '.join(signal.get('penalties', []))}"
-            f"{position_note}"
+            f"Gates: {', '.join(components)}"
         )
 
         signal_id = add_signal(
-            symbol=signal["symbol"],
-            direction=signal["direction"],
+            symbol=symbol,
+            direction=direction,
             entry_price=signal["entry"],
             stop_loss=signal["sl"],
             take_profit=signal["tp"],
-            confidence=signal.get("confidence", 0),
-            confluence_score=signal.get("confluence_score", 0),
+            confidence=signal.get("confidence", 100),
+            confluence_score=signal.get("confluence_score", 100),
             components=components,
             timeframe="15m",
             status=initial_status,
@@ -262,94 +217,38 @@ class TradeManager:
         if initial_status == "ACTIVE":
             activate_signal(signal_id)
             logger.info(
-                f"✅ İŞLEM AÇILDI (MARKET): #{signal_id} {signal['symbol']} {signal['direction']} | "
+                f"✅ İŞLEM AÇILDI (MARKET): #{signal_id} {symbol} {direction} | "
                 f"Entry: {signal['entry']} | SL: {signal['sl']} | TP: {signal['tp']} | "
                 f"RR: {signal.get('rr_ratio', '?')}"
             )
         else:
             logger.info(
-                f"⏳ LİMİT EMİR KURULDU: #{signal_id} {signal['symbol']} {signal['direction']} | "
+                f"⏳ LİMİT EMİR KURULDU: #{signal_id} {symbol} {direction} | "
                 f"FVG Entry: {signal['entry']} | SL: {signal['sl']} | TP: {signal['tp']} | "
-                f"RR: {signal.get('rr_ratio', '?')} | "
-                f"Beklenecek max: {LIMIT_ORDER_EXPIRY_HOURS} saat"
+                f"RR: {signal.get('rr_ratio', '?')} | Max bekle: {LIMIT_ORDER_EXPIRY_HOURS}h"
             )
 
         return {
             "status": "OPENED" if initial_status == "ACTIVE" else "LIMIT_PLACED",
             "signal_id": signal_id,
-            "symbol": signal["symbol"],
-            "direction": signal["direction"],
+            "symbol": symbol,
+            "direction": direction,
             "entry": signal["entry"],
             "sl": signal["sl"],
             "tp": signal["tp"],
-            "entry_mode": entry_mode
+            "entry_mode": entry_mode,
         }
 
-    def _add_to_watch(self, signal):
-        """İzleme listesine ekle (5m onay akışı)."""
-        # Minimum skor: min_confluence_score'un %40'ı (60 → 24, ama en az 30)
-        min_watch_score = max(30, int(self._param("min_confluence_score")) * 0.4)
-        score = signal.get("confluence_score", 0)
-        if score < min_watch_score:
-            logger.debug(f"⏭️ {signal['symbol']} skor çok düşük ({score} < {min_watch_score}), izlemeye alınmadı")
-            return None
-
-        # ===== DUPLICATE KORUMASI =====
-        # Aynı coinde aktif/bekleyen trade varsa izlemeye almayı engelle
-        active_signals = get_active_signals()
-        for s in active_signals:
-            if s["symbol"] == signal["symbol"] and s["status"] in ("ACTIVE", "WAITING"):
-                logger.debug(f"⏭️ {signal['symbol']} zaten aktif/bekleyen işlemde, izlemeye alınmadı")
-                return None
-
-        # Aynı coinde zaten izleme varsa (herhangi bir yönde) tekrar ekleme
-        # Hem aynı yön hem ters yön koruması: Aynı coin için çift sinyal engeli
-        watching_items = get_watching_items()
-        for w in watching_items:
-            if w["symbol"] == signal["symbol"]:
-                if w["direction"] == signal["direction"]:
-                    logger.debug(f"⏭️ {signal['symbol']} {signal['direction']} zaten izleme listesinde, atlanıyor")
-                else:
-                    logger.debug(f"⏭️ {signal['symbol']} ters yön ({w['direction']}) izlemede, {signal['direction']} atlanıyor")
-                return None
-
-        watch_candles = WATCH_CONFIRM_CANDLES
-        watch_id = add_to_watchlist(
-            symbol=signal["symbol"],
-            direction=signal["direction"],
-            potential_entry=signal["entry"],
-            potential_sl=signal["sl"],
-            potential_tp=signal["tp"],
-            watch_reason=signal.get("watch_reason", "Onay bekleniyor"),
-            initial_score=signal["confluence_score"],
-            components=signal["components"],
-            max_watch=watch_candles
-        )
-
-        if watch_id is None:
-            logger.debug(f"⏳ {signal['symbol']} son 15 dk içinde expire edildi, cooldown bekleniyor")
-            return None
-
-        logger.info(
-            f"👁️ İZLEMEYE ALINDI: {signal['symbol']} {signal['direction']} | "
-            f"Score: {signal['confluence_score']}% | Mode: {signal.get('entry_mode', '?')}"
-        )
-
-        return {
-            "status": "WATCHING",
-            "watch_id": watch_id,
-            "symbol": signal["symbol"],
-            "direction": signal["direction"]
-        }
+    # =================================================================
+    #  AÇIK İŞLEM TAKİBİ (WAITING → ACTIVE + SL/TP)
+    # =================================================================
 
     def check_open_trades(self):
         """
         Açık ve bekleyen işlemleri kontrol et.
 
-        İki aşamalı kontrol:
-        1. WAITING sinyaller → Fiyat FVG entry'ye ulaştı mı? → ACTIVE'e geç
-           (Zaman aşımı: LIMIT_ORDER_EXPIRY_HOURS saat)
-        2. ACTIVE sinyaller → SL/TP takibi + Breakeven/Trailing SL
+        1. WAITING → Fiyat FVG entry'ye ulaştı mı? → ACTIVE
+        2. ACTIVE → SL/TP takibi + Breakeven/Trailing SL
         """
         active_signals = get_active_signals()
         results = []
@@ -368,7 +267,6 @@ class TradeManager:
             signal_id = signal["id"]
             status = signal["status"]
 
-            # ===== WAITING (Limit Emir Bekliyor) =====
             if status == "WAITING":
                 result = self._check_waiting_signal(
                     signal, current_price, entry_price, stop_loss,
@@ -378,7 +276,6 @@ class TradeManager:
                     results.append(result)
                 continue
 
-            # ===== ACTIVE (İşlem Açık — SL/TP Takibi) =====
             if status == "ACTIVE":
                 result = self._check_active_signal(
                     signal, current_price, entry_price, stop_loss,
@@ -392,17 +289,13 @@ class TradeManager:
     def _check_waiting_signal(self, signal, current_price, entry_price,
                                stop_loss, direction, signal_id):
         """
-        WAITING (limit emir) sinyalini kontrol et.
-        
-        Fiyat FVG entry seviyesine geldi mi?
-        LONG: current_price <= entry_price (fiyat FVG'ye indi)
-        SHORT: current_price >= entry_price (fiyat FVG'ye çıktı)
-        
-        Zaman aşımı kontrolü de burada yapılır.
+        WAITING (limit emir) kontrol.
+
+        Fiyat FVG entry'ye geldi mi? Zaman aşımı? SL ihlali?
         """
         symbol = signal["symbol"]
 
-        # Zaman aşımı kontrolü
+        # ══ ZAMAN AŞIMI ══
         created_at = signal.get("created_at", "")
         if created_at:
             try:
@@ -410,96 +303,102 @@ class TradeManager:
                 elapsed_hours = (datetime.now() - created_dt).total_seconds() / 3600
                 if elapsed_hours > LIMIT_ORDER_EXPIRY_HOURS:
                     update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
-                    logger.info(
-                        f"⏰ LİMİT EMİR ZAMAN AŞIMI: #{signal_id} {symbol} | "
-                        f"{elapsed_hours:.1f} saat geçti (max {LIMIT_ORDER_EXPIRY_HOURS}h)"
-                    )
+                    logger.info(f"⏰ LİMİT EMİR ZAMAN AŞIMI: #{signal_id} {symbol} ({elapsed_hours:.1f}h)")
                     return {
                         "signal_id": signal_id, "symbol": symbol,
                         "direction": direction, "status": "CANCELLED",
-                        "reason": "Limit emir zaman aşımı"
+                        "reason": "Limit emir zaman aşımı",
                     }
             except Exception:
                 pass
 
-        # Fiyat SL'ye ulaştıysa → emir gerçekleşmeden iptal
+        # ══ SL İHLALİ (entry olmadan) ══
         if direction == "LONG" and current_price <= stop_loss:
             update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
-            logger.info(f"❌ LİMİT EMİR İPTAL: #{signal_id} {symbol} | Fiyat SL'ye ulaştı (entry'siz)")
+            logger.info(f"❌ LİMİT İPTAL: #{signal_id} {symbol} LONG | Fiyat SL'ye ulaştı")
             return {
                 "signal_id": signal_id, "symbol": symbol,
                 "direction": direction, "status": "CANCELLED",
-                "reason": "Fiyat SL seviyesine ulaştı (limit emir gerçekleşmeden)"
+                "reason": "SL ihlali (entry olmadan)",
             }
         elif direction == "SHORT" and current_price >= stop_loss:
             update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
-            logger.info(f"❌ LİMİT EMİR İPTAL: #{signal_id} {symbol} | Fiyat SL'ye ulaştı (entry'siz)")
+            logger.info(f"❌ LİMİT İPTAL: #{signal_id} {symbol} SHORT | Fiyat SL'ye ulaştı")
             return {
                 "signal_id": signal_id, "symbol": symbol,
                 "direction": direction, "status": "CANCELLED",
-                "reason": "Fiyat SL seviyesine ulaştı (limit emir gerçekleşmeden)"
+                "reason": "SL ihlali (entry olmadan)",
             }
 
-        # Fiyat FVG entry seviyesine ulaştı mı?
-        entry_buffer = entry_price * 0.001  # %0.1 buffer
+        # ══ ESKİMİŞ SİNYAL ══
+        take_profit = signal.get("take_profit", 0)
+        if take_profit and entry_price:
+            if direction == "LONG" and current_price > entry_price:
+                tp_distance = take_profit - entry_price
+                price_moved = current_price - entry_price
+                if tp_distance > 0 and price_moved / tp_distance > 0.40:
+                    update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
+                    move_pct = (price_moved / entry_price) * 100
+                    logger.info(f"⏭️ ESKİMİŞ SİNYAL: #{signal_id} {symbol} LONG (+{move_pct:.2f}%) → iptal")
+                    return {
+                        "signal_id": signal_id, "symbol": symbol,
+                        "direction": direction, "status": "CANCELLED",
+                        "reason": f"Fiyat TP yönüne gitmiş (+{move_pct:.2f}%)",
+                    }
+            elif direction == "SHORT" and current_price < entry_price:
+                tp_distance = entry_price - take_profit
+                price_moved = entry_price - current_price
+                if tp_distance > 0 and price_moved / tp_distance > 0.40:
+                    update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
+                    move_pct = (price_moved / entry_price) * 100
+                    logger.info(f"⏭️ ESKİMİŞ SİNYAL: #{signal_id} {symbol} SHORT (-{move_pct:.2f}%) → iptal")
+                    return {
+                        "signal_id": signal_id, "symbol": symbol,
+                        "direction": direction, "status": "CANCELLED",
+                        "reason": f"Fiyat TP yönüne gitmiş (-{move_pct:.2f}%)",
+                    }
 
-        if direction == "LONG":
-            # LONG: Fiyat FVG entry bölgesine veya altına indi
-            if current_price <= entry_price + entry_buffer:
-                activate_signal(signal_id)
-                logger.info(
-                    f"🎯 LİMİT EMİR GERÇEKLEŞTİ: #{signal_id} {symbol} LONG | "
-                    f"Hedef: {entry_price:.8f} | Gerçekleşen: {current_price:.8f}"
-                )
-                return {
-                    "signal_id": signal_id, "symbol": symbol,
-                    "direction": direction, "status": "ACTIVATED",
-                    "current_price": current_price
-                }
-        elif direction == "SHORT":
-            # SHORT: Fiyat FVG entry bölgesine veya üstüne çıktı
-            if current_price >= entry_price - entry_buffer:
-                activate_signal(signal_id)
-                logger.info(
-                    f"🎯 LİMİT EMİR GERÇEKLEŞTİ: #{signal_id} {symbol} SHORT | "
-                    f"Hedef: {entry_price:.8f} | Gerçekleşen: {current_price:.8f}"
-                )
-                return {
-                    "signal_id": signal_id, "symbol": symbol,
-                    "direction": direction, "status": "ACTIVATED",
-                    "current_price": current_price
-                }
+        # ══ FİYAT FVG ENTRY'YE ULAŞTI MI? ══
+        entry_buffer = entry_price * 0.002
 
-        return None  # Hâlâ bekliyor
+        if direction == "LONG" and current_price <= entry_price + entry_buffer:
+            activate_signal(signal_id)
+            logger.info(f"🎯 LİMİT GERÇEKLEŞTİ: #{signal_id} {symbol} LONG @ {current_price:.8f}")
+            return {
+                "signal_id": signal_id, "symbol": symbol,
+                "direction": direction, "status": "ACTIVATED",
+                "current_price": current_price,
+            }
+        elif direction == "SHORT" and current_price >= entry_price - entry_buffer:
+            activate_signal(signal_id)
+            logger.info(f"🎯 LİMİT GERÇEKLEŞTİ: #{signal_id} {symbol} SHORT @ {current_price:.8f}")
+            return {
+                "signal_id": signal_id, "symbol": symbol,
+                "direction": direction, "status": "ACTIVATED",
+                "current_price": current_price,
+            }
+
+        return None
 
     def _check_active_signal(self, signal, current_price, entry_price,
                               stop_loss, take_profit, direction, signal_id):
         """
-        ACTIVE sinyalin SL/TP takibini yap.
-        
-        Breakeven ve Trailing SL yönetimi:
-        - TP'nin %50'sine ulaştıysa → SL'yi entry'ye taşı (breakeven)
-        - TP'nin %75'ine ulaştıysa → SL'yi kârın %50'sinde tut (trailing)
-        
-        Ek korumalar:
-        - Max işlem süresi: MAX_TRADE_DURATION_HOURS saat sonra otomatik kapanış
-        - PnL cap: SL slippage durumunda PnL, max SL risk ile sınırlandırılır
+        ACTIVE sinyal SL/TP takibi + Breakeven/Trailing SL.
         """
         symbol = signal["symbol"]
         result = {
             "signal_id": signal_id, "symbol": symbol,
             "direction": direction, "current_price": current_price,
-            "entry_price": entry_price, "status": "ACTIVE"
+            "entry_price": entry_price, "status": "ACTIVE",
         }
 
-        # ===== MAX TRADE DURATION KONTROLÜ =====
+        # ══ MAX TRADE DURATION ══
         entry_time = signal.get("entry_time") or signal.get("created_at", "")
         if entry_time:
             try:
                 entry_dt = datetime.fromisoformat(entry_time)
                 trade_hours = (datetime.now() - entry_dt).total_seconds() / 3600
                 if trade_hours > MAX_TRADE_DURATION_HOURS:
-                    # Pozisyonu mevcut fiyattan kapat
                     if direction == "LONG":
                         pnl_pct = ((current_price - entry_price) / entry_price) * 100
                     else:
@@ -510,34 +409,34 @@ class TradeManager:
                     result["status"] = status
                     result["pnl_pct"] = round(pnl_pct, 2)
                     emoji = "🏆" if pnl_pct > 0 else "⏰"
-                    logger.info(
-                        f"{emoji} MAX SÜRE AŞIMI: #{signal_id} {symbol} {direction} | "
-                        f"{trade_hours:.1f}h > {MAX_TRADE_DURATION_HOURS}h | PnL: {pnl_pct:+.2f}%"
-                    )
+                    logger.info(f"{emoji} MAX SÜRE: #{signal_id} {symbol} | {trade_hours:.1f}h | PnL: {pnl_pct:+.2f}%")
                     return result
             except Exception:
                 pass
 
-        # Seviye doğrulama (ters SL/TP eski sinyalleri temizle)
-        # ★ FIX: Breakeven/trailing yapılmış trade'lerde SL >= entry normaldir
-        # Bu durumda ters seviye kontrolü atlanmalı
-        state = self._trade_state.get(signal_id, {"breakeven_moved": False, "trailing_sl": None})
+        # Trade state
+        state = self._trade_state.get(signal_id, {
+            "breakeven_moved": False,
+            "trailing_sl": None,
+            "breakeven_sl": None,
+            "early_protect_sl": None,
+        })
         is_be_trade = state.get("breakeven_moved", False)
 
+        # Seviye doğrulama (ters SL/TP kontrolü — BE trade'lerde atla)
         if direction == "LONG" and not is_be_trade and (stop_loss >= entry_price or take_profit <= entry_price):
-            logger.warning(f"⚠️ #{signal_id} {symbol} LONG ters seviyeler - iptal")
+            logger.warning(f"⚠️ #{signal_id} {symbol} LONG ters seviyeler — iptal")
             update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
             self._trade_state.pop(signal_id, None)
             result["status"] = "CANCELLED"
             return result
         elif direction == "SHORT" and not is_be_trade and (stop_loss <= entry_price or take_profit >= entry_price):
-            logger.warning(f"⚠️ #{signal_id} {symbol} SHORT ters seviyeler - iptal")
+            logger.warning(f"⚠️ #{signal_id} {symbol} SHORT ters seviyeler — iptal")
             update_signal_status(signal_id, "CANCELLED", close_price=current_price, pnl_pct=0)
             self._trade_state.pop(signal_id, None)
             result["status"] = "CANCELLED"
             return result
 
-        # Breakeven / Trailing SL hesaplama
         effective_sl = stop_loss
 
         if direction == "LONG":
@@ -545,7 +444,6 @@ class TradeManager:
                 signal_id, symbol, entry_price, current_price,
                 stop_loss, take_profit, state, effective_sl
             )
-            # TP kontrolü
             if current_price >= take_profit:
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100
                 update_signal_status(signal_id, "WON", close_price=current_price, pnl_pct=pnl_pct)
@@ -553,18 +451,12 @@ class TradeManager:
                 result["status"] = "WON"
                 result["pnl_pct"] = round(pnl_pct, 2)
                 logger.info(f"🏆 KAZANDIK: #{signal_id} {symbol} LONG | PnL: +{pnl_pct:.2f}%")
-            # SL kontrolü
             elif current_price <= effective_sl:
-                # PnL'yi hesapla — slippage durumunda max SL risk ile sınırla
                 raw_pnl = ((current_price - entry_price) / entry_price) * 100
                 max_sl_loss = ((effective_sl - entry_price) / entry_price) * 100
-                # Slippage koruması: PnL en fazla SL seviyesindeki kayıp + %0.5 buffer
                 if raw_pnl < 0 and raw_pnl < max_sl_loss - 0.5:
-                    pnl_pct = max_sl_loss - 0.5  # SL noktasındaki kayıp + slippage buffer
-                    logger.warning(
-                        f"⚠️ SLIPPAGE: #{signal_id} {symbol} LONG | Gerçek: {raw_pnl:.2f}% → Capped: {pnl_pct:.2f}% "
-                        f"(SL: {effective_sl:.8f}, Kapanış: {current_price:.8f})"
-                    )
+                    pnl_pct = max_sl_loss - 0.5
+                    logger.warning(f"⚠️ SLIPPAGE: #{signal_id} {symbol} | {raw_pnl:.2f}% → {pnl_pct:.2f}%")
                 else:
                     pnl_pct = raw_pnl
                 sl_type = self._get_sl_close_type(state)
@@ -576,9 +468,9 @@ class TradeManager:
                 emoji = "🏆" if pnl_pct > 0 else "❌"
                 logger.info(f"{emoji} {sl_type}: #{signal_id} {symbol} LONG | PnL: {pnl_pct:+.2f}%")
             else:
-                unrealized_pnl = ((current_price - entry_price) / entry_price) * 100
-                result["unrealized_pnl"] = round(unrealized_pnl, 2)
-                if state["breakeven_moved"] or state.get("trailing_sl"):
+                unrealized = ((current_price - entry_price) / entry_price) * 100
+                result["unrealized_pnl"] = round(unrealized, 2)
+                if state.get("breakeven_moved") or state.get("trailing_sl"):
                     result["effective_sl"] = round(effective_sl, 8)
 
         elif direction == "SHORT":
@@ -586,7 +478,6 @@ class TradeManager:
                 signal_id, symbol, entry_price, current_price,
                 stop_loss, take_profit, state, effective_sl
             )
-            # TP kontrolü
             if current_price <= take_profit:
                 pnl_pct = ((entry_price - current_price) / entry_price) * 100
                 update_signal_status(signal_id, "WON", close_price=current_price, pnl_pct=pnl_pct)
@@ -594,18 +485,12 @@ class TradeManager:
                 result["status"] = "WON"
                 result["pnl_pct"] = round(pnl_pct, 2)
                 logger.info(f"🏆 KAZANDIK: #{signal_id} {symbol} SHORT | PnL: +{pnl_pct:.2f}%")
-            # SL kontrolü
             elif current_price >= effective_sl:
-                # PnL'yi hesapla — slippage durumunda max SL risk ile sınırla
                 raw_pnl = ((entry_price - current_price) / entry_price) * 100
                 max_sl_loss = ((entry_price - effective_sl) / entry_price) * 100
-                # Slippage koruması: PnL en fazla SL seviyesindeki kayıp + %0.5 buffer
                 if raw_pnl < 0 and raw_pnl < max_sl_loss - 0.5:
                     pnl_pct = max_sl_loss - 0.5
-                    logger.warning(
-                        f"⚠️ SLIPPAGE: #{signal_id} {symbol} SHORT | Gerçek: {raw_pnl:.2f}% → Capped: {pnl_pct:.2f}% "
-                        f"(SL: {effective_sl:.8f}, Kapanış: {current_price:.8f})"
-                    )
+                    logger.warning(f"⚠️ SLIPPAGE: #{signal_id} {symbol} | {raw_pnl:.2f}% → {pnl_pct:.2f}%")
                 else:
                     pnl_pct = raw_pnl
                 sl_type = self._get_sl_close_type(state)
@@ -617,67 +502,58 @@ class TradeManager:
                 emoji = "🏆" if pnl_pct > 0 else "❌"
                 logger.info(f"{emoji} {sl_type}: #{signal_id} {symbol} SHORT | PnL: {pnl_pct:+.2f}%")
             else:
-                unrealized_pnl = ((entry_price - current_price) / entry_price) * 100
-                result["unrealized_pnl"] = round(unrealized_pnl, 2)
-                if state["breakeven_moved"] or state.get("trailing_sl"):
+                unrealized = ((entry_price - current_price) / entry_price) * 100
+                result["unrealized_pnl"] = round(unrealized, 2)
+                if state.get("breakeven_moved") or state.get("trailing_sl"):
                     result["effective_sl"] = round(effective_sl, 8)
 
-        # State kaydet (bellekte)
+        # State kaydet
         self._trade_state[signal_id] = state
 
-        # Breakeven/Trailing SL DB'ye de yaz (restart koruması)
-        if state["breakeven_moved"] or state.get("trailing_sl"):
+        # DB'ye yaz (restart koruması)
+        if state.get("breakeven_moved") or state.get("trailing_sl"):
             update_signal_sl(signal_id, effective_sl)
 
         return result
 
+    # =================================================================
+    #  BREAKEVEN / TRAILING SL
+    # =================================================================
+
     def _manage_long_sl(self, signal_id, symbol, entry_price, current_price,
                          stop_loss, take_profit, state, effective_sl):
-        """LONG pozisyon için Progresif Breakeven ve Trailing SL yönetimi.
-        
-        3 seviyeli koruma:
-          %25 → Erken koruma: SL'yi entry'nin hemen altına taşı (zarar azaltma)
-          %40 → Breakeven: SL'yi entry+buffer'a taşı (kayıpsız garanti)
-          %60 → Trailing: SL'yi kârın %50'sinde tut (kâr kilit)
-        
-        FIX: Breakeven SL değeri state'te saklanır.
-        Fiyat geri çekildiğinde BE koruması KAYBOLMAZ.
-        """
+        """LONG: Progresif Breakeven + Trailing SL."""
         total_distance = take_profit - entry_price
         current_progress = current_price - entry_price
 
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %60 → Trailing SL (kârın %50'sini koru)
             if progress_pct >= 0.60:
                 trailing = entry_price + (current_progress * 0.50)
-                if state["trailing_sl"] is None or trailing > state["trailing_sl"]:
+                if state.get("trailing_sl") is None or trailing > state["trailing_sl"]:
                     state["trailing_sl"] = trailing
                     effective_sl = max(effective_sl, trailing)
                     if not state.get("trailing_logged"):
-                        logger.info(f"📈 #{signal_id} {symbol} TRAILING SL: {trailing:.6f} (progress: {progress_pct:.0%})")
+                        logger.info(f"📈 #{signal_id} {symbol} TRAILING: {trailing:.6f} ({progress_pct:.0%})")
                         state["trailing_logged"] = True
 
-            # %40 → Breakeven (SL'yi entry+buffer'a taşı)
-            elif progress_pct >= 0.40 and not state["breakeven_moved"]:
+            elif progress_pct >= 0.40 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
                 be_sl = entry_price * 1.001
-                state["breakeven_sl"] = be_sl  # ★ BE fiyatını state'e kaydet
+                state["breakeven_sl"] = be_sl
                 effective_sl = be_sl
-                logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
+                logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f} ({progress_pct:.0%})")
 
-            # %25 → Erken koruma (SL'yi entry'nin hemen altına taşı — zarar minimize)
             elif progress_pct >= 0.25 and not state.get("early_protect"):
                 state["early_protect"] = True
                 early_sl = entry_price * 0.998
                 if early_sl > stop_loss:
                     effective_sl = early_sl
-                    state["early_protect_sl"] = early_sl  # Erken koruma fiyatını sakla
-                    logger.info(f"🛡️ #{signal_id} {symbol} ERKEN KORUMA: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
+                    state["early_protect_sl"] = early_sl
+                    logger.info(f"🛡️ #{signal_id} {symbol} ERKEN KORUMA: SL → {effective_sl:.6f}")
 
-        # ★ FIX: Her zaman en iyi SL seviyesini kullan (trailing > be > early_protect > original)
-        # Bu sayede fiyat geri çekildiğinde koruma KAYBOLMAZ
+        # En iyi SL seviyesini kullan
         if state.get("trailing_sl"):
             effective_sl = max(effective_sl, state["trailing_sl"])
         if state.get("breakeven_sl"):
@@ -689,41 +565,37 @@ class TradeManager:
 
     def _manage_short_sl(self, signal_id, symbol, entry_price, current_price,
                           stop_loss, take_profit, state, effective_sl):
-        """SHORT pozisyon için Progresif Breakeven ve Trailing SL yönetimi."""
+        """SHORT: Progresif Breakeven + Trailing SL."""
         total_distance = entry_price - take_profit
         current_progress = entry_price - current_price
 
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %60 → Trailing SL
             if progress_pct >= 0.60:
                 trailing = entry_price - (current_progress * 0.50)
-                if state["trailing_sl"] is None or trailing < state["trailing_sl"]:
+                if state.get("trailing_sl") is None or trailing < state["trailing_sl"]:
                     state["trailing_sl"] = trailing
                     effective_sl = min(effective_sl, trailing)
                     if not state.get("trailing_logged"):
-                        logger.info(f"📉 #{signal_id} {symbol} TRAILING SL: {trailing:.6f} (progress: {progress_pct:.0%})")
+                        logger.info(f"📉 #{signal_id} {symbol} TRAILING: {trailing:.6f} ({progress_pct:.0%})")
                         state["trailing_logged"] = True
 
-            # %40 → Breakeven
-            elif progress_pct >= 0.40 and not state["breakeven_moved"]:
+            elif progress_pct >= 0.40 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
                 be_sl = entry_price * 0.999
-                state["breakeven_sl"] = be_sl  # ★ BE fiyatını state'e kaydet
+                state["breakeven_sl"] = be_sl
                 effective_sl = be_sl
-                logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
+                logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {effective_sl:.6f} ({progress_pct:.0%})")
 
-            # %25 → Erken koruma
             elif progress_pct >= 0.25 and not state.get("early_protect"):
                 state["early_protect"] = True
                 early_sl = entry_price * 1.002
                 if early_sl < stop_loss:
                     effective_sl = early_sl
                     state["early_protect_sl"] = early_sl
-                    logger.info(f"🛡️ #{signal_id} {symbol} ERKEN KORUMA: SL → {effective_sl:.6f} (progress: {progress_pct:.0%})")
+                    logger.info(f"🛡️ #{signal_id} {symbol} ERKEN KORUMA: SL → {effective_sl:.6f}")
 
-        # ★ FIX: Her zaman en iyi SL seviyesini kullan (SHORT için min)
         if state.get("trailing_sl"):
             effective_sl = min(effective_sl, state["trailing_sl"])
         if state.get("breakeven_sl"):
@@ -741,262 +613,62 @@ class TradeManager:
             return "BREAKEVEN"
         return "STRUCTURAL_SL"
 
+    # =================================================================
+    #  İZLEME LİSTESİ (Basitleştirilmiş)
+    # =================================================================
+
     def check_watchlist(self, strategy_engine):
         """
-        İzleme listesindeki coinleri kontrol et.
+        İzleme listesi kontrolü.
 
-        5m kapanan mumları tek tek izler:
-        - 2 mum içinde yeterli onay toplanırsa işleme alır
-        - Yetersiz onayda expire eder
-        - Score çok düşerse erken expire eder
+        ★ v3.0'da generate_signal sadece SIGNAL veya None döndürür.
+        ★ WATCH sinyalleri artık üretilmiyor.
+        ★ Bu metod geriye uyumluluk için korundu (app.py çağırıyor).
+        ★ Mevcut watchlist öğeleri tamamlanır veya expire edilir.
         """
         watching_items = get_watching_items()
         promoted = []
-        min_confluence = strategy_engine.params["min_confluence_score"]
 
         for item in watching_items:
             symbol = item["symbol"]
-            candles_watched = int(item.get("candles_watched", 0))
-            confirmation_count = int(item.get("confirmation_count", 0))
-            max_watch = item["max_watch_candles"]
-            required_confirmations = min(max_watch, WATCH_REQUIRED_CONFIRMATIONS)
-            expected_direction = item["direction"]
+            candles_watched = int(item.get("candles_watched", 0)) + 1
+            max_watch = item.get("max_watch_candles", WATCH_CONFIRM_CANDLES)
 
-            # 5m verisi + HTF/MTF verisi çek
-            watch_df = data_fetcher.get_candles(symbol, WATCH_CONFIRM_TIMEFRAME, 120)
-            multi_tf = data_fetcher.get_multi_timeframe_data(symbol)
-            if watch_df is None or watch_df.empty or multi_tf is None:
-                continue
-
-            # Sadece yeni kapanan 5m mum geldiğinde sayaç artır
-            last_candle_ts = watch_df["timestamp"].iloc[-1].isoformat()
-            if item.get("last_5m_candle_ts") == last_candle_ts:
-                continue
-
-            candles_watched += 1
-
-            # === 5m Onay Analizi (geliştirilmiş v2) ===
-            # 15m'de tespit edilen ICT yapılarının (FVG, OB, sweep) gerçekten
-            # devam edip etmediğini 5m mumlarıyla doğrular. 6 kriter:
-            
-            last_candle = watch_df.iloc[-1]
-            potential_entry = item.get("potential_entry", 0)
-            potential_sl = item.get("potential_sl", 0)
-            current_5m_price = last_candle["close"]
-            
-            # ── 1) Yön kontrolü: 5m yapısal trend ──
-            # 5m'de tam yapısal trend nadiren oluşur, bu yüzden:
-            #   - Doğru yön veya NEUTRAL → geçer
-            #   - Sadece net ters trend → fail
-            structure_5m = strategy_engine.detect_market_structure(watch_df)
-            trend_5m = structure_5m.get("trend", "NEUTRAL")
-            
-            if expected_direction == "LONG":
-                direction_ok = trend_5m not in ["BEARISH"]  # BULLISH, WEAKENING_BEAR, WEAKENING_BULL, NEUTRAL hepsi OK
-            else:
-                direction_ok = trend_5m not in ["BULLISH"]  # BEARISH, WEAKENING_BULL, WEAKENING_BEAR, NEUTRAL hepsi OK
-            
-            # ── 2) Ranging kontrolü ──
-            market_ok = not strategy_engine.detect_ranging_market(watch_df)
-            
-            # ── 3) Mum gövde filtresi: doji/küçük mumları reddet ──
-            candle_body = abs(last_candle["close"] - last_candle["open"])
-            recent_bodies = watch_df.tail(20).apply(
-                lambda r: abs(r["close"] - r["open"]), axis=1
-            )
-            avg_body = recent_bodies.mean() if len(recent_bodies) > 0 else 0
-            # Gövde, son 20 mumun ortalamasının min %30'u olmalı
-            body_ok = candle_body >= avg_body * 0.3 if avg_body > 0 else True
-            
-            # Mum yönü doğru mu?
-            if expected_direction == "LONG":
-                price_ok = last_candle["close"] > last_candle["open"]  # Kesin yeşil (= dahil değil)
-            else:
-                price_ok = last_candle["close"] < last_candle["open"]  # Kesin kırmızı
-            
-            # ── 4) Hacim doğrulaması: çok zayıf hacimli mumları reddet ──
-            vol_series = watch_df.tail(20)["volume"]
-            avg_vol = vol_series.mean() if len(vol_series) > 0 else 0
-            current_vol = last_candle.get("volume", 0)
-            # Hacim, ortalamanın en az %40'ı olmalı (5m mumlar genelde düşük hacimli)
-            volume_ok = current_vol >= avg_vol * 0.4 if avg_vol > 0 else True
-            
-            # ── 5) Entry bölgesi mesafe kontrolü ──
-            # Fiyat, potansiyel entry'den max %2 uzakta olmalı
-            entry_distance_pct = 0.0
-            if potential_entry > 0:
-                entry_distance_pct = abs(current_5m_price - potential_entry) / potential_entry * 100
-                entry_near_ok = entry_distance_pct <= 2.0
-            else:
-                entry_near_ok = True
-            
-            # ── 6) SL seviyesi koruması ──
-            if expected_direction == "LONG":
-                level_ok = current_5m_price > potential_sl if potential_sl > 0 else True
-            else:
-                level_ok = current_5m_price < potential_sl if potential_sl > 0 else True
-            
-            # ── Skor hesaplama ──
-            new_score = item["initial_score"]
-            if not direction_ok:
-                new_score *= 0.3
-            if not market_ok:
-                new_score *= 0.5
-            if not volume_ok:
-                new_score *= 0.7
-            if not entry_near_ok:
-                new_score *= 0.6
-            
-            # ── Onay kararı ──
-            # Zorunlu: level_ok (SL ihlali → zaten erken expire)
-            # Zorunlu: entry_near_ok (fiyat entry'den çok uzaklaşmışsa onaylama)
-            # Esnek: direction_ok (5m'de sadece ters trend fail)
-            # Esnek: price_ok VEYA body_ok (mum yönü doğru VEYA gövde yeterli)
-            # Esnek: volume_ok esnek (%40) — 5m mumlar genelde düşük hacimli
-            candle_confirmed = all([
-                level_ok,
-                entry_near_ok,
-                direction_ok,
-                price_ok or body_ok,
-            ])
-            if candle_confirmed:
-                confirmation_count += 1
-
-            logger.debug(
-                f"  👁️ {symbol} mum #{candles_watched}: "
-                f"yön={'✓' if direction_ok else '✗'}({trend_5m}) "
-                f"market={'✓' if market_ok else '✗'} "
-                f"price={'✓' if price_ok else '✗'} "
-                f"body={'✓' if body_ok else '✗'} "
-                f"vol={'✓' if volume_ok else '✗'} "
-                f"entry={'✓' if entry_near_ok else '✗'}({entry_distance_pct:.1f}%) "
-                f"level={'✓' if level_ok else '✗'} "
-                f"onay={confirmation_count}/{candles_watched}"
-            )
-
-            # Mum onayı tamamlandıysa nihai karar ver
+            # Max mum sayısına ulaştıysa expire et
             if candles_watched >= max_watch:
-                if confirmation_count >= required_confirmations:
-                    # 15m verisiyle sinyal üret (5m değil!)
-                    multi_15m_df = data_fetcher.get_candles(symbol, "15m", 120)
-                    if multi_15m_df is not None and not multi_15m_df.empty:
-                        signal_result = strategy_engine.generate_signal(symbol, multi_15m_df, multi_tf)
-                    else:
-                        signal_result = None
-                    
-                    if signal_result and signal_result.get("action") in ("SIGNAL", "WATCH"):
-                        quality_tier = signal_result.get("quality_tier", "?")
-                        promo_score = signal_result.get("confluence_score", 0)
-                        promo_conf = signal_result.get("confidence", 0)
-                        
-                        # ══ KALİTE KAPISI: Tier + Skor birleşik değerlendirme ══
-                        # A+/A tier → direkt geçer (tüm 4 gate geçmiş)
-                        # B tier → skor yeterliyse 5m onay ile geçer (sweep+HTF var)
-                        # POTENTIAL → daha yüksek eşik gerekli
-                        # NOT: 5m onay zaten sinyal kalitesini doğruluyor.
-                        if quality_tier not in ("A+", "A"):
-                            if quality_tier == "B":
-                                # B-tier: sweep+HTF var, skor kontrolü yeterli
-                                # 5m onay + sweep = güçlü doğrulama
-                                if promo_score >= min_confluence * 0.85:
-                                    logger.info(
-                                        f"✅ {symbol} Tier-B → 5m onaylı, "
-                                        f"skor yeterli (score={promo_score}) → trade'e devam"
-                                    )
-                                else:
-                                    logger.info(
-                                        f"⏭️ {symbol} Tier-B → skor yetersiz ({promo_score})"
-                                    )
-                                    expire_watchlist_item(
-                                        item["id"],
-                                        reason=f"Tier-B — skor yetersiz ({promo_score})"
-                                    )
-                                    continue
-                            else:
-                                # POTENTIAL tier: hem skor hem güven gerekli
-                                if promo_score >= min_confluence and promo_conf >= min_confidence * 0.85:
-                                    logger.info(
-                                        f"✅ {symbol} Tier-{quality_tier} → 5m onaylı, "
-                                        f"skor+güven yeterli ({promo_score}/{promo_conf}) → trade'e devam"
-                                    )
-                                else:
-                                    logger.info(
-                                        f"⏭️ {symbol} Tier-{quality_tier} → skor/güven yetersiz "
-                                        f"({promo_score}/{promo_conf})"
-                                    )
-                                    expire_watchlist_item(
-                                        item["id"],
-                                        reason=f"Tier-{quality_tier} — skor/güven yetersiz ({promo_score}/{promo_conf})"
-                                    )
-                                    continue
-                        
-                        # ══ SKOR KAPISI: Promosyonda da minimum skor kontrolü ══
-                        promo_min_score = min_confluence * 0.5  # En az %50'si
-                        if promo_score < promo_min_score:
-                            logger.info(
-                                f"⏭️ {symbol} skor yetersiz ({promo_score} < {promo_min_score}) → trade açılmadı"
-                            )
-                            expire_watchlist_item(
-                                item["id"],
-                                reason=f"Skor yetersiz: {promo_score}/{min_confluence}"
-                            )
-                            continue
-                        
-                        promote_watchlist_item(item["id"])
-                        # WATCH bile olsa, 5m onaydan geçtiği için işleme al
-                        if signal_result.get("action") == "WATCH":
-                            signal_result = dict(signal_result)
-                            signal_result["action"] = "SIGNAL"
-                        trade_result = self._open_trade(signal_result)
-                        
-                        # _open_trade reddettiyse promoted'a ekleme
-                        if trade_result.get("status") == "REJECTED":
-                            logger.info(
-                                f"⛔ {symbol} promote edildi ama trade reddedildi: {trade_result.get('reason')}"
-                            )
-                            continue
-                        
-                        promoted.append({
-                            "symbol": symbol,
-                            "action": "PROMOTED",
-                            "trade_result": trade_result
-                        })
-                        logger.info(
-                            f"⬆️ İZLEMEDEN SİNYALE: {symbol} | "
-                            f"Tier: {quality_tier} | Score: {promo_score} | "
-                            f"Onay: {confirmation_count}/{candles_watched} | "
-                            f"Mode: {signal_result.get('entry_mode', '?')}"
-                        )
-                        continue
-                
                 expire_watchlist_item(
                     item["id"],
-                    reason=f"Mum onay yetersiz ({confirmation_count}/{candles_watched})"
+                    reason="v3.0: Boolean gate sistemi — watchlist devre dışı"
                 )
-                logger.info(
-                    f"⏰ İZLEME BİTTİ: {symbol} | "
-                    f"Onay: {confirmation_count}/{candles_watched} | Son Score: {new_score:.1f}"
-                )
+                logger.debug(f"⏰ İZLEME BİTTİ: {symbol} (v3.0 watchlist expire)")
                 continue
 
-            # SL seviyesi ihlal edildiyse erken expire
-            if not level_ok:
-                expire_watchlist_item(
-                    item["id"],
-                    reason=f"SL seviyesi ihlal edildi ({symbol})"
-                )
-                logger.info(f"📉 İZLEME SL İHLAL: {symbol} | Yön tersine döndü")
+            # 15m verisi çek ve yeniden analiz et
+            multi_tf = data_fetcher.get_multi_timeframe_data(symbol)
+            ltf_df = data_fetcher.get_candles(symbol, "15m", 120)
+
+            if ltf_df is None or ltf_df.empty or multi_tf is None:
+                update_watchlist_item(item["id"], candles_watched, item.get("initial_score", 0))
                 continue
 
-            # Güncelle ve beklemeye devam
-            update_watchlist_item(
-                item["id"],
-                candles_watched,
-                new_score,
-                confirmation_count=confirmation_count,
-                last_5m_candle_ts=last_candle_ts,
-                status="WATCHING"
-            )
+            # Yeniden sinyal üret
+            signal_result = strategy_engine.generate_signal(symbol, ltf_df, multi_tf)
+
+            if signal_result and signal_result.get("action") == "SIGNAL":
+                promote_watchlist_item(item["id"])
+                trade_result = self._open_trade(signal_result)
+
+                if trade_result and trade_result.get("status") != "REJECTED":
+                    promoted.append({
+                        "symbol": symbol,
+                        "action": "PROMOTED",
+                        "trade_result": trade_result,
+                    })
+                    logger.info(f"⬆️ İZLEMEDEN SİNYALE: {symbol} (tüm gate'ler geçti)")
+                continue
+
+            # Henüz sinyal yok — güncelle ve bekle
+            update_watchlist_item(item["id"], candles_watched, item.get("initial_score", 0))
 
         return promoted
 
