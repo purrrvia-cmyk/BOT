@@ -1381,13 +1381,13 @@ def api_coin_detail(symbol):
 
         if len(unfilled_bull) > len(unfilled_bear):
             proximity_note = ""
-            if bull_near_price:
+            if bull_near_price and nearest_bull:
                 proximity_note = f" En yakın boğa FVG ({nearest_bull['low']}) fiyata çok yakın — fiyat bu bölgeye çekilebilir (alım fırsatı)."
             result.update({"label": f"{len(unfilled_bull)} Boğa FVG", "signal": "BULLISH", "color": "green",
                           "desc": f"{len(unfilled_bull)} doldurulmamış boğa FVG tespit edildi. ICT teorisine göre fiyat bu boşlukları doldurmaya eğilimlidir.{proximity_note} FVG bölgelerinde limit emir konabilir."})
         elif len(unfilled_bear) > len(unfilled_bull):
             proximity_note = ""
-            if bear_near_price:
+            if bear_near_price and nearest_bear:
                 proximity_note = f" En yakın ayı FVG ({nearest_bear['high']}) fiyata çok yakın — fiyat bu bölgeye yükselebilir (satış bölgesi)."
             result.update({"label": f"{len(unfilled_bear)} Ayı FVG", "signal": "BEARISH", "color": "red",
                           "desc": f"{len(unfilled_bear)} doldurulmamış ayı FVG tespit edildi. Fiyat yukarı doğru bu boşlukları doldurup sonra dönebilir.{proximity_note} FVG bölgelerinde SHORT planlanabilir."})
@@ -1705,7 +1705,7 @@ def api_coin_detail(symbol):
         bb_result = _interpret_bb(current_price, bb_upper.iloc[-1], bb_middle.iloc[-1], bb_lower.iloc[-1], bb_width, prev_bb_width)
 
         # ADX
-        adx_series, plus_di, minus_di = _adx(df)
+        adx_series, plus_di, minus_di = _adx(df)  # type: ignore[misc]
         adx_val = adx_series.iloc[-1] if not adx_series.empty and not np.isnan(adx_series.iloc[-1]) else None
         pdi_val = plus_di.iloc[-1] if not plus_di.empty else None
         mdi_val = minus_di.iloc[-1] if not minus_di.empty else None
@@ -2069,7 +2069,7 @@ def api_coin_detail(symbol):
             pass
 
         # ── PİYASA VERİLERİ: Fonlama, Açık Faiz, Long/Short Ratio ──
-        market_data = {"funding": None, "open_interest": None, "long_short_ratio": None}
+        market_data: dict = {"funding": None, "open_interest": None, "long_short_ratio": None}
         market_data_score = 0  # Genel karara katkı
         try:
             # Fonlama oranı
@@ -2449,9 +2449,9 @@ def api_coin_detail(symbol):
             div_tfs = [k for k in ["1H", "4H"] if tf_results[k].get("divergence", {}).get("type") in ("BULLISH", "BEARISH")]
             div_types = [tf_results[k]["divergence"]["type"] for k in div_tfs]
             warnings.append(f"⚠ {', '.join(div_tfs)}'de {'/'.join(div_types)} diverjansı — mevcut trend zayıflıyor olabilir!")
-        if orderbook_result.get("bid_walls", 0) >= 2:
+        if int(orderbook_result.get("bid_walls") or 0) >= 2:
             warnings.append("🛡 Güçlü alım duvarları — aşağı yönlü destek güçlü.")
-        if orderbook_result.get("ask_walls", 0) >= 2:
+        if int(orderbook_result.get("ask_walls") or 0) >= 2:
             warnings.append("🧱 Güçlü satış duvarları — yukarı yönlü direnç var.")
         
         # Düşük güven uyarısı
@@ -2459,10 +2459,11 @@ def api_coin_detail(symbol):
             warnings.append("ℹ Skor düşük — yüksek güvenli sinyal için daha fazla gösterge uyumu gerekli.")
 
         # Piyasa verileri uyarıları
-        if market_data.get("funding") and market_data["funding"].get("signal") == "BEARISH":
-            warnings.append(f"💰 Fonlama oranı yüksek ({market_data['funding']['current']:.4f}%) — aşırı long kalabalık, düşüş riski.")
-        elif market_data.get("funding") and market_data["funding"].get("signal") == "BULLISH":
-            warnings.append(f"💰 Fonlama oranı negatif ({market_data['funding']['current']:.4f}%) — aşırı short kalabalık, short squeeze riski.")
+        funding_data = market_data.get("funding")
+        if funding_data and funding_data.get("signal") == "BEARISH":
+            warnings.append(f"💰 Fonlama oranı yüksek ({funding_data['current']:.4f}%) — aşırı long kalabalık, düşüş riski.")
+        elif funding_data and funding_data.get("signal") == "BULLISH":
+            warnings.append(f"💰 Fonlama oranı negatif ({funding_data['current']:.4f}%) — aşırı short kalabalık, short squeeze riski.")
         
         lsr_1d = (market_data.get("long_short_ratio") or {}).get("1D")
         if lsr_1d and lsr_1d.get("signal") == "BEARISH":

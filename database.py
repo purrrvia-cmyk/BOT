@@ -10,21 +10,34 @@ import os
 import json
 import threading
 from datetime import datetime, date
+from typing import Any, Optional
 
 # =================== BACKEND SEÇİMİ ===================
+
+# Her iki kütüphaneyi de en tepede import et (Pylance unbound hatalarını önler)
+try:
+    import psycopg2  # type: ignore[import]
+    import psycopg2.extras  # type: ignore[import]
+except ImportError:
+    psycopg2 = None  # type: ignore[assignment]
+
+try:
+    import sqlite3
+except ImportError:
+    sqlite3 = None  # type: ignore[assignment]
+
+try:
+    from config import DB_PATH
+except ImportError:
+    DB_PATH = "ict_bot.db"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 USE_POSTGRES = bool(DATABASE_URL)
 
-if USE_POSTGRES:
+if USE_POSTGRES and DATABASE_URL:
     # Render bazen postgres:// verir, psycopg2 postgresql:// ister
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    import psycopg2
-    import psycopg2.extras
-else:
-    import sqlite3
-    from config import DB_PATH
 
 _local = threading.local()
 
@@ -34,15 +47,15 @@ _local = threading.local()
 def _create_connection():
     """Yeni veritabanı bağlantısı oluştur"""
     if USE_POSTGRES:
-        kwargs = {}
-        if "sslmode" not in DATABASE_URL:
+        kwargs: dict[str, Any] = {}
+        if DATABASE_URL and "sslmode" not in DATABASE_URL:
             kwargs["sslmode"] = "require"
-        conn = psycopg2.connect(DATABASE_URL, **kwargs)
+        conn = psycopg2.connect(DATABASE_URL, **kwargs)  # type: ignore[union-attr]
         conn.autocommit = True
         return conn
     else:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)  # type: ignore[union-attr]
+        conn.row_factory = sqlite3.Row  # type: ignore[union-attr]
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
@@ -56,7 +69,7 @@ def get_db():
     # PostgreSQL bağlantı canlılık kontrolü
     if USE_POSTGRES:
         try:
-            with _local.conn.cursor() as cur:
+            with _local.conn.cursor() as cur:  # type: ignore[union-attr]
                 cur.execute("SELECT 1")
         except Exception:
             try:
@@ -77,49 +90,49 @@ def _q(sql):
     return sql
 
 
-def _execute(sql, params=None):
+def _execute(sql: str, params: Any = None) -> None:
     """SQL çalıştır ve commit yap"""
     conn = get_db()
     if USE_POSTGRES:
-        with conn.cursor() as cur:
+        with conn.cursor() as cur:  # type: ignore[union-attr]
             cur.execute(_q(sql), params or ())
     else:
         conn.execute(sql, params or ())
         conn.commit()
 
 
-def _execute_returning_id(sql, params=None):
+def _execute_returning_id(sql: str, params: Any = None) -> Optional[int]:
     """INSERT çalıştır, yeni satır ID'sini döndür"""
     conn = get_db()
     if USE_POSTGRES:
-        with conn.cursor() as cur:
+        with conn.cursor() as cur:  # type: ignore[union-attr]
             cur.execute(_q(sql) + " RETURNING id", params or ())
             row = cur.fetchone()
-            return row[0]
+            return row[0] if row else None
     else:
         cursor = conn.execute(sql, params or ())
         conn.commit()
         return cursor.lastrowid
 
 
-def _fetchall(sql, params=None):
+def _fetchall(sql: str, params: Any = None) -> list[dict[str, Any]]:
     """Tüm satırları dict listesi olarak döndür"""
     conn = get_db()
     if USE_POSTGRES:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
             cur.execute(_q(sql), params or ())
             rows = cur.fetchall()
-            return [_serialize_row(dict(r)) for r in rows]
+            return [_serialize_row(dict(r)) for r in rows]  # type: ignore[return-value]
     else:
         rows = conn.execute(sql, params or ()).fetchall()
         return [dict(row) for row in rows]
 
 
-def _fetchone(sql, params=None):
+def _fetchone(sql: str, params: Any = None) -> Optional[dict[str, Any]]:
     """Tek satır döndür (dict veya None)"""
     conn = get_db()
     if USE_POSTGRES:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
             cur.execute(_q(sql), params or ())
             row = cur.fetchone()
             return _serialize_row(dict(row)) if row else None
