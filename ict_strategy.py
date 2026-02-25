@@ -1069,22 +1069,80 @@ class ICTStrategy:
             # Entry, SL, TP hesaplama
             entry = zone["ce"]
 
+            # SL hesaplama
             if bias == "LONG":
                 sl = zone["low"] - (zone["high"] - zone["low"]) * 0.2
-                # Draw on Liquidity: 15m ve 1H'dan en yakın BSL
-                tp_15m = liquidity["nearest_bsl"] if liquidity["nearest_bsl"] > entry else 0
-                tp_1h = liquidity_1h["nearest_bsl"] if liquidity_1h["nearest_bsl"] > entry else 0
-                candidates = [t for t in [tp_15m, tp_1h] if t > 0]
-                tp = min(candidates) if candidates else entry * 1.02  # En yakın likidite hedefi
                 in_correct_zone = pd_zone["zone"] in ("DISCOUNT", "DEEP_DISCOUNT")
             else:
                 sl = zone["high"] + (zone["high"] - zone["low"]) * 0.2
-                # Draw on Liquidity: 15m ve 1H'dan en yakın SSL
-                tp_15m = liquidity["nearest_ssl"] if liquidity["nearest_ssl"] > 0 and liquidity["nearest_ssl"] < entry else 0
-                tp_1h = liquidity_1h["nearest_ssl"] if liquidity_1h["nearest_ssl"] > 0 and liquidity_1h["nearest_ssl"] < entry else 0
-                candidates = [t for t in [tp_15m, tp_1h] if t > 0]
-                tp = max(candidates) if candidates else entry * 0.98  # En yakın likidite hedefi (SHORT: en yüksek = en yakın)
                 in_correct_zone = pd_zone["zone"] in ("PREMIUM", "DEEP_PREMIUM")
+
+            # TP: Tüm tepki bölgelerini topla (FVG + OB + Liquidity, 15m + 1H)
+            tp_candidates = []
+            min_tp_distance = 0.01  # Minimum %1 TP mesafesi
+
+            if bias == "LONG":
+                # Likidite hedefleri
+                if liquidity["nearest_bsl"] > entry:
+                    tp_candidates.append(liquidity["nearest_bsl"])
+                if liquidity_1h["nearest_bsl"] > entry:
+                    tp_candidates.append(liquidity_1h["nearest_bsl"])
+                # Karşı FVG (Bearish FVG = LONG için tepki bölgesi)
+                for fvg in fvgs_15m:
+                    if fvg["type"] == "BEARISH" and fvg["low"] > entry:
+                        tp_candidates.append(fvg["low"])
+                for fvg in fvgs_1h:
+                    if fvg["type"] == "BEARISH" and fvg["low"] > entry:
+                        tp_candidates.append(fvg["low"])
+                # Karşı OB (Bearish OB = LONG için tepki bölgesi)
+                for ob in obs_1h:
+                    if ob["type"] == "BEARISH" and not ob["mitigated"] and ob["low"] > entry:
+                        tp_candidates.append(ob["low"])
+                for ob in obs_15m:
+                    if ob["type"] == "BEARISH" and not ob["mitigated"] and ob["low"] > entry:
+                        tp_candidates.append(ob["low"])
+
+                # Min TP mesafesi filtresi + en yakından başlayarak RR kontrolü
+                tp_candidates = [t for t in tp_candidates if (t - entry) / entry >= min_tp_distance]
+                tp_candidates.sort()  # En yakından en uzağa
+            else:
+                # Likidite hedefleri
+                if liquidity["nearest_ssl"] > 0 and liquidity["nearest_ssl"] < entry:
+                    tp_candidates.append(liquidity["nearest_ssl"])
+                if liquidity_1h["nearest_ssl"] > 0 and liquidity_1h["nearest_ssl"] < entry:
+                    tp_candidates.append(liquidity_1h["nearest_ssl"])
+                # Karşı FVG (Bullish FVG = SHORT için tepki bölgesi)
+                for fvg in fvgs_15m:
+                    if fvg["type"] == "BULLISH" and fvg["high"] < entry:
+                        tp_candidates.append(fvg["high"])
+                for fvg in fvgs_1h:
+                    if fvg["type"] == "BULLISH" and fvg["high"] < entry:
+                        tp_candidates.append(fvg["high"])
+                # Karşı OB (Bullish OB = SHORT için tepki bölgesi)
+                for ob in obs_1h:
+                    if ob["type"] == "BULLISH" and not ob["mitigated"] and ob["high"] < entry:
+                        tp_candidates.append(ob["high"])
+                for ob in obs_15m:
+                    if ob["type"] == "BULLISH" and not ob["mitigated"] and ob["high"] < entry:
+                        tp_candidates.append(ob["high"])
+
+                # Min TP mesafesi filtresi + en yakından başlayarak RR kontrolü
+                tp_candidates = [t for t in tp_candidates if (entry - t) / entry >= min_tp_distance]
+                tp_candidates.sort(reverse=True)  # En yakından en uzağa (SHORT: büyükten küçüğe)
+
+            # En yakın TP'yi seç (RR >= min_rr olan ilk aday)
+            _min_rr_tp = self.params.get("min_rr_ratio", 1.5)
+            risk_est = abs(entry - sl)
+            tp = None
+            if risk_est > 0:
+                for tp_cand in tp_candidates:
+                    reward_est = abs(tp_cand - entry)
+                    if reward_est / risk_est >= _min_rr_tp:
+                        tp = tp_cand
+                        break
+            # Fallback: hiçbiri RR tutmazsa en yakını al
+            if tp is None:
+                tp = tp_candidates[0] if tp_candidates else (entry * 1.02 if bias == "LONG" else entry * 0.98)
 
             # Min/Max SL kontrolü
             min_sl_pct = self.params.get("min_sl_distance_pct", 0.008)
