@@ -891,10 +891,8 @@ class ICTStrategy:
             result["obstacles"] = obstacles
             result["obstacle_distance_pct"] = obstacles[0]["pct_of_tp_distance"]
 
-            # v4.4: Sadece çok yakın engellerde TP ayarla (%15 içinde)
-            # Önceki %30 eşiği TP'yi aşırı daraltıyordu → RR düşüyordu
             first_obstacle = obstacles[0]
-            if first_obstacle["pct_of_tp_distance"] < 15:
+            if first_obstacle["pct_of_tp_distance"] < 30:
                 buffer = tp_distance * 0.02
                 if bias == "LONG":
                     result["adjusted_tp"] = first_obstacle["price"] - buffer
@@ -923,153 +921,6 @@ class ICTStrategy:
     def _is_volatile_candle(self, candle_range: float, atr: float) -> bool:
         """Tek mum > 3x ATR = anormal volatilite."""
         return atr > 0 and candle_range > 3 * atr
-
-    # =================================================================
-    #  BÖLÜM 1B — OVEREXTENSION + 4H ENGEL KONTROLLERI
-    # =================================================================
-
-    def _check_overextension(self, df_1h, bias: str) -> bool:
-        """
-        1H'da fiyat tek yöne aşırı mı gitmiş? (Geri çekilme olmadan)
-
-        Kripto'da coin %5-10 tek yöne gidip sıfır geri çekilme olmuşsa,
-        o yönde giriş = tepeye/dibe giriş. Düzeltme gelecek.
-
-        Kontrol:
-          - Son 6 adet 1H mumdan en az 5'i aynı yönde mi?
-          - Toplam hareket 1H ATR'nin 3 katından fazla mı?
-          - Hiç anlamlı geri çekilme (ATR'nin %40'ı) yok mu?
-
-        True = overextended (aşırı gitmiş, girme)
-        False = normal, girilebilir
-        """
-        if df_1h is None or len(df_1h) < 10:
-            return False
-
-        atr_1h = self._calc_atr(df_1h, 14)
-        if atr_1h <= 0:
-            return False
-
-        recent = df_1h.tail(6)
-        opens = recent["open"].values
-        closes = recent["close"].values
-        highs = recent["high"].values
-        lows = recent["low"].values
-
-        # Aynı yönde kaç mum var?
-        if bias == "LONG":
-            same_dir = sum(1 for o, c in zip(opens, closes) if c > o)
-        else:
-            same_dir = sum(1 for o, c in zip(opens, closes) if c < o)
-
-        if same_dir < 5:
-            return False  # 6 mumdan 5'i aynı yönde değil → normal
-
-        # Toplam hareket
-        if bias == "LONG":
-            total_move = float(closes[-1]) - float(lows[0])
-        else:
-            total_move = float(highs[0]) - float(closes[-1])
-
-        if total_move < atr_1h * 3:
-            return False  # ATR'nin 3 katından az → normal
-
-        # Geri çekilme var mı? (herhangi bir mumda ATR'nin %40'ı kadar ters hareket)
-        pullback_threshold = atr_1h * 0.4
-        has_pullback = False
-        for i in range(len(opens)):
-            if bias == "LONG":
-                # Yeşil mum serisinde küçük kırmızı mum veya uzun alt fitil
-                wick_down = float(min(opens[i], closes[i])) - float(lows[i])
-                if closes[i] < opens[i] or wick_down > pullback_threshold:
-                    has_pullback = True
-                    break
-            else:
-                wick_up = float(highs[i]) - float(max(opens[i], closes[i]))
-                if closes[i] > opens[i] or wick_up > pullback_threshold:
-                    has_pullback = True
-                    break
-
-        if has_pullback:
-            return False  # Geri çekilme var → sağlıklı hareket
-
-        # 5/6 mum aynı yön + 3x ATR hareket + sıfır geri çekilme = OVEREXTENDED
-        return True
-
-    def _check_4h_obstacle_for_fallback(self, df_4h, bias: str,
-                                         entry: float, tp: float) -> bool:
-        """
-        1H fallback durumunda 4H'da entry→TP yolunda engel var mı?
-
-        4H NEUTRAL olduğunda 1H yön veriyor. Ama 4H'da kocaman bearish
-        FVG veya OB olabilir — fiyat oraya çarpıp geri döner.
-
-        True = 4H'da engel var, girme
-        False = yol temiz
-        """
-        if df_4h is None or len(df_4h) < 20 or entry <= 0 or tp <= 0:
-            return False
-
-        # 4H OB'leri bul (her iki yönde)
-        obs_4h_bull = self._find_order_blocks(df_4h, "LONG", 20)
-        obs_4h_bear = self._find_order_blocks(df_4h, "SHORT", 20)
-        obs_4h = obs_4h_bull + obs_4h_bear
-
-        # 4H FVG'leri bul
-        fvgs_4h = self._find_fvg(df_4h, 15)
-
-        tp_distance = abs(tp - entry)
-        if tp_distance == 0:
-            return False
-
-        if bias == "LONG":
-            # Entry→TP yolunda mitigated olmamış bearish OB/FVG var mı?
-            for ob in obs_4h:
-                if ob["type"] == "BEARISH" and not ob["mitigated"]:
-                    if entry < ob["low"] < tp:
-                        dist_pct = (ob["low"] - entry) / tp_distance * 100
-                        if dist_pct < 60:  # TP yolunun ilk %60'ında
-                            logger.debug(
-                                f"4H engel: BEARISH OB @ {ob['low']:.5f} "
-                                f"(TP yolunun %{dist_pct:.0f}'inde)"
-                            )
-                            return True
-
-            for fvg in fvgs_4h:
-                if fvg["type"] == "BEARISH" and fvg["mitigated"] != "FULL":
-                    if entry < fvg["low"] < tp:
-                        dist_pct = (fvg["low"] - entry) / tp_distance * 100
-                        if dist_pct < 60:
-                            logger.debug(
-                                f"4H engel: BEARISH FVG @ {fvg['low']:.5f} "
-                                f"(TP yolunun %{dist_pct:.0f}'inde)"
-                            )
-                            return True
-
-        elif bias == "SHORT":
-            for ob in obs_4h:
-                if ob["type"] == "BULLISH" and not ob["mitigated"]:
-                    if tp < ob["high"] < entry:
-                        dist_pct = (entry - ob["high"]) / tp_distance * 100
-                        if dist_pct < 60:
-                            logger.debug(
-                                f"4H engel: BULLISH OB @ {ob['high']:.5f} "
-                                f"(TP yolunun %{dist_pct:.0f}'inde)"
-                            )
-                            return True
-
-            for fvg in fvgs_4h:
-                if fvg["type"] == "BULLISH" and fvg["mitigated"] != "FULL":
-                    if tp < fvg["high"] < entry:
-                        dist_pct = (entry - fvg["high"]) / tp_distance * 100
-                        if dist_pct < 60:
-                            logger.debug(
-                                f"4H engel: BULLISH FVG @ {fvg['high']:.5f} "
-                                f"(TP yolunun %{dist_pct:.0f}'inde)"
-                            )
-                            return True
-
-        return False
 
     # =================================================================
     #  BÖLÜM 2 — KATMAN 1: NARRATIVE (4H Yapı Analizi)
@@ -1262,10 +1113,9 @@ class ICTStrategy:
                 "pd_zone": pd_zone,
             })
 
-        # Sıralama: RR >= min_rr önce, sonra confluence, sonra fiyata yakınlık
-        _min_rr = self.params.get("min_rr_ratio", 2.0)
+        # Sıralama: RR >= 1.5 önce, sonra confluence, sonra fiyata yakınlık
         pois.sort(key=lambda p: (
-            -(1 if p["rr"] >= _min_rr else 0),
+            -(1 if p["rr"] >= 1.5 else 0),
             -p["confluence_count"],
             p["distance_from_price_pct"],
         ))
@@ -1277,8 +1127,7 @@ class ICTStrategy:
     # =================================================================
 
     def check_trigger(self, df_15m, bias: str, poi: Dict,
-                      current_price: float, atr: float,
-                      proximity_pct: float = 0.01) -> Optional[Dict]:
+                      current_price: float, atr: float) -> Optional[Dict]:
         """
         POI bölgesinde trigger oluştu mu?
         
@@ -1287,12 +1136,7 @@ class ICTStrategy:
           B) MSS (Micro Structure Shift)
           C) Displacement (2-3 ardışık güçlü mum)
         
-        RR >= min_rr_ratio (config, default 2.0) zorunlu. Tek dev mum (>3x ATR) = REDDET.
-        
-        Args:
-            proximity_pct: POI zone'a yakınlık eşiği.
-                           generate_signal: 0.01 (1%) — trigger henüz oluşuyor
-                           check_trigger_for_watch: 0.025 (2.5%) — fiyat bounce etmiş olabilir
+        RR >= 1.5 zorunlu. Tek dev mum (>3x ATR) = REDDET.
         """
         if df_15m is None or len(df_15m) < 10 or poi is None:
             return None
@@ -1301,11 +1145,12 @@ class ICTStrategy:
         zone_low = poi["zone_low"]
         tp = poi["tp"]
 
-        # Fiyat POI'ye yeterince yakın mı?
+        # Fiyat POI'ye yeterince yakın mı? (< %1.0)
+        proximity_threshold = 0.01
         if bias == "LONG":
-            price_in_or_near_zone = current_price <= zone_high * (1 + proximity_pct)
+            price_in_or_near_zone = current_price <= zone_high * (1 + proximity_threshold)
         elif bias == "SHORT":
-            price_in_or_near_zone = current_price >= zone_low * (1 - proximity_pct)
+            price_in_or_near_zone = current_price >= zone_low * (1 - proximity_threshold)
         else:
             return None
 
@@ -1314,7 +1159,6 @@ class ICTStrategy:
 
         min_sl_pct = self.params.get("min_sl_distance_pct", 0.008)
         max_sl_pct = self.params.get("max_sl_distance_pct", 0.025)
-        min_rr = self.params.get("min_rr_ratio", 2.0)
 
         # === TRIGGER A: Sweep + Rejection ===
         sh_15m, sl_15m = self._find_swing_points(df_15m, lookback=3)
@@ -1336,7 +1180,7 @@ class ICTStrategy:
             reward = abs(tp - current_price)
             actual_rr = reward / risk if risk > 0 else 0
 
-            if actual_rr >= min_rr:
+            if actual_rr >= 1.5:
                 return {
                     "trigger_type": "SWEEP_REJECTION",
                     "direction": bias,
@@ -1356,19 +1200,11 @@ class ICTStrategy:
 
         if mss is not None and mss["candles_ago"] <= 4:
             sl = poi["sl"]
-
-            # Min/Max SL kontrolü (Trigger A ve C'de var, burada eksikti)
-            sl_dist = abs(current_price - sl) / current_price if current_price > 0 else 0
-            if sl_dist < min_sl_pct:
-                sl = current_price * (1 - min_sl_pct) if bias == "LONG" else current_price * (1 + min_sl_pct)
-            elif sl_dist > max_sl_pct:
-                sl = current_price * (1 - max_sl_pct) if bias == "LONG" else current_price * (1 + max_sl_pct)
-
             risk = abs(current_price - sl)
             reward = abs(tp - current_price)
             actual_rr = reward / risk if risk > 0 else 0
 
-            if actual_rr >= min_rr:
+            if actual_rr >= 1.5:
                 return {
                     "trigger_type": "MSS",
                     "direction": bias,
@@ -1402,7 +1238,7 @@ class ICTStrategy:
             reward = abs(tp - current_price)
             actual_rr = reward / risk if risk > 0 else 0
 
-            if actual_rr >= min_rr:
+            if actual_rr >= 1.5:
                 return {
                     "trigger_type": "DISPLACEMENT",
                     "direction": bias,
@@ -1465,85 +1301,23 @@ class ICTStrategy:
 
         # CHoCH artık sinyali engellemez — sadece triggerda kalite düşürür
 
-        # ═══ OVEREXTENSION KONTROLÜ (1H) ═══
-        # Coin tek yöne aşırı gitmişse → sinyali SIGNAL yerine WATCH'a düşür
-        force_watch_overextended = False
-        if df_1h is not None and len(df_1h) >= 10:
-            if self._check_overextension(df_1h, bias):
-                force_watch_overextended = True
-                logger.info(
-                    f"⚠️ {symbol}: 1H overextended ({bias}) — "
-                    f"sinyal WATCH'a düşürülecek"
-                )
-
         # ═══ KATMAN 2: POI TESPİTİ ═══
         pois = self.find_poi_zones(df_15m, df_1h, bias, current_price)
 
         if not pois:
             return None
 
-        # RR filtresi (config'den)
-        _min_rr = self.params.get("min_rr_ratio", 2.0)
-        valid_pois = [p for p in pois if p["rr"] >= _min_rr]
+        # RR >= 1.5 filtresi
+        valid_pois = [p for p in pois if p["rr"] >= 1.5]
         if not valid_pois:
             return None
 
         best_poi = valid_pois[0]
 
-        # ═══ 4H ENGEL KONTROLÜ (sadece 1H fallback durumunda) ═══
-        # 4H NEUTRAL idi, 1H yön verdi → ama 4H'da engel var mı?
-        if narrative.get("quality") == "WEAK" and df_4h is not None:
-            entry_est = best_poi.get("entry", current_price)
-            tp_est = best_poi.get("tp", 0)
-            
-            # v4.4: WEAK quality'de RR minimum 2.5 olmalı (extra güvenlik)
-            if best_poi["rr"] < 2.5:
-                logger.debug(
-                    f"⚠️ {symbol}: 1H fallback ({bias}) RR={best_poi['rr']:.1f} < 2.5 — düşük kalite, skip"
-                )
-                return None
-            
-            if tp_est > 0 and self._check_4h_obstacle_for_fallback(
-                df_4h, bias, entry_est, tp_est
-            ):
-                logger.info(
-                    f"🚫 {symbol}: 1H fallback ({bias}) ama 4H'da engel var "
-                    f"— sinyal iptal"
-                )
-                return None
-
         # ═══ KATMAN 3: TRIGGER ═══
         trigger = self.check_trigger(df_15m, bias, best_poi, current_price, atr_15m)
 
         if trigger is not None:
-            # Overextended kontrolü: Trigger oluştu ama coin aşırı gitmişse → WATCH
-            if force_watch_overextended:
-                logger.info(
-                    f"⚠️ {symbol} OVEREXTENDED → WATCH'a düşürüldü: "
-                    f"{trigger['direction']} | Entry: {trigger['entry']:.5f}"
-                )
-                return {
-                    "action": "WATCH",
-                    "symbol": symbol,
-                    "direction": trigger["direction"],
-                    "entry_price": trigger["entry"],
-                    "current_price": current_price,
-                    "stop_loss": trigger["sl"],
-                    "take_profit": trigger["tp"],
-                    "rr_ratio": trigger["rr"],
-                    "watch_reason": "1H overextended — geri çekilme bekleniyor",
-                    "quality_tier": "WATCH",
-                    "components": trigger["components"],
-                    "narrative": narrative,
-                    "poi": best_poi,
-                    "trigger_data": trigger,
-                    "atr": atr_15m,
-                    "confidence": 100,
-                    "confluence_score": 100,
-                    "entry_mode": "MARKET",
-                    "timeframe": "15m",
-                }
-
             # TRIGGER OLUŞTU → SIGNAL
             logger.info(
                 f"🎯 {symbol} SIGNAL: {trigger['direction']} | "
@@ -1608,63 +1382,28 @@ class ICTStrategy:
         return None
 
     # =================================================================
-    #  BÖLÜM 5B — WATCHLIST TRIGGER KONTROLÜ (Dual TF)
+    #  BÖLÜM 5B — WATCHLIST TRIGGER KONTROLÜ (Hafif)
     # =================================================================
-
-    def _check_zone_touched(self, df, bias: str, poi: Dict,
-                            lookback: int = 12) -> bool:
-        """
-        Son N mum içinde herhangi birinin POI zone'a dokunup dokunmadığını kontrol et.
-
-        ICT Prensibi: Trigger'ın anlamlı olabilmesi için fiyatın zone'a
-        DOKUNMUŞ olması gerekir. Zone'a hiç ulaşmamış fiyatta sweep/MSS
-        tespit etmek false positive üretir.
-
-        LONG:  Mumun low'u <= zone_high (zone'a veya içine girdi)
-        SHORT: Mumun high'ı >= zone_low (zone'a veya içine girdi)
-        """
-        zone_high = poi.get("zone_high", 0)
-        zone_low = poi.get("zone_low", 0)
-
-        if not zone_high or not zone_low:
-            return False
-
-        recent = df.tail(min(lookback, len(df)))
-
-        for _, candle in recent.iterrows():
-            low = float(candle.get("low", 0))
-            high = float(candle.get("high", 0))
-
-            if bias == "LONG" and low <= zone_high:
-                return True
-            elif bias == "SHORT" and high >= zone_low:
-                return True
-
-        return False
 
     def check_trigger_for_watch(self, symbol: str, df_15m,
                                 stored_narrative: Dict,
-                                stored_poi: Dict,
-                                df_5m=None) -> Optional[Dict]:
+                                stored_poi: Dict) -> Optional[Dict]:
         """
-        Watchlist item'ı için dual-TF trigger kontrolü.
-
-        v4.1 — ICT Sniper Entry yaklaşımı:
-          1. Narrative tekrar hesaplanmaz (stored kullanılır, 4H/1H API tasarrufu)
-          2. POI tekrar aranmaz (stored kullanılır)
-          3. POI invalidation: 2 ardışık 15m close teyitli (%1.2 eşik)
-          4. 15m'de trigger ara (standart — proximity %2.5)
-          5. 15m bulamazsa + 5m zone'a dokunmuşsa → 5m sniper trigger ara
-
-        ICT Prensibi:
-          Institutional order flow POI zone'larda birikir. Fiyat zone'a dokunup
-          yapısal shift verdiğinde (5m MSS/displacement), bu en hassas giriş
-          noktasıdır. 15m'de henüz görünmeyen micro yapılar 5m'de tespit edilir.
-
+        Watchlist item'ı için hafif trigger kontrolü.
+        
+        generate_signal()'den FARKLI:
+          - Narrative tekrar hesaplanmaz (stored kullanılır)
+          - POI tekrar aranmaz (stored kullanılır)
+          - Sadece 15m data ile check_trigger() çağrılır
+          - 4H ve 1H API çağrısı YAPILMAZ → 2 API tasarrufu
+        
+        POI Invalidation:
+          - Fiyat POI zone'unu tamamen geçtiyse → None + "invalidated" flag
+          - CHoCH oluşmuşsa stored_narrative ile tutarsızlık → None
+        
         Returns:
-            None — trigger yok
-            {"_invalidated": True, ...} — POI geçersiz
-            {"action": "SIGNAL", ...} — trigger oluştu, işlem açılacak
+            None — trigger yok veya POI invalidate
+            Dict — generate_signal ile aynı SIGNAL formatı
         """
         if df_15m is None or len(df_15m) < 20:
             return None
@@ -1688,45 +1427,27 @@ class ICTStrategy:
         if self._is_volatile_candle(last_range, atr_15m):
             return None
 
-        # ══════════════════════════════════════════════
-        #  POI İNVALIDATION — Close teyitli (%1.2 eşik)
-        # ══════════════════════════════════════════════
-        #
-        # ICT Prensibi: POI zone "kırıldı" demek için tek wick yetmez.
-        # Ardışık 2 mumun KAPANIŞI zone'un ötesinde olmalı.
-        # Tek wick = sweep (giriş fırsatı), ardışık close = zone öldü.
-
+        # ── POI İNVALIDATION ──
         zone_high = stored_poi.get("zone_high", 0)
         zone_low = stored_poi.get("zone_low", 0)
 
-        recent_closes = [float(row["close"]) for _, row in df_15m.tail(2).iterrows()]
-
         if bias == "LONG":
-            invalidation_level = zone_low * 0.988
-            if len(recent_closes) >= 2 and all(c < invalidation_level for c in recent_closes):
-                logger.debug(f"{symbol} WATCH: POI invalidated (2 ardışık 15m close zone altında)")
-                return {"_invalidated": True, "reason": "POI aşağı kırıldı (2x close teyit)"}
+            # Fiyat POI'nin altına düştüyse → zone sweep edildi, artık geçersiz
+            if current_price < zone_low * 0.995:
+                logger.debug(f"{symbol} WATCH: POI invalidated (fiyat zone altına düştü)")
+                return {"_invalidated": True, "reason": "POI zone aşağı sweep edildi"}
         elif bias == "SHORT":
-            invalidation_level = zone_high * 1.012
-            if len(recent_closes) >= 2 and all(c > invalidation_level for c in recent_closes):
-                logger.debug(f"{symbol} WATCH: POI invalidated (2 ardışık 15m close zone üstünde)")
-                return {"_invalidated": True, "reason": "POI yukarı kırıldı (2x close teyit)"}
+            # Fiyat POI'nin üstüne çıktıysa → zone sweep edildi
+            if current_price > zone_high * 1.005:
+                logger.debug(f"{symbol} WATCH: POI invalidated (fiyat zone üstüne çıktı)")
+                return {"_invalidated": True, "reason": "POI zone yukarı sweep edildi"}
 
-        # ══════════════════════════════════════════════
-        #  15M TRIGGER KONTROLÜ (Standart)
-        # ══════════════════════════════════════════════
-        #
-        # generate_signal: proximity %1 (trigger anlık oluşuyor)
-        # Watchlist: proximity %2.5 (fiyat bounce etmiş olabilir)
-
-        trigger = self.check_trigger(
-            df_15m, bias, stored_poi, current_price, atr_15m,
-            proximity_pct=0.025
-        )
+        # ── TRIGGER KONTROLÜ ──
+        trigger = self.check_trigger(df_15m, bias, stored_poi, current_price, atr_15m)
 
         if trigger is not None:
             logger.info(
-                f"🎯 {symbol} WATCH→SIGNAL (15m): {trigger['direction']} | "
+                f"🎯 {symbol} WATCH→SIGNAL: {trigger['direction']} | "
                 f"Trigger: {trigger['trigger_type']} | "
                 f"Entry: {trigger['entry']:.5f} | "
                 f"SL: {trigger['sl']:.5f} | TP: {trigger['tp']:.5f} | "
@@ -1754,70 +1475,6 @@ class ICTStrategy:
                 "confluence_score": 100,
                 "timeframe": "15m",
             }
-
-        # ══════════════════════════════════════════════
-        #  5M SNİPER TRIGGER KONTROLÜ (ICT LTF Entry)
-        # ══════════════════════════════════════════════
-        #
-        # ICT Prensibi: En hassas giriş, fiyat POI zone'a dokunduktan sonra
-        # 5m (veya 1m) yapısal shift ile gelir. 15m'de henüz görünmeyen
-        # micro sweep veya MSS burada yakalanır.
-        #
-        # Koşullar:
-        #   1. 5m data mevcut ve yeterli
-        #   2. Son 12 adet 5m mum zone'a dokunmuş olmalı (zone_touched)
-        #   3. 5m volatilite filtresi
-        #   4. check_trigger ile 5m'de sweep/MSS/displacement ara
-
-        if df_5m is not None and len(df_5m) >= 15:
-            zone_touched = self._check_zone_touched(df_5m, bias, stored_poi, lookback=12)
-
-            if zone_touched:
-                atr_5m = self._calc_atr(df_5m, 14)
-                current_price_5m = float(df_5m.iloc[-1]["close"])
-
-                # 5m volatilite filtresi
-                last_5m = df_5m.iloc[-1]
-                range_5m = float(last_5m["high"]) - float(last_5m["low"])
-
-                if not self._is_volatile_candle(range_5m, atr_5m):
-                    trigger_5m = self.check_trigger(
-                        df_5m, bias, stored_poi, current_price_5m, atr_5m,
-                        proximity_pct=0.03
-                    )
-
-                    if trigger_5m is not None:
-                        logger.info(
-                            f"🎯 {symbol} WATCH→SIGNAL (5m SNIPER): "
-                            f"{trigger_5m['direction']} | "
-                            f"Trigger: {trigger_5m['trigger_type']} | "
-                            f"Entry: {trigger_5m['entry']:.5f} | "
-                            f"SL: {trigger_5m['sl']:.5f} | "
-                            f"TP: {trigger_5m['tp']:.5f} | "
-                            f"RR: {trigger_5m['rr']}"
-                        )
-
-                        return {
-                            "action": "SIGNAL",
-                            "symbol": symbol,
-                            "direction": trigger_5m["direction"],
-                            "entry_price": trigger_5m["entry"],
-                            "current_price": current_price_5m,
-                            "stop_loss": trigger_5m["sl"],
-                            "take_profit": trigger_5m["tp"],
-                            "rr_ratio": trigger_5m["rr"],
-                            "entry_mode": "MARKET",
-                            "trigger_type": trigger_5m["trigger_type"],
-                            "quality_tier": "SNIPER",
-                            "components": trigger_5m["components"] + ["5M_SNIPER"],
-                            "narrative": stored_narrative,
-                            "poi": stored_poi,
-                            "trigger_data": trigger_5m,
-                            "atr": atr_5m,
-                            "confidence": 100,
-                            "confluence_score": 100,
-                            "timeframe": "5m",
-                        }
 
         return None
 

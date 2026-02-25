@@ -39,41 +39,42 @@ ICT_PARAMS = {
     "swing_lookback": 5,            # Swing high/low tespiti için bakılacak mum sayısı
     "bos_min_displacement": 0.003,  # BOS için minimum kırılım oranı (%0.3)
     
-    # Order Block (v4.4: v4.2 gevşemesi geri alındı)
-    "ob_max_age_candles": 30,       # v4.4: 35→30 — taze OB daha güvenilir
-    "ob_body_ratio_min": 0.40,     # v4.4: 0.35→0.40 — güçlü gövdeli OB şart
+    # Order Block
+    "ob_max_age_candles": 30,       # Order Block'un geçerlilik süresi (mum sayısı)
+    "ob_body_ratio_min": 0.4,      # OB mumunun minimum gövde/fitil oranı
     
-    # Fair Value Gap (v4.4: v4.2 gevşemesi geri alındı)
-    "fvg_min_size_pct": 0.001,     # v4.4: 0.0008→0.001 — mikro FVG güvenilmez
-    "fvg_max_age_candles": 20,     # v4.4: 25→20 — eski FVG dolmuş olabilir
+    # Fair Value Gap
+    "fvg_min_size_pct": 0.001,     # Minimum FVG boyutu (fiyatın %'si)
+    "fvg_max_age_candles": 20,     # FVG'nin geçerlilik süresi
     
     # Liquidity
     "liquidity_equal_tolerance": 0.001,  # Eşit dip/tepe toleransı (%0.1)
     "liquidity_min_touches": 2,          # Minimum dokunma sayısı
     
-    # Risk Yönetimi (v4.4: yapısal SL, min %1.2)
+    # Risk Yönetimi (v4.0: yapısal SL, min %0.8)
     "default_sl_pct": 0.020,       # Varsayılan SL (%2.0) - sadece fallback, yapısal SL öncelikli
     "max_sl_distance_pct": 0.030,  # Maximum SL mesafesi (%3.0) - risk limiti
     "sl_buffer_pct": 0.01,         # SL buffer wick extreme'den (%1)
     "max_concurrent_trades": 3,    # v4.0: 2→3 eşzamanlı işlem
     "max_same_direction_trades": 2,  # v4.0: 1→2 aynı yönde max işlem
-    "min_sl_distance_pct": 0.012,  # v4.4: %0.8→%1.2 — kripto noise'a dayanıklı
+    "min_sl_distance_pct": 0.008,  # v4.0: %0.5→%0.8 — noise'a yakalanmayı önler
     "signal_cooldown_minutes": 20, # Aynı coinde sinyal arası bekleme
     
-    # Displacement (v4.4: v4.2 gevşemesi geri alındı — kalite öncelikli)
-    "displacement_min_body_ratio": 0.55,  # v4.4: 0.50→0.55 — güçlü displacement şart
-    "displacement_min_size_pct": 0.006,   # v4.4: 0.005→0.006 — zayıf hareketleri ele
-    "displacement_atr_multiplier": 1.5,   # v4.4: 1.3→1.5 — gerçek displacement ATR×1.5 olmalı
+    # Displacement (v4.0: 2-3 ardışık mum, tek dev mum REDDEDİLİR)
+    "displacement_min_body_ratio": 0.55,  # Displacement mum gövde oranı
+    "displacement_min_size_pct": 0.006,   # %0.6 minimum displacement
+    "displacement_atr_multiplier": 1.5,   # ATR × 1.5 (gerçek displacement)
     "displacement_max_candles_after_sweep": 3,  # v4.0: 2→3 ardışık mum izni
     
-    # POI Confluence (v4.4: kalite öncelikli)
-    "poi_max_distance_pct": 0.010,        # v4.4: 0.012→0.010 — daha yakın POI = daha iyi giriş
+    # POI Confluence (v4.0 yeni)
+    "poi_max_distance_pct": 0.01,         # POI'ye max uzaklık (%1.0)
     "obstacle_proximity_pct": 0.003,      # Engel yakınlık eşiği (%0.3)
-    "min_rr_ratio": 2.0,                  # v4.4: 1.4→2.0 — BE ile bile kârlı olacak şekilde RR şart
+    "min_rr_ratio": 1.5,                  # Minimum RR oranı
 }
 
 # İşlem Süre Ayarları (v4.0: LIMIT kaldırıldı → MARKET only)
-MAX_TRADE_DURATION_HOURS = 6     # v4.4: 4→6 saat — TP'ye ulaşmak için yeterli süre
+MAX_TRADE_DURATION_HOURS = 4     # Aktif işlem max yaşam süresi (saat)
+                                 # 15m TF sinyal geçerliliği: uzun süren işlemler kaybetme eğiliminde
 
 # Optimizer Parametreleri (v3.0 — SMC Threshold Optimizer)
 OPTIMIZER_CONFIG = {
@@ -105,7 +106,7 @@ OPTIMIZER_PARAM_BOUNDS = {
     "default_sl_pct": (0.008, 0.025),
     # POI
     "poi_max_distance_pct": (0.005, 0.020),
-    "min_rr_ratio": (1.80, 4.00),  # v4.4: alt sınır 1.8 (BE ile bile kârlı olmalı)
+    "min_rr_ratio": (1.20, 3.00),
 }
 
 # Tarama Aralıkları
@@ -116,7 +117,7 @@ TRADE_CHECK_INTERVAL = 5    # Açık işlem kontrolü (saniye) — 10→5: daha 
 # SIGNAL → direkt MARKET giriş (bekleme yok)
 # WATCH → watchlist → trigger oluşunca promote
 WATCH_CONFIRM_TIMEFRAME = "5m"          # Watchlist kontrol TF'si
-WATCH_CONFIRM_CANDLES = 12              # v4.1: max 12×5m = 60dk (1 saat) watchlist süresi
+WATCH_CONFIRM_CANDLES = 12              # v4.0: max 12×5m = 60dk watchlist süresi
 WATCH_CHECK_INTERVAL = 60               # Watchlist kontrol aralığı (saniye)
 WATCH_REQUIRED_CONFIRMATIONS = 1        # Uyumluluk için kalıyor
 

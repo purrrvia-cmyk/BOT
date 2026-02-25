@@ -44,7 +44,7 @@ logger = logging.getLogger("ICT-Bot.TradeManager")
 
 # ─── SABITLER ────────────────────────────────────────
 MAX_TRADE_DURATION_HOURS = 4      # 15m TF sinyalleri için max yaşam süresi
-WATCH_MAX_CANDLES = 12            # Watchlist max izleme: 12 × 5m = 1 saat
+WATCH_MAX_CANDLES = 12            # Watchlist max izleme: 12 × 5m = 60dk
 WATCH_TIMEFRAME = "5m"            # Watchlist izleme TF'si
 WATCH_CHECK_INTERVAL_SEC = 60     # Watchlist kontrol aralığı
 
@@ -401,9 +401,9 @@ class TradeManager:
         """
         ACTIVE sinyal SL/TP takibi + Breakeven/Trailing SL.
 
-        v4.4 SL Yönetimi (2 aşama — eşikler yükseltildi):
-          %65 TP → Breakeven (SL entry + %0.3 buffer)
-          %85 TP → Trailing (SL kârın %50'sine)
+        v4.0 SL Yönetimi (2 aşama):
+          %50 TP → Breakeven (SL entry'ye)
+          %75 TP → Trailing (SL kârın %50'sine)
         """
         symbol = signal["symbol"]
         result = {
@@ -551,9 +551,8 @@ class TradeManager:
         """
         LONG: Yapısal SL yönetimi.
 
-        v4.4: BE ve Trailing eşikleri yükseltildi (kazananların kaçmasını önle)
-        %65 TP mesafesi → Breakeven (SL = entry + %0.3 buffer)
-        %85 TP mesafesi → Trailing (SL = entry + kârın %50'si)
+        %50 TP mesafesi → Breakeven (SL = entry + buffer)
+        %75 TP mesafesi → Trailing (SL = entry + kârın %50'si)
         """
         total_distance = take_profit - entry_price
         current_progress = current_price - entry_price
@@ -562,8 +561,8 @@ class TradeManager:
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %85+ → Trailing SL (kârın %50'si)
-            if progress_pct >= 0.85:
+            # %75+ → Trailing SL (kârın %50'si)
+            if progress_pct >= 0.75:
                 trailing = entry_price + (current_progress * 0.50)
                 prev_trailing = state.get("trailing_sl")
                 if prev_trailing is None or trailing > prev_trailing:
@@ -575,12 +574,12 @@ class TradeManager:
                 # Breakeven da aktif olmalı
                 if not state.get("breakeven_moved"):
                     state["breakeven_moved"] = True
-                    state["breakeven_sl"] = entry_price * 1.003
+                    state["breakeven_sl"] = entry_price * 1.001
 
-            # %65+ → Breakeven
-            elif progress_pct >= 0.65 and not state.get("breakeven_moved"):
+            # %50+ → Breakeven
+            elif progress_pct >= 0.50 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
-                be_sl = entry_price * 1.003  # Entry + %0.3 buffer
+                be_sl = entry_price * 1.001  # Entry + %0.1 buffer
                 state["breakeven_sl"] = be_sl
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {be_sl:.6f} ({progress_pct:.0%})")
 
@@ -597,9 +596,8 @@ class TradeManager:
         """
         SHORT: Yapısal SL yönetimi.
 
-        v4.4: BE ve Trailing eşikleri yükseltildi
-        %65 TP mesafesi → Breakeven (SL = entry - %0.3 buffer)
-        %85 TP mesafesi → Trailing (SL = entry - kârın %50'si)
+        %50 TP mesafesi → Breakeven (SL = entry - buffer)
+        %75 TP mesafesi → Trailing (SL = entry - kârın %50'si)
         """
         total_distance = entry_price - take_profit
         current_progress = entry_price - current_price
@@ -608,8 +606,8 @@ class TradeManager:
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %85+ → Trailing SL
-            if progress_pct >= 0.85:
+            # %75+ → Trailing SL
+            if progress_pct >= 0.75:
                 trailing = entry_price - (current_progress * 0.50)
                 prev_trailing = state.get("trailing_sl")
                 if prev_trailing is None or trailing < prev_trailing:
@@ -620,12 +618,12 @@ class TradeManager:
 
                 if not state.get("breakeven_moved"):
                     state["breakeven_moved"] = True
-                    state["breakeven_sl"] = entry_price * 0.997
+                    state["breakeven_sl"] = entry_price * 0.999
 
-            # %65+ → Breakeven
-            elif progress_pct >= 0.65 and not state.get("breakeven_moved"):
+            # %50+ → Breakeven
+            elif progress_pct >= 0.50 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
-                be_sl = entry_price * 0.997  # Entry - %0.3 buffer
+                be_sl = entry_price * 0.999  # Entry - %0.1 buffer
                 state["breakeven_sl"] = be_sl
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {be_sl:.6f} ({progress_pct:.0%})")
 
@@ -702,9 +700,9 @@ class TradeManager:
             max_watch = item.get("max_watch_candles", WATCH_MAX_CANDLES)
             stored_ts = item.get("last_5m_candle_ts") or ""
 
-            # ── 5m VERİ ÇEK (mum sayımı + SL kontrolü + 5m trigger) ──
+            # ── 5m VERİ ÇEK (mum sayımı + SL kontrolü) ──
             try:
-                df_ltf = data_fetcher.get_candles(symbol, WATCH_TIMEFRAME, 50)
+                df_ltf = data_fetcher.get_candles(symbol, WATCH_TIMEFRAME, 15)
             except Exception as e:
                 logger.debug(f"Watchlist veri hatası ({symbol}): {e}")
                 continue
@@ -719,26 +717,19 @@ class TradeManager:
 
             candles_watched += 1
 
-            # ── SL İNVALIDATION (close bazlı — wick fakeout koruması) ──
+            # ── SL İNVALIDATION ──
             potential_sl = item.get("potential_sl")
             direction = item["direction"]
 
             if potential_sl and not df_ltf.empty:
-                # Son 3 mumun KAPANIŞ fiyatlarını kontrol et
-                # Tek wick SL'e dokunabilir ama close ile teyit gerekli
-                recent = df_ltf.tail(min(3, len(df_ltf)))
-                sl_broken = False
-                for _, candle in recent.iterrows():
-                    close_price = float(candle.get("close", 0))
-                    if direction == "LONG" and close_price <= potential_sl:
-                        sl_broken = True
-                        break
-                    elif direction == "SHORT" and close_price >= potential_sl:
-                        sl_broken = True
-                        break
-                if sl_broken:
-                    expire_watchlist_item(item["id"], reason=f"SL kırıldı - close teyitli ({candles_watched}. mum)")
-                    logger.info(f"❌ WATCH SL KIRILDI (close): {symbol} {direction}")
+                last_candle = df_ltf.iloc[-1]
+                if direction == "LONG" and float(last_candle.get("low", 0)) <= potential_sl:
+                    expire_watchlist_item(item["id"], reason=f"SL kırıldı ({candles_watched}. mum)")
+                    logger.info(f"❌ WATCH SL KIRILDI: {symbol} LONG")
+                    continue
+                elif direction == "SHORT" and float(last_candle.get("high", 0)) >= potential_sl:
+                    expire_watchlist_item(item["id"], reason=f"SL kırıldı ({candles_watched}. mum)")
+                    logger.info(f"❌ WATCH SL KIRILDI: {symbol} SHORT")
                     continue
 
             # ── TIMEOUT ──
@@ -772,12 +763,11 @@ class TradeManager:
                 logger.debug(f"{symbol} watchlist item expired: narrative/poi eksik")
                 continue
 
-            # ── TRIGGER KONTROLÜ — Dual TF (15m + 5m sniper) ──
+            # ── TRIGGER KONTROLÜ — check_trigger_for_watch (hafif) ──
             try:
                 df_15m = data_fetcher.get_candles(symbol, "15m", 100)
                 signal_result = strategy_engine.check_trigger_for_watch(
-                    symbol, df_15m, stored_narrative, stored_poi,
-                    df_5m=df_ltf
+                    symbol, df_15m, stored_narrative, stored_poi
                 )
             except Exception as e:
                 logger.debug(f"Watchlist trigger check hatası ({symbol}): {e}")
