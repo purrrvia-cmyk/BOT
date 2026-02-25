@@ -1002,9 +1002,15 @@ class ICTStrategy:
         fvgs_15m = self._find_fvg(df_15m, self.params.get("fvg_max_age_candles", 20))
         liquidity = self._find_liquidity_pools(sh_15m, sl_15m, current_price)
 
-        # 1H analiz (engel taraması için)
+        # 1H analiz (engel taraması + likidite hedefi için)
         obs_1h = self._find_order_blocks(df_1h, bias, 50) if df_1h is not None and len(df_1h) >= 20 else []
         fvgs_1h = self._find_fvg(df_1h, 30) if df_1h is not None and len(df_1h) >= 20 else []
+
+        # 1H likidite pool (Draw on Liquidity — daha yakın hedef bulma)
+        liquidity_1h = {"bsl": [], "ssl": [], "nearest_bsl": 0.0, "nearest_ssl": 0.0}
+        if df_1h is not None and len(df_1h) >= 20:
+            sh_1h, sl_1h = self._find_swing_points(df_1h, lookback=self.params.get("swing_lookback", 5))
+            liquidity_1h = self._find_liquidity_pools(sh_1h, sl_1h, current_price)
 
         pd_zone = self._calculate_premium_discount(sh_15m, sl_15m, current_price)
 
@@ -1065,11 +1071,19 @@ class ICTStrategy:
 
             if bias == "LONG":
                 sl = zone["low"] - (zone["high"] - zone["low"]) * 0.2
-                tp = liquidity["nearest_bsl"] if liquidity["nearest_bsl"] > entry else entry * 1.02
+                # Draw on Liquidity: 15m ve 1H'dan en yakın BSL
+                tp_15m = liquidity["nearest_bsl"] if liquidity["nearest_bsl"] > entry else 0
+                tp_1h = liquidity_1h["nearest_bsl"] if liquidity_1h["nearest_bsl"] > entry else 0
+                candidates = [t for t in [tp_15m, tp_1h] if t > 0]
+                tp = min(candidates) if candidates else entry * 1.02  # En yakın likidite hedefi
                 in_correct_zone = pd_zone["zone"] in ("DISCOUNT", "DEEP_DISCOUNT")
             else:
                 sl = zone["high"] + (zone["high"] - zone["low"]) * 0.2
-                tp = liquidity["nearest_ssl"] if liquidity["nearest_ssl"] > 0 and liquidity["nearest_ssl"] < entry else entry * 0.98
+                # Draw on Liquidity: 15m ve 1H'dan en yakın SSL
+                tp_15m = liquidity["nearest_ssl"] if liquidity["nearest_ssl"] > 0 and liquidity["nearest_ssl"] < entry else 0
+                tp_1h = liquidity_1h["nearest_ssl"] if liquidity_1h["nearest_ssl"] > 0 and liquidity_1h["nearest_ssl"] < entry else 0
+                candidates = [t for t in [tp_15m, tp_1h] if t > 0]
+                tp = max(candidates) if candidates else entry * 0.98  # En yakın likidite hedefi (SHORT: en yüksek = en yakın)
                 in_correct_zone = pd_zone["zone"] in ("PREMIUM", "DEEP_PREMIUM")
 
             # Min/Max SL kontrolü
