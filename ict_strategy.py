@@ -684,8 +684,8 @@ class ICTStrategy:
         lows = df["low"].values
         volumes = df["volume"].values if "volume" in df.columns else None
 
-        min_body_ratio = self.params.get("displacement_min_body_ratio", 0.50)
-        atr_multiplier = self.params.get("displacement_atr_multiplier", 1.3)
+        min_body_ratio = self.params.get("displacement_min_body_ratio", 0.55)
+        atr_multiplier = self.params.get("displacement_atr_multiplier", 1.5)
 
         search_start = max(after_index, len(df) - 20)
 
@@ -891,8 +891,10 @@ class ICTStrategy:
             result["obstacles"] = obstacles
             result["obstacle_distance_pct"] = obstacles[0]["pct_of_tp_distance"]
 
+            # v4.4: Sadece çok yakın engellerde TP ayarla (%15 içinde)
+            # Önceki %30 eşiği TP'yi aşırı daraltıyordu → RR düşüyordu
             first_obstacle = obstacles[0]
-            if first_obstacle["pct_of_tp_distance"] < 30:
+            if first_obstacle["pct_of_tp_distance"] < 15:
                 buffer = tp_distance * 0.02
                 if bias == "LONG":
                     result["adjusted_tp"] = first_obstacle["price"] - buffer
@@ -1261,7 +1263,7 @@ class ICTStrategy:
             })
 
         # Sıralama: RR >= min_rr önce, sonra confluence, sonra fiyata yakınlık
-        _min_rr = self.params.get("min_rr_ratio", 1.4)
+        _min_rr = self.params.get("min_rr_ratio", 2.0)
         pois.sort(key=lambda p: (
             -(1 if p["rr"] >= _min_rr else 0),
             -p["confluence_count"],
@@ -1285,7 +1287,7 @@ class ICTStrategy:
           B) MSS (Micro Structure Shift)
           C) Displacement (2-3 ardışık güçlü mum)
         
-        RR >= min_rr_ratio (config, default 1.4) zorunlu. Tek dev mum (>3x ATR) = REDDET.
+        RR >= min_rr_ratio (config, default 2.0) zorunlu. Tek dev mum (>3x ATR) = REDDET.
         
         Args:
             proximity_pct: POI zone'a yakınlık eşiği.
@@ -1312,7 +1314,7 @@ class ICTStrategy:
 
         min_sl_pct = self.params.get("min_sl_distance_pct", 0.008)
         max_sl_pct = self.params.get("max_sl_distance_pct", 0.025)
-        min_rr = self.params.get("min_rr_ratio", 1.4)
+        min_rr = self.params.get("min_rr_ratio", 2.0)
 
         # === TRIGGER A: Sweep + Rejection ===
         sh_15m, sl_15m = self._find_swing_points(df_15m, lookback=3)
@@ -1481,7 +1483,7 @@ class ICTStrategy:
             return None
 
         # RR filtresi (config'den)
-        _min_rr = self.params.get("min_rr_ratio", 1.4)
+        _min_rr = self.params.get("min_rr_ratio", 2.0)
         valid_pois = [p for p in pois if p["rr"] >= _min_rr]
         if not valid_pois:
             return None
@@ -1493,6 +1495,14 @@ class ICTStrategy:
         if narrative.get("quality") == "WEAK" and df_4h is not None:
             entry_est = best_poi.get("entry", current_price)
             tp_est = best_poi.get("tp", 0)
+            
+            # v4.4: WEAK quality'de RR minimum 2.5 olmalı (extra güvenlik)
+            if best_poi["rr"] < 2.5:
+                logger.debug(
+                    f"⚠️ {symbol}: 1H fallback ({bias}) RR={best_poi['rr']:.1f} < 2.5 — düşük kalite, skip"
+                )
+                return None
+            
             if tp_est > 0 and self._check_4h_obstacle_for_fallback(
                 df_4h, bias, entry_est, tp_est
             ):

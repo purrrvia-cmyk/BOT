@@ -401,9 +401,9 @@ class TradeManager:
         """
         ACTIVE sinyal SL/TP takibi + Breakeven/Trailing SL.
 
-        v4.0 SL Yönetimi (2 aşama):
-          %50 TP → Breakeven (SL entry'ye)
-          %75 TP → Trailing (SL kârın %50'sine)
+        v4.4 SL Yönetimi (2 aşama — eşikler yükseltildi):
+          %65 TP → Breakeven (SL entry + %0.3 buffer)
+          %85 TP → Trailing (SL kârın %50'sine)
         """
         symbol = signal["symbol"]
         result = {
@@ -551,8 +551,9 @@ class TradeManager:
         """
         LONG: Yapısal SL yönetimi.
 
-        %50 TP mesafesi → Breakeven (SL = entry + buffer)
-        %75 TP mesafesi → Trailing (SL = entry + kârın %50'si)
+        v4.4: BE ve Trailing eşikleri yükseltildi (kazananların kaçmasını önle)
+        %65 TP mesafesi → Breakeven (SL = entry + %0.3 buffer)
+        %85 TP mesafesi → Trailing (SL = entry + kârın %50'si)
         """
         total_distance = take_profit - entry_price
         current_progress = current_price - entry_price
@@ -561,8 +562,8 @@ class TradeManager:
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %75+ → Trailing SL (kârın %50'si)
-            if progress_pct >= 0.75:
+            # %85+ → Trailing SL (kârın %50'si)
+            if progress_pct >= 0.85:
                 trailing = entry_price + (current_progress * 0.50)
                 prev_trailing = state.get("trailing_sl")
                 if prev_trailing is None or trailing > prev_trailing:
@@ -574,12 +575,12 @@ class TradeManager:
                 # Breakeven da aktif olmalı
                 if not state.get("breakeven_moved"):
                     state["breakeven_moved"] = True
-                    state["breakeven_sl"] = entry_price * 1.001
+                    state["breakeven_sl"] = entry_price * 1.003
 
-            # %50+ → Breakeven
-            elif progress_pct >= 0.50 and not state.get("breakeven_moved"):
+            # %65+ → Breakeven
+            elif progress_pct >= 0.65 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
-                be_sl = entry_price * 1.001  # Entry + %0.1 buffer
+                be_sl = entry_price * 1.003  # Entry + %0.3 buffer
                 state["breakeven_sl"] = be_sl
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {be_sl:.6f} ({progress_pct:.0%})")
 
@@ -596,8 +597,9 @@ class TradeManager:
         """
         SHORT: Yapısal SL yönetimi.
 
-        %50 TP mesafesi → Breakeven (SL = entry - buffer)
-        %75 TP mesafesi → Trailing (SL = entry - kârın %50'si)
+        v4.4: BE ve Trailing eşikleri yükseltildi
+        %65 TP mesafesi → Breakeven (SL = entry - %0.3 buffer)
+        %85 TP mesafesi → Trailing (SL = entry - kârın %50'si)
         """
         total_distance = entry_price - take_profit
         current_progress = entry_price - current_price
@@ -606,8 +608,8 @@ class TradeManager:
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %75+ → Trailing SL
-            if progress_pct >= 0.75:
+            # %85+ → Trailing SL
+            if progress_pct >= 0.85:
                 trailing = entry_price - (current_progress * 0.50)
                 prev_trailing = state.get("trailing_sl")
                 if prev_trailing is None or trailing < prev_trailing:
@@ -618,12 +620,12 @@ class TradeManager:
 
                 if not state.get("breakeven_moved"):
                     state["breakeven_moved"] = True
-                    state["breakeven_sl"] = entry_price * 0.999
+                    state["breakeven_sl"] = entry_price * 0.997
 
-            # %50+ → Breakeven
-            elif progress_pct >= 0.50 and not state.get("breakeven_moved"):
+            # %65+ → Breakeven
+            elif progress_pct >= 0.65 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
-                be_sl = entry_price * 0.999  # Entry - %0.1 buffer
+                be_sl = entry_price * 0.997  # Entry - %0.3 buffer
                 state["breakeven_sl"] = be_sl
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {be_sl:.6f} ({progress_pct:.0%})")
 
