@@ -63,27 +63,50 @@ logger = logging.getLogger("ICT-Bot.Optimizer")
 
 class SelfOptimizer:
     """
-    SMC Parameter Optimizer v4.0 — Narrative → POI → Trigger Threshold Optimizer.
+    SMC Parameter Optimizer v4.1 — Target-Based Adaptive Optimizer.
 
     WON/LOST işlem verilerinden öğrenerek ICT strateji motorunun
     geometrik ve hacimsel eşik değerlerini otomatik optimize eder.
 
-    v4.0: Gate sistemi kaldırıldı → 3 katmanlı bağlamsal mimari.
-    Perakende gösterge ve puanlama sıfır.
+    v4.1 FARKLAR (v4.0'dan):
+      1. TARGET-BASED: Tüm koşullar hedef WR (%55) bazlı
+      2. COMPONENT-AWARE: Hangi trigger tipi kötü ise o katman öncelikli
+      3. MAX 4 CHANGE: Döngü başına max 4 parametre değişir
+      4. ROLLBACK: Son değişiklik WR'yi düşürdüyse geri alınır
+      5. PRIORITY: Parametreler etki büyüklüğüne göre sıralanır
 
-    Optimize edilen katmanlar:
-      Trigger  → displacement kalitesi (body ratio, ATR mult, size)
-      Narrative → BOS kırılım hassasiyeti
-      POI      → FVG, OB, Likidite, confluence mesafe
-      Risk     → SL fallback, min RR
+    Mimari:
+      1. Bileşen performansını analiz et (SWEEP %47, MSS %33, DISP %100)
+      2. Kötü bileşenlere ait parametreleri önceliklendir
+      3. Rollback kontrolü (son değişiklik kötüleştirdi mi?)
+      4. Hedef-adaptif adım hesapla (hedefe uzaksa büyük, yakınsa küçük)
+      5. Max 4 en öncelikli parametreyi değiştir
 
-    Akış:
-      1. Son kapanmış işlemleri çek (batch)
-      2. WON ve LOST havuzlarını ayrıştır
-      3. Her katman için veri odaklı analiz yap
-      4. Eşik değerlerini küçük adımlarla ayarla
-      5. Her değişikliği logla ve izle
+    Bileşen → Parametre İlişkisi:
+      SWEEP/REJECTION → liquidity_equal_tolerance, swing_lookback
+      MSS            → bos_min_displacement, ob_body_ratio_min
+      DISPLACEMENT   → displacement_*, fvg_*
+      HTF_BIAS       → bos_min_displacement, swing_lookback
+      POI_ZONE       → poi_max_distance_pct, ob_max_age_candles, fvg_max_age_candles
+      (Risk)         → default_sl_pct, min_rr_ratio
     """
+
+    # ═══════════════════════════════════════════════════════════
+    #  BİLEŞEN → PARAMETRE HARİTASI
+    #  Hangi bileşen kötüyse hangi parametreler optimize edilecek
+    # ═══════════════════════════════════════════════════════════
+
+    COMPONENT_PARAM_MAP = {
+        "SWEEP": ["liquidity_equal_tolerance", "swing_lookback"],
+        "REJECTION": ["liquidity_equal_tolerance", "displacement_min_body_ratio"],
+        "MSS": ["bos_min_displacement", "ob_body_ratio_min", "swing_lookback"],
+        "DISPLACEMENT": ["displacement_min_body_ratio", "displacement_atr_multiplier", "displacement_min_size_pct"],
+        "HTF_BIAS": ["bos_min_displacement", "swing_lookback"],
+        "POI_ZONE": ["poi_max_distance_pct", "ob_max_age_candles", "fvg_max_age_candles", "fvg_min_size_pct"],
+    }
+
+    # Her döngüde max kaç parametre değişebilir
+    MAX_CHANGES_PER_CYCLE = 4
 
     # ═══════════════════════════════════════════════════════════
     #  PARAMETRE REJİSTRİSİ
@@ -185,7 +208,10 @@ class SelfOptimizer:
         self.min_trades = OPTIMIZER_CONFIG.get("min_trades_for_optimization", 20)
         self.target_win_rate = OPTIMIZER_CONFIG.get("win_rate_target", 0.55)
         self._last_trade_count = 0
-        logger.info("SMC Parameter Optimizer v4.0 başlatıldı — Narrative → POI → Trigger")
+        # Rollback tracking: son optimizasyon anındaki WR
+        self._last_optimization_wr = None
+        self._last_optimization_changes = []
+        logger.info("SMC Parameter Optimizer v4.1 başlatıldı — Target-Based Adaptive Optimization")
 
     # ═══════════════════════════════════════════════════════════
     #  BAŞLANGIÇ GÜVENLİK KONTROLÜ
@@ -236,19 +262,15 @@ class SelfOptimizer:
         """
         Ana optimizasyon döngüsü — app.py tarafından her 30dk çağrılır.
 
-        Adımlar:
+        v4.1 Akış:
           1. Yeterli veri kontrolü (min 20 kapanmış işlem)
-          2. WON/LOST havuzu oluştur + istatistikler hesapla
-          3. Displacement parametreleri optimize et (Trigger)
-          4. FVG parametreleri optimize et (POI)
-          5. Likidite parametreleri optimize et (POI)
-          6. Yapısal parametreler optimize et (OB, swing)
-          7. Risk parametreleri optimize et (SL, RR)
-          8. POI confluence parametreleri optimize et
-          9. Narrative parametreleri optimize et
-          10. Seans, HTF bias bilgi analizi
+          2. ROLLBACK: Son değişiklikler WR'yi düşürdüyse geri al
+          3. BİLEŞEN ANALİZİ: Hangi trigger tipi kaybettiriyor?
+          4. ÖNCELİKLEME: Kötü bileşenlere ait parametreler önce
+          5. TÜM parametreleri hesapla ama MAX 4 UYGULANIR
+          6. Seans/HTF bilgi analizi
         """
-        logger.info("🔄 SMC Optimizer v4.0 — Optimizasyon döngüsü başlatılıyor...")
+        logger.info("🔄 SMC Optimizer v4.1 — Optimizasyon döngüsü başlatılıyor...")
 
         stats = get_performance_summary()
         total_trades = stats["total_trades"]
@@ -282,66 +304,54 @@ class SelfOptimizer:
 
         changes = []
 
-        # ═══ ACİL MOD: %0 WR + 3+ kayıp ═══
+        # ═══ ADIM 1: ROLLBACK KONTROLÜ ═══
+        rollback_changes = self._check_rollback(pool, stats)
+        changes.extend(rollback_changes)
+
+        # ═══ ADIM 2: ACİL MOD (%0 WR + 3+ kayıp) ═══
         if pool["win_rate"] == 0 and len(pool["losers"]) >= 3:
             emergency = self._emergency_mode(pool, stats)
             changes.extend(emergency)
 
-        # ═══ OPTİMİZASYON ADIMLARI ═══
-        already_changed = {c["param"] for c in changes}
+        # Rollback veya acil mod aktifse normal optimizasyonu atla
+        if changes:
+            self._post_optimization(changes, pool, stats, total_trades)
+            return {
+                "status": "COMPLETED",
+                "total_trades_analyzed": total_trades,
+                "win_rate": stats["win_rate"],
+                "changes": changes,
+            }
 
-        # 1. Displacement parametreleri (Trigger katmanı)
-        disp_changes = self._optimize_displacement(pool, stats, already_changed)
-        changes.extend(disp_changes)
-        already_changed.update(c["param"] for c in disp_changes)
+        # ═══ ADIM 3: BİLEŞEN PERFORMANS ANALİZİ ═══
+        comp_perf = get_component_performance()
+        priority_params = self._get_priority_params(comp_perf, pool)
 
-        # 2. FVG parametreleri (POI katmanı)
-        fvg_changes = self._optimize_fvg(pool, stats, already_changed)
-        changes.extend(fvg_changes)
-        already_changed.update(c["param"] for c in fvg_changes)
+        logger.info(f"📊 Bileşen bazlı öncelik sırası: {[p['param'] for p in priority_params[:6]]}")
 
-        # 3. Likidite parametreleri (POI katmanı)
-        liq_changes = self._optimize_liquidity(pool, stats, already_changed)
-        changes.extend(liq_changes)
-        already_changed.update(c["param"] for c in liq_changes)
+        # ═══ ADIM 4: TÜM DEĞİŞİKLİKLERİ HESAPLA ═══
+        already_changed = set()
+        all_candidates = []
 
-        # 4. Yapısal parametreler (OB, swing)
-        struct_changes = self._optimize_structural(pool, stats, already_changed)
-        changes.extend(struct_changes)
-        already_changed.update(c["param"] for c in struct_changes)
+        # Her katmandan değişiklik adaylarını topla
+        all_candidates.extend(self._optimize_displacement(pool, stats, already_changed))
+        all_candidates.extend(self._optimize_fvg(pool, stats, already_changed))
+        all_candidates.extend(self._optimize_liquidity(pool, stats, already_changed))
+        all_candidates.extend(self._optimize_structural(pool, stats, already_changed))
+        all_candidates.extend(self._optimize_risk(pool, stats, already_changed))
+        all_candidates.extend(self._optimize_poi_confluence(pool, stats, already_changed))
+        all_candidates.extend(self._optimize_narrative(pool, stats, already_changed))
 
-        # 5. Risk parametreleri (SL, RR)
-        risk_changes = self._optimize_risk(pool, stats, already_changed)
-        changes.extend(risk_changes)
-        already_changed.update(c["param"] for c in risk_changes)
+        # ═══ ADIM 5: ÖNCELİKLEME + MAX 4 LİMİT ═══
+        changes = self._select_top_changes(all_candidates, priority_params)
 
-        # 6. POI confluence parametreleri
-        poi_changes = self._optimize_poi_confluence(pool, stats, already_changed)
-        changes.extend(poi_changes)
-        already_changed.update(c["param"] for c in poi_changes)
-
-        # 7. Narrative parametreleri (BOS hassasiyeti)
-        narr_changes = self._optimize_narrative(pool, stats, already_changed)
-        changes.extend(narr_changes)
-
-        # 8. Bilgi analizleri (parametre değiştirmez, sadece loglar)
+        # ═══ ADIM 6: BİLGİ ANALİZLERİ ═══
         self._log_session_analysis(pool)
         self._log_htf_bias_analysis()
+        self._log_component_analysis(comp_perf)
 
         # ═══ SONUÇ ═══
-        if changes:
-            logger.info(
-                f"✅ SMC Optimizasyon tamamlandı: {len(changes)} parametre güncellendi"
-            )
-            for c in changes:
-                logger.info(
-                    f"   → {c['param']}: {c['old']} → {c['new']} "
-                    f"[{c.get('group', '?')}]"
-                )
-        else:
-            logger.info("ℹ️ Optimizasyon: Tüm parametreler optimal aralıkta")
-
-        self._last_trade_count = total_trades
+        self._post_optimization(changes, pool, stats, total_trades)
 
         return {
             "status": "COMPLETED",
@@ -349,6 +359,223 @@ class SelfOptimizer:
             "win_rate": stats["win_rate"],
             "changes": changes,
         }
+
+    def _post_optimization(self, changes, pool, stats, total_trades):
+        """Optimizasyon sonrası: logla ve state'i kaydet."""
+        if changes:
+            logger.info(
+                f"✅ SMC Optimizasyon tamamlandı: {len(changes)} parametre güncellendi "
+                f"(max {self.MAX_CHANGES_PER_CYCLE})"
+            )
+            for c in changes:
+                logger.info(
+                    f"   → {c['param']}: {c['old']} → {c['new']} "
+                    f"[{c.get('group', '?')}] priority={c.get('priority', '?')}"
+                )
+        else:
+            logger.info("ℹ️ Optimizasyon: Tüm parametreler optimal aralıkta veya hedefte")
+
+        # Rollback tracking için state kaydet
+        self._last_optimization_wr = pool["win_rate"]
+        self._last_optimization_changes = [
+            {"param": c["param"], "old": c["old"], "new": c["new"]}
+            for c in changes
+        ]
+        self._last_trade_count = total_trades
+
+    # ═══════════════════════════════════════════════════════════
+    #  ROLLBACK KONTROLÜ
+    # ═══════════════════════════════════════════════════════════
+
+    def _check_rollback(self, pool, stats):
+        """
+        Son optimizasyondan sonra WR düştüyse → değişiklikleri geri al.
+
+        Mantık:
+          - Son opt. WR'si biliniyorsa ve şu anki WR 3+ puan düştüyse
+          - Son değiştirilen parametreleri eski değerlerine döndür
+          - En son 1 döngü geri alınır (zincirleme rollback yok)
+        """
+        changes = []
+
+        if self._last_optimization_wr is None or not self._last_optimization_changes:
+            return changes
+
+        current_wr = pool["win_rate"]
+        last_wr = self._last_optimization_wr
+        wr_drop = last_wr - current_wr
+
+        # WR 3+ puan düştüyse rollback
+        if wr_drop >= 3.0 and len(pool["completed"]) >= self.min_trades + 2:
+            logger.warning(
+                f"🔙 ROLLBACK: WR {last_wr:.1f}% → {current_wr:.1f}% "
+                f"({wr_drop:.1f} puan düşüş) — son {len(self._last_optimization_changes)} "
+                f"değişiklik geri alınıyor"
+            )
+
+            for prev_change in self._last_optimization_changes:
+                param = prev_change["param"]
+                old_val = prev_change["old"]  # Geri dönülecek değer
+                current_val = get_bot_param(param, ICT_PARAMS.get(param))
+
+                reason = (
+                    f"🔙 ROLLBACK: WR {wr_drop:.1f} puan düştü "
+                    f"({last_wr:.1f}%→{current_wr:.1f}%), "
+                    f"{param} {current_val} → {old_val} geri alındı"
+                )
+
+                default_val = ICT_PARAMS.get(param, old_val)
+                save_bot_param(param, old_val, default_val)
+                add_optimization_log(param, current_val, old_val, reason,
+                                     current_wr, current_wr, stats["total_trades"])
+
+                registry = self.PARAM_REGISTRY.get(param, {})
+                changes.append({
+                    "param": param,
+                    "old": current_val,
+                    "new": old_val,
+                    "reason": reason,
+                    "bounds": list(registry.get("bounds", (0, 0))),
+                    "group": registry.get("group", "?"),
+                    "priority": "ROLLBACK",
+                })
+
+                logger.info(f"🔙 {param}: {current_val} → {old_val} (rollback)")
+
+            # Rollback sonrası state temizle (zincirleme rollback engeli)
+            self._last_optimization_wr = None
+            self._last_optimization_changes = []
+
+        return changes
+
+    # ═══════════════════════════════════════════════════════════
+    #  BİLEŞEN BAZLI ÖNCELİKLEME
+    # ═══════════════════════════════════════════════════════════
+
+    def _get_priority_params(self, comp_perf, pool):
+        """
+        Bileşen performansına göre parametreleri önceliklendir.
+
+        Mantık:
+          1. Her bileşenin WR'sini al (SWEEP %47, MSS %33, vb.)
+          2. WR'si en düşük bileşenin parametrelerine en yüksek öncelik ver
+          3. Risk parametreleri her zaman orta öncelikli (her zaman relevant)
+
+        Returns:
+            Sıralı liste: [{"param": "...", "priority_score": float, "reason": "..."}, ...]
+        """
+        target_wr = self.target_win_rate * 100
+        param_priorities = {}
+
+        # Bileşen bazlı öncelikleme
+        for comp_name, comp_data in comp_perf.items():
+            comp_wr = comp_data.get("win_rate", 50)
+            comp_total = comp_data.get("total", 0)
+
+            if comp_total < 3:
+                continue  # Yetersiz veri
+
+            # Hedeften uzaklık = öncelik puanı (yüksek = öncelikli)
+            gap = target_wr - comp_wr  # Pozitif = kötü performans
+
+            # Bu bileşene bağlı parametreleri bul
+            mapped_params = self.COMPONENT_PARAM_MAP.get(comp_name, [])
+            for param in mapped_params:
+                if param not in param_priorities:
+                    param_priorities[param] = {
+                        "param": param,
+                        "priority_score": 0,
+                        "reasons": [],
+                    }
+                # En kötü bileşenin gap'ini kullan (birden fazla bileşen aynı parametreyi etkileyebilir)
+                param_priorities[param]["priority_score"] = max(
+                    param_priorities[param]["priority_score"], gap
+                )
+                param_priorities[param]["reasons"].append(
+                    f"{comp_name}:{comp_wr:.0f}%"
+                )
+
+        # Risk parametreleri her zaman orta öncelik
+        for risk_param in ["default_sl_pct", "min_rr_ratio"]:
+            if risk_param not in param_priorities:
+                param_priorities[risk_param] = {
+                    "param": risk_param,
+                    "priority_score": (target_wr - pool["win_rate"]) * 0.5,
+                    "reasons": ["risk-always-relevant"],
+                }
+
+        # Sırala: en yüksek priority_score en önce
+        sorted_params = sorted(
+            param_priorities.values(),
+            key=lambda x: -x["priority_score"]
+        )
+
+        return sorted_params
+
+    def _select_top_changes(self, all_candidates, priority_params):
+        """
+        Tüm aday değişikliklerden max MAX_CHANGES_PER_CYCLE kadarını seç.
+
+        Seçim kriterleri:
+          1. Bileşen bazlı öncelik sırasına göre (kötü bileşen = yüksek öncelik)
+          2. Aynı bileşenden birden fazla parametre seçme (çeşitlilik)
+          3. Acil mod değişiklikleri her zaman dahil
+        """
+        if not all_candidates:
+            return []
+
+        # Priority map oluştur
+        priority_map = {p["param"]: p["priority_score"] for p in priority_params}
+
+        # Her adaya öncelik puanı ata
+        for candidate in all_candidates:
+            candidate["priority"] = priority_map.get(candidate["param"], 0)
+
+        # Önceliğe göre sırala
+        all_candidates.sort(key=lambda c: -c["priority"])
+
+        # Max limit uygula + grup çeşitliliği sağla
+        selected = []
+        selected_groups = {}
+
+        for candidate in all_candidates:
+            if len(selected) >= self.MAX_CHANGES_PER_CYCLE:
+                break
+
+            group = candidate.get("group", "?")
+            # Aynı gruptan max 2 parametre
+            if selected_groups.get(group, 0) >= 2:
+                continue
+
+            selected.append(candidate)
+            selected_groups[group] = selected_groups.get(group, 0) + 1
+
+        # Seçilen adayları DB'ye kaydet
+        if selected:
+            self._commit_changes(selected)
+            logger.info(
+                f"🎯 {len(all_candidates)} aday değişiklikten {len(selected)} seçildi "
+                f"ve uygulandı (max {self.MAX_CHANGES_PER_CYCLE})"
+            )
+
+        return selected
+
+    def _log_component_analysis(self, comp_perf):
+        """Bileşen performansını logla — optimizer karar gerekçesi."""
+        if not comp_perf:
+            return
+
+        target_wr = self.target_win_rate * 100
+        logger.info("📊 ─── Bileşen Performans Raporu ───")
+        for comp, data in sorted(comp_perf.items(), key=lambda x: x[1].get("win_rate", 0)):
+            wr = data.get("win_rate", 0)
+            total = data.get("total", 0)
+            status = "🔴" if wr < target_wr - 10 else "🟡" if wr < target_wr else "🟢"
+            logger.info(f"   {status} {comp}: WR={wr:.0f}%, {total} işlem")
+            if wr < target_wr - 10 and total >= 3:
+                mapped = self.COMPONENT_PARAM_MAP.get(comp, [])
+                if mapped:
+                    logger.info(f"      → Hedef parametreler: {', '.join(mapped)}")
 
     # ═══════════════════════════════════════════════════════════
     #  VERİ HAVUZU OLUŞTURMA
@@ -426,6 +653,38 @@ class SelfOptimizer:
         }
 
     # ═══════════════════════════════════════════════════════════
+    #  HEDEF BAZLI ADIM HESAPLAMA
+    # ═══════════════════════════════════════════════════════════
+
+    def _calc_adaptive_step(self, current_val, win_rate, direction="up"):
+        """
+        Hedef WR'ye uzaklığa göre adaptif adım hesapla.
+
+        WR hedefe ne kadar uzaksa adım o kadar büyük.
+        WR hedefe yakınsa adım küçük (ince ayar).
+
+        direction: "up" = parametreyi artır, "down" = azalt
+        """
+        target = self.target_win_rate * 100  # 55%
+        gap = target - win_rate  # Pozitif = hedefin altında
+
+        if gap <= 0:
+            # Hedefin üzerinde → küçük adım (gevşetme)
+            intensity = 0.5
+        elif gap <= 5:
+            # Hedefe yakın (50-55%) → normal adım
+            intensity = 1.0
+        elif gap <= 10:
+            # Orta mesafe (45-50%) → büyük adım
+            intensity = 1.5
+        else:
+            # Uzak (< 45%) → agresif adım
+            intensity = 2.0
+
+        step = abs(current_val) * self.learning_rate * intensity
+        return step if direction == "up" else -step
+
+    # ═══════════════════════════════════════════════════════════
     #  1. DISPLACEMENT PARAMETRELERİ (Trigger Katmanı)
     # ═══════════════════════════════════════════════════════════
 
@@ -433,19 +692,22 @@ class SelfOptimizer:
         """
         Displacement kalitesini WON/LOST analizinden öğren.
 
+        v4.1 FARK: Koşullar artık target_win_rate bazlı.
+        WR < hedef (%55) ise optimize et, uzaklığa göre adım büyüklüğü ayarla.
+
         Kararlar:
-        ┌────────────────────────┬──────────────────────────────────┐
-        │ Durum                  │ Aksiyon                          │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ Ort kayıp yüksek +    │ body_ratio ↑  atr_mult ↑        │
-        │ WR düşük               │ → Zayıf momentum filtrelemesi    │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ Hızlı kayıp oranı     │ body_ratio ↑  atr_mult ↑        │
-        │ > %40                  │ → Fake breakout koruması         │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ WR > %70 + yeterli    │ body_ratio ↓  (hafif)            │
-        │ veri                   │ → Daha fazla setup yakala        │
-        └────────────────────────┴──────────────────────────────────┘
+        ┌──────────────────────────┬──────────────────────────────────┐
+        │ Durum                    │ Aksiyon                          │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR < hedef + hızlı kayıp│ body_ratio ↑  atr_mult ↑        │
+        │ yüksek                   │ → Zayıf momentum filtrelemesi    │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR < hedef + ort kayıp  │ body_ratio ↑ size_pct ↑          │
+        │ yüksek                   │ → Displacement boyutu yetersiz   │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR > hedef+10 + yeterli │ body_ratio ↓  (hafif)            │
+        │ veri                     │ → Daha fazla setup yakala        │
+        └──────────────────────────┴──────────────────────────────────┘
         """
         changes = []
 
@@ -455,6 +717,7 @@ class SelfOptimizer:
         avg_loss = pool["avg_loss_pnl"]
         quick_loss_ratio = pool["quick_loss_ratio"]
         win_rate = pool["win_rate"]
+        target_wr = self.target_win_rate * 100  # 55
 
         # ────────────────────────────────────────
         # displacement_min_body_ratio
@@ -463,42 +726,31 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if avg_loss > 1.8 and win_rate < 45:
-                # Displacement gövdesi zayıfmış → sıkılaştır
-                step = current * self.learning_rate * 1.5
+            if win_rate < target_wr and quick_loss_ratio > 0.25:
+                # Hedefin altında + hızlı kayıplar var → displacement gövdesi zayıf
+                step = self._calc_adaptive_step(current, win_rate, "up")
                 new_val = current + step
                 reason = (
-                    f"Fake breakout'larda artış tespit edildi, "
+                    f"WR ({win_rate:.1f}%) hedefin ({target_wr:.0f}%) altında, "
+                    f"hızlı kayıp oranı {quick_loss_ratio:.0%}, "
                     f"displacement_min_body_ratio {current:.2f}'den "
-                    f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.2f}'e güncellendi"
+                    f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.2f}'e güncellendi "
+                    f"(daha güçlü gövde gerekli)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif quick_loss_ratio > 0.40 and win_rate < 50:
-                # Hızlı kayıplar = fake displacement
-                step = current * self.learning_rate * 2.0
-                new_val = current + step
+            elif win_rate >= target_wr + 10 and pool["total"] >= 30:
+                # Hedefin çok üzerinde → hafif gevşet
+                step = self._calc_adaptive_step(current, win_rate, "up") * 0.3
+                new_val = current - abs(step)
                 reason = (
-                    f"Hızlı kayıp oranı yüksek ({quick_loss_ratio:.0%}), "
-                    f"displacement_min_body_ratio {current:.2f}'den "
-                    f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.2f}'e güncellendi"
-                )
-                change = self._apply_change(param, current, new_val, reason, stats)
-                if change:
-                    changes.append(change)
-
-            elif win_rate > 70 and pool["total"] >= 30:
-                # WR çok iyi → hafif gevşet (daha fazla setup yakalansın)
-                step = current * self.learning_rate * 0.5
-                new_val = current - step
-                reason = (
-                    f"Win rate yüksek ({win_rate:.1f}%), "
+                    f"WR yüksek ({win_rate:.1f}%), "
                     f"displacement_min_body_ratio {current:.2f}'den "
                     f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.2f}'e gevşetildi"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -509,30 +761,31 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if quick_loss_ratio > 0.35 and win_rate < 50:
-                # Hızlı kayıplar → displacement momentum yetersiz
-                step = current * self.learning_rate
+            if win_rate < target_wr and quick_loss_ratio > 0.20:
+                # Hedefin altında + hızlı kayıplar → momentum yetersiz
+                step = self._calc_adaptive_step(current, win_rate, "up")
                 new_val = current + step
                 reason = (
-                    f"Hızlı kayıp oranı {quick_loss_ratio:.0%}, "
+                    f"WR ({win_rate:.1f}%) hedefin altında, "
+                    f"hızlı kayıp oranı {quick_loss_ratio:.0%}, "
                     f"displacement_atr_multiplier {current:.2f}'den "
                     f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.2f}'e güncellendi "
                     f"(daha güçlü momentum gerekli)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif win_rate > 65 and avg_loss < 1.0:
-                # İyi performans, hafif gevşet
-                step = current * self.learning_rate * 0.5
-                new_val = current - step
+            elif win_rate >= target_wr + 10 and avg_loss < 1.0:
+                # Hedefin çok üzerinde → gevşet
+                step = self._calc_adaptive_step(current, win_rate, "up") * 0.3
+                new_val = current - abs(step)
                 reason = (
-                    f"İyi performans (WR: {win_rate:.1f}%, ort kayıp: {avg_loss:.2f}%), "
+                    f"WR yüksek ({win_rate:.1f}%), ort kayıp düşük ({avg_loss:.2f}%), "
                     f"displacement_atr_multiplier {current:.2f}'den "
                     f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.2f}'e gevşetildi"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -543,29 +796,28 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if avg_loss > 2.0 and win_rate < 40:
-                # Yüksek kayıp + düşük WR → displacement boyutu yetersiz
-                step = current * self.learning_rate * 1.5
+            if win_rate < target_wr and avg_loss > 1.0:
+                # Hedefin altında + kayıplar büyük → displacement boyutu yetersiz
+                step = self._calc_adaptive_step(current, win_rate, "up")
                 new_val = current + step
                 reason = (
-                    f"Yüksek ort. kayıp ({avg_loss:.2f}%) ve düşük WR ({win_rate:.1f}%), "
+                    f"WR ({win_rate:.1f}%) hedefin altında, ort kayıp {avg_loss:.2f}%, "
                     f"displacement_min_size_pct {current:.4f}'den "
                     f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.4f}'e güncellendi"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif win_rate > 65 and pool["total"] >= 25:
-                # Performans iyi → hafif gevşet
-                step = current * self.learning_rate * 0.5
-                new_val = current - step
+            elif win_rate >= target_wr + 10 and pool["total"] >= 25:
+                step = self._calc_adaptive_step(current, win_rate, "up") * 0.3
+                new_val = current - abs(step)
                 reason = (
                     f"WR iyi ({win_rate:.1f}%), "
                     f"displacement_min_size_pct {current:.4f}'den "
                     f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.4f}'e gevşetildi"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -579,20 +831,21 @@ class SelfOptimizer:
         """
         FVG kalitesini WON/LOST analizinden öğren.
 
+        v4.1 FARK: target_win_rate bazlı koşullar.
+
         Kararlar:
-        ┌────────────────────────┬──────────────────────────────────┐
-        │ Durum                  │ Aksiyon                          │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ Gerçek RR düşük +     │ fvg_min_size_pct ↑               │
-        │ WR düşük               │ → Küçük FVG'leri eleyerek        │
-        │                        │   kaliteyi artır                 │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ RR iyi + WR iyi       │ fvg_min_size_pct ↓ (hafif)       │
-        │                        │ → Daha fazla FVG yakala          │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ WR düşük + veri var    │ fvg_max_age_candles ↓            │
-        │                        │ → Eski FVG'ler güvenilmez        │
-        └────────────────────────┴──────────────────────────────────┘
+        ┌──────────────────────────┬──────────────────────────────────┐
+        │ Durum                    │ Aksiyon                          │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR < hedef               │ fvg_min_size_pct ↑               │
+        │                          │ → Küçük FVG'leri ele             │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR < hedef               │ fvg_max_age_candles ↓            │
+        │                          │ → Eski FVG'ler güvenilmez        │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR > hedef+10            │ fvg_min_size_pct ↓ (hafif)       │
+        │                          │ → Daha fazla FVG yakala          │
+        └──────────────────────────┴──────────────────────────────────┘
         """
         changes = []
 
@@ -601,6 +854,7 @@ class SelfOptimizer:
 
         realized_rr = pool["realized_rr"]
         win_rate = pool["win_rate"]
+        target_wr = self.target_win_rate * 100
 
         # ────────────────────────────────────────
         # fvg_min_size_pct
@@ -609,30 +863,30 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if realized_rr < 1.5 and win_rate < 50:
-                # Düşük RR + düşük WR → küçük FVG'lerden giriyoruz
-                step = current * self.learning_rate * 1.5
+            if win_rate < target_wr:
+                # Hedefin altında → küçük FVG'leri filtrele
+                step = self._calc_adaptive_step(current, win_rate, "up")
                 new_val = current + step
                 reason = (
-                    f"Gerçek RR düşük ({realized_rr:.2f}) ve WR düşük ({win_rate:.1f}%), "
+                    f"WR ({win_rate:.1f}%) hedefin ({target_wr:.0f}%) altında, "
                     f"fvg_min_size_pct {current:.5f}'den "
                     f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.5f}'e güncellendi "
                     f"(daha büyük FVG hedefleme)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif realized_rr > 2.5 and win_rate > 60:
-                # İyi RR + iyi WR → hafif gevşet
-                step = current * self.learning_rate * 0.5
-                new_val = current - step
+            elif win_rate >= target_wr + 10 and realized_rr > 2.0:
+                # Hedefin çok üzerinde + RR iyi → gevşet
+                step = self._calc_adaptive_step(current, win_rate, "up") * 0.3
+                new_val = current - abs(step)
                 reason = (
-                    f"İyi RR ({realized_rr:.2f}) ve WR ({win_rate:.1f}%), "
+                    f"WR iyi ({win_rate:.1f}%) ve RR iyi ({realized_rr:.2f}), "
                     f"fvg_min_size_pct {current:.5f}'den "
                     f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.5f}'e gevşetildi"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -643,16 +897,30 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if win_rate < 40 and pool["total"] >= 20:
-                # Genel WR düşük → eski FVG'leri kısıtla
-                step = max(1, current * self.learning_rate * 0.8)
-                new_val = current - step
+            if win_rate < target_wr and pool["total"] >= 20:
+                # Hedefin altında → eski FVG'leri kısıtla
+                step = max(1, self._calc_adaptive_step(current, win_rate, "up") * 0.5)
+                new_val = current - abs(step)
                 reason = (
-                    f"WR düşük ({win_rate:.1f}%), "
+                    f"WR ({win_rate:.1f}%) hedefin altında, "
                     f"fvg_max_age_candles {int(current)}'den "
-                    f"{max(int(new_val), self.PARAM_REGISTRY[param]['bounds'][0])}'e azaltıldı"
+                    f"{max(int(new_val), self.PARAM_REGISTRY[param]['bounds'][0])}'e azaltıldı "
+                    f"(daha taze FVG hedefleme)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
+                if change:
+                    changes.append(change)
+
+            elif win_rate >= target_wr + 10:
+                # Hedefin üzerinde → eski FVG'leri de dahil et
+                step = max(1, abs(current * self.learning_rate * 0.3))
+                new_val = current + step
+                reason = (
+                    f"WR yüksek ({win_rate:.1f}%), "
+                    f"fvg_max_age_candles {int(current)}'den "
+                    f"{min(int(new_val), self.PARAM_REGISTRY[param]['bounds'][1])}'e genişletildi"
+                )
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -666,16 +934,18 @@ class SelfOptimizer:
         """
         Likidite sweep kalitesini analiz et.
 
+        v4.1 FARK: target_win_rate bazlı koşullar.
+
         Kararlar:
-        ┌────────────────────────┬──────────────────────────────────┐
-        │ Durum                  │ Aksiyon                          │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ Hızlı kayıp > %50 +   │ tolerance ↓                      │
-        │ WR düşük               │ → Sahte sweep'leri ele           │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ WR > %65 + hızlı      │ tolerance ↑ (hafif)              │
-        │ kayıp düşük            │ → Daha fazla seviye yakala       │
-        └────────────────────────┴──────────────────────────────────┘
+        ┌──────────────────────────┬──────────────────────────────────┐
+        │ Durum                    │ Aksiyon                          │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR < hedef + hızlı kayıp │ tolerance ↓                      │
+        │                          │ → Sahte sweep'leri ele           │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR > hedef+10            │ tolerance ↑ (hafif)              │
+        │                          │ → Daha fazla seviye yakala       │
+        └──────────────────────────┴──────────────────────────────────┘
         """
         changes = []
 
@@ -684,6 +954,7 @@ class SelfOptimizer:
 
         quick_loss_ratio = pool["quick_loss_ratio"]
         win_rate = pool["win_rate"]
+        target_wr = self.target_win_rate * 100
 
         # ────────────────────────────────────────
         # liquidity_equal_tolerance
@@ -692,31 +963,32 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if quick_loss_ratio > 0.50 and win_rate < 45:
-                # Çok fazla hızlı kayıp → sahte sweep'ler → tolerans sıkılaştır
-                step = current * self.learning_rate
-                new_val = current - step  # Tolerans küçült = daha hassas seviye
+            if win_rate < target_wr and quick_loss_ratio > 0.20:
+                # Hedefin altında + hızlı kayıplar → sahte sweep'ler
+                step = self._calc_adaptive_step(current, win_rate, "up")
+                new_val = current - abs(step)  # Tolerans küçült = daha hassas
                 reason = (
-                    f"Hızlı kayıp oranı {quick_loss_ratio:.0%} ve WR {win_rate:.1f}%, "
+                    f"WR ({win_rate:.1f}%) hedefin altında, "
+                    f"hızlı kayıp oranı {quick_loss_ratio:.0%}, "
                     f"liquidity_equal_tolerance {current:.5f}'den "
                     f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.5f}'e "
                     f"sıkılaştırıldı (sahte sweep filtresi)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif win_rate > 65 and quick_loss_ratio < 0.15:
-                # Sweep tespiti çok iyi → hafif gevşet
-                step = current * self.learning_rate * 0.5
-                new_val = current + step
+            elif win_rate >= target_wr + 10 and quick_loss_ratio < 0.15:
+                # Hedefin çok üzerinde → hafif gevşet
+                step = self._calc_adaptive_step(current, win_rate, "up") * 0.3
+                new_val = current + abs(step)
                 reason = (
-                    f"Sweep kalitesi iyi (WR: {win_rate:.1f}%, hızlı kayıp: {quick_loss_ratio:.0%}), "
+                    f"WR yüksek ({win_rate:.1f}%), hızlı kayıp düşük ({quick_loss_ratio:.0%}), "
                     f"liquidity_equal_tolerance {current:.5f}'den "
                     f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.5f}'e "
                     f"gevşetildi (daha fazla seviye)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -730,19 +1002,18 @@ class SelfOptimizer:
         """
         Order Block ve swing noktası parametrelerini optimize et.
 
-        Bu parametreler POI katmanına dolaylı bağlıdır — yapısal
-        veri hazırlığının kalitesini belirler.
+        v4.1 FARK: target_win_rate bazlı koşullar.
 
         Kararlar:
-        ┌────────────────────────┬──────────────────────────────────┐
-        │ Durum                  │ Aksiyon                          │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ WR < %40               │ ob_body ↑, ob_age ↓, swing ↑    │
-        │                        │ → Daha kaliteli yapısal veri     │
-        ├────────────────────────┼──────────────────────────────────┤
-        │ WR > %65               │ ob_body ↓ (hafif)                │
-        │                        │ → Daha fazla yapı belirlensin    │
-        └────────────────────────┴──────────────────────────────────┘
+        ┌──────────────────────────┬──────────────────────────────────┐
+        │ Durum                    │ Aksiyon                          │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR < hedef               │ ob_body ↑, ob_age ↓, swing ↑    │
+        │                          │ → Daha kaliteli yapısal veri     │
+        ├──────────────────────────┼──────────────────────────────────┤
+        │ WR > hedef+10            │ ob_body ↓ (hafif)                │
+        │                          │ → Daha fazla yapı belirlensin    │
+        └──────────────────────────┴──────────────────────────────────┘
         """
         changes = []
 
@@ -751,6 +1022,7 @@ class SelfOptimizer:
 
         win_rate = pool["win_rate"]
         avg_loss = pool["avg_loss_pnl"]
+        target_wr = self.target_win_rate * 100
 
         # ────────────────────────────────────────
         # ob_body_ratio_min
@@ -759,28 +1031,28 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if win_rate < 40 and pool["total"] >= 20:
-                step = current * self.learning_rate
+            if win_rate < target_wr and pool["total"] >= 20:
+                step = self._calc_adaptive_step(current, win_rate, "up")
                 new_val = current + step
                 reason = (
-                    f"WR düşük ({win_rate:.1f}%), "
+                    f"WR ({win_rate:.1f}%) hedefin ({target_wr:.0f}%) altında, "
                     f"ob_body_ratio_min {current:.2f}'den "
                     f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.2f}'e güncellendi "
                     f"(OB kalite filtresi sıkılaştırıldı)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif win_rate > 65 and pool["total"] >= 20:
-                step = current * self.learning_rate * 0.5
-                new_val = current - step
+            elif win_rate >= target_wr + 10 and pool["total"] >= 20:
+                step = self._calc_adaptive_step(current, win_rate, "up") * 0.3
+                new_val = current - abs(step)
                 reason = (
                     f"WR yüksek ({win_rate:.1f}%), "
                     f"ob_body_ratio_min {current:.2f}'den "
                     f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.2f}'e gevşetildi"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -791,17 +1063,30 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if win_rate < 42 and avg_loss > 1.5:
-                # Düşük WR + yüksek kayıp → eski OB'ler bozulmuş
-                step = max(1, current * self.learning_rate)
-                new_val = current - step
+            if win_rate < target_wr and avg_loss > 0.8:
+                # Hedefin altında → eski OB'leri kısıtla
+                step = max(1, self._calc_adaptive_step(current, win_rate, "up") * 0.3)
+                new_val = current - abs(step)
                 reason = (
-                    f"WR düşük ({win_rate:.1f}%) ve ort kayıp yüksek ({avg_loss:.2f}%), "
+                    f"WR ({win_rate:.1f}%) hedefin altında, ort kayıp {avg_loss:.2f}%, "
                     f"ob_max_age_candles {int(current)}'den "
                     f"{max(int(new_val), self.PARAM_REGISTRY[param]['bounds'][0])}'e "
                     f"azaltıldı (daha taze OB hedefleme)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
+                if change:
+                    changes.append(change)
+
+            elif win_rate >= target_wr + 10:
+                # Hedefin çok üzerinde → gevşet
+                step = max(1, abs(current * self.learning_rate * 0.3))
+                new_val = current + step
+                reason = (
+                    f"WR yüksek ({win_rate:.1f}%), "
+                    f"ob_max_age_candles {int(current)}'den "
+                    f"{min(int(new_val), self.PARAM_REGISTRY[param]['bounds'][1])}'e genişletildi"
+                )
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -812,16 +1097,28 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            # Swing lookback: çok küçük = noise, çok büyük = eski seviyeler
-            if win_rate < 38 and pool["quick_loss_ratio"] > 0.40:
-                # Hızlı kayıplar + düşük WR → swing seviyeleri hassas değil
+            if win_rate < target_wr and pool["quick_loss_ratio"] > 0.25:
+                # Hedefin altında + hızlı kayıplar → swing seviyeleri hassas
                 new_val = current + 1
                 reason = (
-                    f"Hızlı kayıp oranı yüksek ({pool['quick_loss_ratio']:.0%}), "
+                    f"WR ({win_rate:.1f}%) hedefin altında, "
+                    f"hızlı kayıp oranı {pool['quick_loss_ratio']:.0%}, "
                     f"swing_lookback {int(current)}'den {int(new_val)}'e artırıldı "
                     f"(daha güvenilir swing seviyeleri)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
+                if change:
+                    changes.append(change)
+
+            elif win_rate >= target_wr + 10 and current > 4:
+                # Hedefin çok üzerinde + lookback büyük → gevşet
+                new_val = current - 1
+                reason = (
+                    f"WR yüksek ({win_rate:.1f}%), "
+                    f"swing_lookback {int(current)}'den {int(new_val)}'e azaltıldı "
+                    f"(daha fazla swing noktası)"
+                )
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -835,26 +1132,24 @@ class SelfOptimizer:
         """
         SL ve min RR parametrelerini gerçekleşen trade sonuçlarından öğren.
 
-        NOT: v4.0'da SL = sweep wick extreme, TP = opposing liquidity.
-        Bu parametreler sadece FALLBACK olarak kullanılır.
-        Ama gerçekleşen RR ve kayıp büyüklüğünü izleyerek trend gösterir.
+        v4.1 FARK: target_win_rate bazlı koşullar.
 
         Kararlar:
-        ┌─────────────────────────┬─────────────────────────────────┐
-        │ Durum                   │ Aksiyon                         │
-        ├─────────────────────────┼─────────────────────────────────┤
-        │ Kayıp oranı > %60 +    │ default_sl_pct ↑                │
-        │ ort kayıp makul         │ → Noise filtresi genişlet       │
-        ├─────────────────────────┼─────────────────────────────────┤
-        │ Ort kayıp > %2.5       │ default_sl_pct ↓                │
-        │                         │ → SL çok geniş, daralt          │
-        ├─────────────────────────┼─────────────────────────────────┤
-        │ Gerçek RR < 1.2 +      │ min_rr_ratio ↓                  │
-        │ WR > %55                │ → Daha fazla setup yakala       │
-        ├─────────────────────────┼─────────────────────────────────┤
-        │ WR < %40 + RR < 1.5    │ min_rr_ratio ↑                  │
-        │                         │ → Kalite filtresi sıkılaştır    │
-        └─────────────────────────┴─────────────────────────────────┘
+        ┌──────────────────────────┬─────────────────────────────────┐
+        │ Durum                    │ Aksiyon                         │
+        ├──────────────────────────┼─────────────────────────────────┤
+        │ WR < hedef + kayıp       │ default_sl_pct ↑                │
+        │ ort SL'den küçük         │ → Noise SL tetikliyor           │
+        ├──────────────────────────┼─────────────────────────────────┤
+        │ WR < hedef + kayıp büyük │ default_sl_pct ↓                │
+        │                          │ → SL çok geniş                  │
+        ├──────────────────────────┼─────────────────────────────────┤
+        │ WR < hedef + RR düşük    │ min_rr_ratio ↑                  │
+        │                          │ → Kalite filtresi sıkılaştır    │
+        ├──────────────────────────┼─────────────────────────────────┤
+        │ WR > hedef + RR düşük    │ min_rr_ratio ↓                  │
+        │                          │ → Daha fazla setup yakala       │
+        └──────────────────────────┴─────────────────────────────────┘
         """
         changes = []
 
@@ -865,6 +1160,7 @@ class SelfOptimizer:
         avg_loss = pool["avg_loss_pnl"]
         win_rate = pool["win_rate"]
         realized_rr = pool["realized_rr"]
+        target_wr = self.target_win_rate * 100
 
         if avg_win <= 0 or avg_loss <= 0:
             return changes
@@ -879,30 +1175,31 @@ class SelfOptimizer:
             current = get_bot_param(param, ICT_PARAMS[param])
             sl_as_pct = current * 100  # 0.012 → 1.2%
 
-            if loss_rate > 0.60 and avg_loss < sl_as_pct * 0.9:
-                # Çok sık kayıp AMA kayıplar SL'den küçük → noise tetikliyor
-                step = current * self.learning_rate
+            if win_rate < target_wr and avg_loss < sl_as_pct * 0.8:
+                # Hedefin altında + kayıplar SL'den küçük → noise tetikliyor
+                step = self._calc_adaptive_step(current, win_rate, "up")
                 new_val = current + step
                 reason = (
-                    f"Kayıp oranı yüksek ({loss_rate:.0%}) ama ort kayıp makul ({avg_loss:.2f}%), "
+                    f"WR ({win_rate:.1f}%) hedefin altında, "
+                    f"ort kayıp ({avg_loss:.2f}%) SL'den küçük → noise koruması, "
                     f"default_sl_pct {current:.4f}'den "
-                    f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.4f}'e "
-                    f"genişletildi (noise filtresi)"
+                    f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.4f}'e genişletildi"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif avg_loss > 2.5 and win_rate < 45:
-                # Ort kayıp çok büyük → SL çok geniş
-                step = current * self.learning_rate
-                new_val = current - step
+            elif win_rate < target_wr and avg_loss > sl_as_pct * 1.2:
+                # Hedefin altında + kayıplar SL'den büyük → SL çok geniş
+                step = self._calc_adaptive_step(current, win_rate, "up")
+                new_val = current - abs(step)
                 reason = (
-                    f"Ort kayıp çok yüksek ({avg_loss:.2f}%), "
+                    f"WR ({win_rate:.1f}%) hedefin altında, "
+                    f"ort kayıp ({avg_loss:.2f}%) SL'den büyük → SL daraltılıyor, "
                     f"default_sl_pct {current:.4f}'den "
                     f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.4f}'e daraltıldı"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -913,29 +1210,30 @@ class SelfOptimizer:
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if realized_rr < 1.2 and win_rate > 55:
-                # RR düşük ama WR iyi → min RR'yi hafif gevşet, daha fazla setup yakala
+            if win_rate >= target_wr and realized_rr < 1.3:
+                # Hedefin üzerinde ama RR düşük → daha fazla setup yakala
                 new_val = current - 0.1
                 reason = (
-                    f"Gerçek RR düşük ({realized_rr:.2f}) ama WR iyi ({win_rate:.1f}%), "
+                    f"WR iyi ({win_rate:.1f}%) ama RR düşük ({realized_rr:.2f}), "
                     f"min_rr_ratio {current:.2f}'den "
-                    f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.2f}'e gevşetildi "
-                    f"(daha fazla setup)"
+                    f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.2f}'e "
+                    f"gevşetildi (daha fazla setup)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif win_rate < 40 and realized_rr < 1.5:
-                # Hem WR hem RR düşük → kalite filtresi sıkılaştır
-                new_val = current + 0.15
+            elif win_rate < target_wr:
+                # Hedefin altında → RR eşiğini artır (sadece yüksek RR setuplara gir)
+                step = 0.05 + (target_wr - win_rate) / 100  # WR uzaksa daha büyük adım
+                new_val = current + step
                 reason = (
-                    f"WR düşük ({win_rate:.1f}%) ve RR düşük ({realized_rr:.2f}), "
+                    f"WR ({win_rate:.1f}%) hedefin ({target_wr:.0f}%) altında, "
                     f"min_rr_ratio {current:.2f}'den "
                     f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.2f}'e "
-                    f"artırıldı (kalite filtresi)"
+                    f"artırıldı (sadece yüksek RR setuplara gir)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -949,20 +1247,18 @@ class SelfOptimizer:
         """
         POI bölgesi ile fiyat arasındaki mesafe eşiğini optimize et.
 
-        poi_max_distance_pct: Fiyatın POI bölgesine ne kadar yakın
-        olması gerektiğini belirler. Düşük değer = daha hassas,
-        yüksek değer = daha geniş yakalama alanı.
+        v4.1 FARK: target_win_rate bazlı koşullar.
 
         Kararlar:
-        ┌─────────────────────────┬─────────────────────────────────┐
-        │ Durum                   │ Aksiyon                         │
-        ├─────────────────────────┼─────────────────────────────────┤
-        │ WR < %40 + hızlı kayıp │ poi_max_distance_pct ↓          │
-        │ > %40                   │ → POI'ye daha yakın giriş       │
-        ├─────────────────────────┼─────────────────────────────────┤
-        │ WR > %60 + az işlem    │ poi_max_distance_pct ↑ (hafif)  │
-        │ (göreceli)              │ → Daha fazla setup yakala       │
-        └─────────────────────────┴─────────────────────────────────┘
+        ┌──────────────────────────┬─────────────────────────────────┐
+        │ Durum                    │ Aksiyon                         │
+        ├──────────────────────────┼─────────────────────────────────┤
+        │ WR < hedef + hızlı kayıp │ poi_max_distance_pct ↓          │
+        │                          │ → POI'ye daha yakın giriş       │
+        ├──────────────────────────┼─────────────────────────────────┤
+        │ WR > hedef+10            │ poi_max_distance_pct ↑ (hafif)  │
+        │                          │ → Daha fazla setup yakala       │
+        └──────────────────────────┴─────────────────────────────────┘
         """
         changes = []
 
@@ -972,36 +1268,38 @@ class SelfOptimizer:
         win_rate = pool["win_rate"]
         quick_loss_ratio = pool["quick_loss_ratio"]
         realized_rr = pool["realized_rr"]
+        target_wr = self.target_win_rate * 100
 
         param = "poi_max_distance_pct"
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if win_rate < 40 and quick_loss_ratio > 0.40:
-                # POI'den uzak girişler hızlı kayıp veriyor → mesafeyi daralt
-                step = current * self.learning_rate
-                new_val = current - step
+            if win_rate < target_wr and quick_loss_ratio > 0.20:
+                # Hedefin altında + hızlı kayıplar → POI'ye daha yakın gir
+                step = self._calc_adaptive_step(current, win_rate, "up")
+                new_val = current - abs(step)
                 reason = (
-                    f"WR düşük ({win_rate:.1f}%) ve hızlı kayıp yüksek ({quick_loss_ratio:.0%}), "
+                    f"WR ({win_rate:.1f}%) hedefin altında, "
+                    f"hızlı kayıp oranı {quick_loss_ratio:.0%}, "
                     f"poi_max_distance_pct {current:.4f}'den "
                     f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.4f}'e "
                     f"daraltıldı (POI'ye daha yakın giriş)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif win_rate > 60 and realized_rr > 2.0 and pool["total"] < 30:
-                # İyi WR + iyi RR ama az işlem → hafif genişlet
-                step = current * self.learning_rate * 0.5
-                new_val = current + step
+            elif win_rate >= target_wr + 10 and realized_rr > 1.5:
+                # Hedefin çok üzerinde → hafif genişlet
+                step = self._calc_adaptive_step(current, win_rate, "up") * 0.3
+                new_val = current + abs(step)
                 reason = (
-                    f"WR iyi ({win_rate:.1f}%) ve RR iyi ({realized_rr:.2f}) ama az işlem, "
+                    f"WR yüksek ({win_rate:.1f}%), RR iyi ({realized_rr:.2f}), "
                     f"poi_max_distance_pct {current:.4f}'den "
                     f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.4f}'e "
                     f"gevşetildi (daha fazla setup)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -1015,20 +1313,18 @@ class SelfOptimizer:
         """
         BOS (Break of Structure) kırılım hassasiyetini optimize et.
 
-        bos_min_displacement: 4H yapısal kırılımın minimum displacement
-        büyüklüğü. Düşük → daha fazla BOS algılanır (daha fazla sinyal),
-        yüksek → sadece güçlü kırılımlar sayılır (daha az ama kaliteli).
+        v4.1 FARK: target_win_rate bazlı koşullar.
 
         Kararlar:
-        ┌─────────────────────────┬─────────────────────────────────┐
-        │ Durum                   │ Aksiyon                         │
-        ├─────────────────────────┼─────────────────────────────────┤
-        │ WR < %40 + hızlı       │ bos_min_displacement ↑          │
-        │ kayıp yüksek            │ → Sahte BOS'ları filtrele       │
-        ├─────────────────────────┼─────────────────────────────────┤
-        │ WR > %65 + az işlem    │ bos_min_displacement ↓ (hafif)  │
-        │                         │ → Daha fazla narrative yakala   │
-        └─────────────────────────┴─────────────────────────────────┘
+        ┌──────────────────────────┬─────────────────────────────────┐
+        │ Durum                    │ Aksiyon                         │
+        ├──────────────────────────┼─────────────────────────────────┤
+        │ WR < hedef               │ bos_min_displacement ↑          │
+        │                          │ → Sahte BOS'ları filtrele       │
+        ├──────────────────────────┼─────────────────────────────────┤
+        │ WR > hedef+10            │ bos_min_displacement ↓ (hafif)  │
+        │                          │ → Daha fazla narrative yakala   │
+        └──────────────────────────┴─────────────────────────────────┘
         """
         changes = []
 
@@ -1038,36 +1334,37 @@ class SelfOptimizer:
         win_rate = pool["win_rate"]
         quick_loss_ratio = pool["quick_loss_ratio"]
         avg_loss = pool["avg_loss_pnl"]
+        target_wr = self.target_win_rate * 100
 
         param = "bos_min_displacement"
         if param not in already_changed:
             current = get_bot_param(param, ICT_PARAMS[param])
 
-            if win_rate < 40 and quick_loss_ratio > 0.35:
-                # Yanlış narrative → yanlış yön → hızlı kayıp
-                step = current * self.learning_rate * 1.5
+            if win_rate < target_wr:
+                # Hedefin altında → BOS hassasiyetini artır
+                step = self._calc_adaptive_step(current, win_rate, "up")
                 new_val = current + step
                 reason = (
-                    f"WR düşük ({win_rate:.1f}%) ve hızlı kayıp yüksek ({quick_loss_ratio:.0%}), "
+                    f"WR ({win_rate:.1f}%) hedefin ({target_wr:.0f}%) altında, "
                     f"bos_min_displacement {current:.4f}'den "
                     f"{min(new_val, self.PARAM_REGISTRY[param]['bounds'][1]):.4f}'e "
-                    f"artırıldı (sahte BOS filtresi)"
+                    f"artırıldı (daha güçlü BOS gerekli)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
-            elif win_rate > 65 and pool["total"] < 25:
-                # İyi WR ama az işlem → BOS hassasiyetini hafif gevşet
-                step = current * self.learning_rate * 0.5
-                new_val = current - step
+            elif win_rate >= target_wr + 10 and pool["total"] < 30:
+                # Hedefin çok üzerinde ama az işlem → gevşet
+                step = self._calc_adaptive_step(current, win_rate, "up") * 0.3
+                new_val = current - abs(step)
                 reason = (
-                    f"WR iyi ({win_rate:.1f}%) ama az işlem ({pool['total']}), "
+                    f"WR yüksek ({win_rate:.1f}%) ama az işlem ({pool['total']}), "
                     f"bos_min_displacement {current:.4f}'den "
                     f"{max(new_val, self.PARAM_REGISTRY[param]['bounds'][0]):.4f}'e "
                     f"gevşetildi (daha fazla narrative)"
                 )
-                change = self._apply_change(param, current, new_val, reason, stats)
+                change = self._prepare_change(param, current, new_val, reason, stats)
                 if change:
                     changes.append(change)
 
@@ -1199,9 +1496,9 @@ class SelfOptimizer:
     #  YARDIMCI METODLAR
     # ═══════════════════════════════════════════════════════════
 
-    def _apply_change(self, param_name, current_val, new_val, reason, stats):
+    def _prepare_change(self, param_name, current_val, new_val, reason, stats):
         """
-        Parametre değişikliğini güvenli şekilde uygula.
+        Parametre değişikliğini HESAPLA ama KAYDETME (aday oluştur).
 
         Kontroller:
           1. Max değişim limiti (%10)
@@ -1210,7 +1507,7 @@ class SelfOptimizer:
           4. Minimum anlamlı değişiklik (%1)
 
         Returns:
-            dict: Değişiklik bilgisi veya None (uygulanmadıysa)
+            dict: Aday değişiklik bilgisi veya None (geçersizse)
         """
         registry = self.PARAM_REGISTRY.get(param_name)
         if not registry:
@@ -1249,17 +1546,6 @@ class SelfOptimizer:
         elif new_val == current_val:
             return None
 
-        # ── Kaydet ──
-        default_val = ICT_PARAMS.get(param_name, current_val)
-        save_bot_param(param_name, new_val, default_val)
-
-        add_optimization_log(
-            param_name, current_val, new_val, reason,
-            stats["win_rate"], stats["win_rate"], stats["total_trades"]
-        )
-
-        logger.info(f"📊 {param_name}: {current_val} → {new_val} | {reason}")
-
         return {
             "param": param_name,
             "old": current_val,
@@ -1267,7 +1553,42 @@ class SelfOptimizer:
             "reason": reason,
             "bounds": [min_b, max_b],
             "group": registry["group"],
+            "_stats": stats,  # commit sırasında lazım olacak
         }
+
+    def _commit_changes(self, candidates, stats=None):
+        """
+        Seçilmiş aday değişiklikleri DB'ye kaydet.
+
+        Args:
+            candidates: _prepare_change'den dönen aday listesi
+            stats: Performans istatistikleri (yoksa adaydan alınır)
+        """
+        for c in candidates:
+            s = stats or c.get("_stats", {})
+            default_val = ICT_PARAMS.get(c["param"], c["old"])
+            save_bot_param(c["param"], c["new"], default_val)
+            add_optimization_log(
+                c["param"], c["old"], c["new"], c["reason"],
+                s.get("win_rate", 0), s.get("win_rate", 0),
+                s.get("total_trades", 0),
+            )
+            logger.info(f"📊 {c['param']}: {c['old']} → {c['new']} | {c['reason']}")
+            # Temizlik: iç alanı kaldır
+            c.pop("_stats", None)
+
+    def _apply_change(self, param_name, current_val, new_val, reason, stats):
+        """
+        Parametre değişikliğini HEMEN uygula (acil mod / rollback için).
+
+        prepare + commit'i tek çağrıda yapar.
+        Returns:
+            dict: Değişiklik bilgisi veya None
+        """
+        candidate = self._prepare_change(param_name, current_val, new_val, reason, stats)
+        if candidate:
+            self._commit_changes([candidate], stats)
+        return candidate
 
     def _get_last_change_direction(self, param_name):
         """
@@ -1401,7 +1722,7 @@ class SelfOptimizer:
         )
 
         return {
-            "optimizer_version": "4.0 — Narrative → POI → Trigger Threshold Optimizer",
+            "optimizer_version": "4.1 — Target-Based Adaptive Optimizer (Narrative → POI → Trigger)",
             "total_optimizations": len(changed_params),
             "current_win_rate": stats["win_rate"],
             "target_win_rate": self.target_win_rate * 100,
