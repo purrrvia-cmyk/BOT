@@ -84,6 +84,7 @@ FOREX_INSTRUMENTS = {
 }
 
 TF_MAP = {
+    "5m":  {"interval": "5m",  "period": "5d",  "label": "5 Dakika"},
     "15m": {"interval": "15m", "period": "5d",  "label": "15 Dakika"},
     "1h":  {"interval": "1h",  "period": "30d", "label": "1 Saat"},
     "4h":  {"interval": "1h",  "period": "60d", "label": "4 Saat"},
