@@ -57,7 +57,7 @@ ICT_PARAMS = {
     "sl_buffer_pct": 0.01,         # SL buffer wick extreme'den (%1)
     "max_concurrent_trades": 3,    # v4.0: 2→3 eşzamanlı işlem
     "max_same_direction_trades": 2,  # v4.0: 1→2 aynı yönde max işlem
-    "min_sl_distance_pct": 0.008,  # v4.0: %0.5→%0.8 — noise'a yakalanmayı önler
+    "min_sl_distance_pct": 0.010,  # v4.6.3: %0.8→%1.0 — kripto noise koruması
     "signal_cooldown_minutes": 20, # Aynı coinde sinyal arası bekleme
     
     # Displacement (v4.0: 2-3 ardışık mum, tek dev mum REDDEDİLİR)
