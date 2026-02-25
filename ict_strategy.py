@@ -923,6 +923,153 @@ class ICTStrategy:
         return atr > 0 and candle_range > 3 * atr
 
     # =================================================================
+    #  BÖLÜM 1B — OVEREXTENSION + 4H ENGEL KONTROLLERI
+    # =================================================================
+
+    def _check_overextension(self, df_1h, bias: str) -> bool:
+        """
+        1H'da fiyat tek yöne aşırı mı gitmiş? (Geri çekilme olmadan)
+
+        Kripto'da coin %5-10 tek yöne gidip sıfır geri çekilme olmuşsa,
+        o yönde giriş = tepeye/dibe giriş. Düzeltme gelecek.
+
+        Kontrol:
+          - Son 6 adet 1H mumdan en az 5'i aynı yönde mi?
+          - Toplam hareket 1H ATR'nin 3 katından fazla mı?
+          - Hiç anlamlı geri çekilme (ATR'nin %40'ı) yok mu?
+
+        True = overextended (aşırı gitmiş, girme)
+        False = normal, girilebilir
+        """
+        if df_1h is None or len(df_1h) < 10:
+            return False
+
+        atr_1h = self._calc_atr(df_1h, 14)
+        if atr_1h <= 0:
+            return False
+
+        recent = df_1h.tail(6)
+        opens = recent["open"].values
+        closes = recent["close"].values
+        highs = recent["high"].values
+        lows = recent["low"].values
+
+        # Aynı yönde kaç mum var?
+        if bias == "LONG":
+            same_dir = sum(1 for o, c in zip(opens, closes) if c > o)
+        else:
+            same_dir = sum(1 for o, c in zip(opens, closes) if c < o)
+
+        if same_dir < 5:
+            return False  # 6 mumdan 5'i aynı yönde değil → normal
+
+        # Toplam hareket
+        if bias == "LONG":
+            total_move = float(closes[-1]) - float(lows[0])
+        else:
+            total_move = float(highs[0]) - float(closes[-1])
+
+        if total_move < atr_1h * 3:
+            return False  # ATR'nin 3 katından az → normal
+
+        # Geri çekilme var mı? (herhangi bir mumda ATR'nin %40'ı kadar ters hareket)
+        pullback_threshold = atr_1h * 0.4
+        has_pullback = False
+        for i in range(len(opens)):
+            if bias == "LONG":
+                # Yeşil mum serisinde küçük kırmızı mum veya uzun alt fitil
+                wick_down = float(min(opens[i], closes[i])) - float(lows[i])
+                if closes[i] < opens[i] or wick_down > pullback_threshold:
+                    has_pullback = True
+                    break
+            else:
+                wick_up = float(highs[i]) - float(max(opens[i], closes[i]))
+                if closes[i] > opens[i] or wick_up > pullback_threshold:
+                    has_pullback = True
+                    break
+
+        if has_pullback:
+            return False  # Geri çekilme var → sağlıklı hareket
+
+        # 5/6 mum aynı yön + 3x ATR hareket + sıfır geri çekilme = OVEREXTENDED
+        return True
+
+    def _check_4h_obstacle_for_fallback(self, df_4h, bias: str,
+                                         entry: float, tp: float) -> bool:
+        """
+        1H fallback durumunda 4H'da entry→TP yolunda engel var mı?
+
+        4H NEUTRAL olduğunda 1H yön veriyor. Ama 4H'da kocaman bearish
+        FVG veya OB olabilir — fiyat oraya çarpıp geri döner.
+
+        True = 4H'da engel var, girme
+        False = yol temiz
+        """
+        if df_4h is None or len(df_4h) < 20 or entry <= 0 or tp <= 0:
+            return False
+
+        # 4H OB'leri bul (her iki yönde)
+        obs_4h_bull = self._find_order_blocks(df_4h, "LONG", 20)
+        obs_4h_bear = self._find_order_blocks(df_4h, "SHORT", 20)
+        obs_4h = obs_4h_bull + obs_4h_bear
+
+        # 4H FVG'leri bul
+        fvgs_4h = self._find_fvg(df_4h, 15)
+
+        tp_distance = abs(tp - entry)
+        if tp_distance == 0:
+            return False
+
+        if bias == "LONG":
+            # Entry→TP yolunda mitigated olmamış bearish OB/FVG var mı?
+            for ob in obs_4h:
+                if ob["type"] == "BEARISH" and not ob["mitigated"]:
+                    if entry < ob["low"] < tp:
+                        dist_pct = (ob["low"] - entry) / tp_distance * 100
+                        if dist_pct < 60:  # TP yolunun ilk %60'ında
+                            logger.debug(
+                                f"4H engel: BEARISH OB @ {ob['low']:.5f} "
+                                f"(TP yolunun %{dist_pct:.0f}'inde)"
+                            )
+                            return True
+
+            for fvg in fvgs_4h:
+                if fvg["type"] == "BEARISH" and fvg["mitigated"] != "FULL":
+                    if entry < fvg["low"] < tp:
+                        dist_pct = (fvg["low"] - entry) / tp_distance * 100
+                        if dist_pct < 60:
+                            logger.debug(
+                                f"4H engel: BEARISH FVG @ {fvg['low']:.5f} "
+                                f"(TP yolunun %{dist_pct:.0f}'inde)"
+                            )
+                            return True
+
+        elif bias == "SHORT":
+            for ob in obs_4h:
+                if ob["type"] == "BULLISH" and not ob["mitigated"]:
+                    if tp < ob["high"] < entry:
+                        dist_pct = (entry - ob["high"]) / tp_distance * 100
+                        if dist_pct < 60:
+                            logger.debug(
+                                f"4H engel: BULLISH OB @ {ob['high']:.5f} "
+                                f"(TP yolunun %{dist_pct:.0f}'inde)"
+                            )
+                            return True
+
+            for fvg in fvgs_4h:
+                if fvg["type"] == "BULLISH" and fvg["mitigated"] != "FULL":
+                    if tp < fvg["high"] < entry:
+                        dist_pct = (entry - fvg["high"]) / tp_distance * 100
+                        if dist_pct < 60:
+                            logger.debug(
+                                f"4H engel: BULLISH FVG @ {fvg['high']:.5f} "
+                                f"(TP yolunun %{dist_pct:.0f}'inde)"
+                            )
+                            return True
+
+        return False
+
+    # =================================================================
     #  BÖLÜM 2 — KATMAN 1: NARRATIVE (4H Yapı Analizi)
     # =================================================================
 
@@ -1306,6 +1453,17 @@ class ICTStrategy:
 
         # CHoCH artık sinyali engellemez — sadece triggerda kalite düşürür
 
+        # ═══ OVEREXTENSION KONTROLÜ (1H) ═══
+        # Coin tek yöne aşırı gitmişse → sinyali SIGNAL yerine WATCH'a düşür
+        force_watch_overextended = False
+        if df_1h is not None and len(df_1h) >= 10:
+            if self._check_overextension(df_1h, bias):
+                force_watch_overextended = True
+                logger.info(
+                    f"⚠️ {symbol}: 1H overextended ({bias}) — "
+                    f"sinyal WATCH'a düşürülecek"
+                )
+
         # ═══ KATMAN 2: POI TESPİTİ ═══
         pois = self.find_poi_zones(df_15m, df_1h, bias, current_price)
 
@@ -1319,10 +1477,52 @@ class ICTStrategy:
 
         best_poi = valid_pois[0]
 
+        # ═══ 4H ENGEL KONTROLÜ (sadece 1H fallback durumunda) ═══
+        # 4H NEUTRAL idi, 1H yön verdi → ama 4H'da engel var mı?
+        if narrative.get("quality") == "WEAK" and df_4h is not None:
+            entry_est = best_poi.get("entry", current_price)
+            tp_est = best_poi.get("tp", 0)
+            if tp_est > 0 and self._check_4h_obstacle_for_fallback(
+                df_4h, bias, entry_est, tp_est
+            ):
+                logger.info(
+                    f"🚫 {symbol}: 1H fallback ({bias}) ama 4H'da engel var "
+                    f"— sinyal iptal"
+                )
+                return None
+
         # ═══ KATMAN 3: TRIGGER ═══
         trigger = self.check_trigger(df_15m, bias, best_poi, current_price, atr_15m)
 
         if trigger is not None:
+            # Overextended kontrolü: Trigger oluştu ama coin aşırı gitmişse → WATCH
+            if force_watch_overextended:
+                logger.info(
+                    f"⚠️ {symbol} OVEREXTENDED → WATCH'a düşürüldü: "
+                    f"{trigger['direction']} | Entry: {trigger['entry']:.5f}"
+                )
+                return {
+                    "action": "WATCH",
+                    "symbol": symbol,
+                    "direction": trigger["direction"],
+                    "entry_price": trigger["entry"],
+                    "current_price": current_price,
+                    "stop_loss": trigger["sl"],
+                    "take_profit": trigger["tp"],
+                    "rr_ratio": trigger["rr"],
+                    "watch_reason": "1H overextended — geri çekilme bekleniyor",
+                    "quality_tier": "WATCH",
+                    "components": trigger["components"],
+                    "narrative": narrative,
+                    "poi": best_poi,
+                    "trigger_data": trigger,
+                    "atr": atr_15m,
+                    "confidence": 100,
+                    "confluence_score": 100,
+                    "entry_mode": "MARKET",
+                    "timeframe": "15m",
+                }
+
             # TRIGGER OLUŞTU → SIGNAL
             logger.info(
                 f"🎯 {symbol} SIGNAL: {trigger['direction']} | "
