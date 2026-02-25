@@ -44,7 +44,7 @@ logger = logging.getLogger("ICT-Bot.TradeManager")
 
 # ─── SABITLER ────────────────────────────────────────
 MAX_TRADE_DURATION_HOURS = 4      # 15m TF sinyalleri için max yaşam süresi
-WATCH_MAX_CANDLES = 36            # Watchlist max izleme: 36 × 5m = 3 saat
+WATCH_MAX_CANDLES = 12            # Watchlist max izleme: 12 × 5m = 1 saat
 WATCH_TIMEFRAME = "5m"            # Watchlist izleme TF'si
 WATCH_CHECK_INTERVAL_SEC = 60     # Watchlist kontrol aralığı
 
