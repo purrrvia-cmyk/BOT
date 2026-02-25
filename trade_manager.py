@@ -700,9 +700,9 @@ class TradeManager:
             max_watch = item.get("max_watch_candles", WATCH_MAX_CANDLES)
             stored_ts = item.get("last_5m_candle_ts") or ""
 
-            # ── 5m VERİ ÇEK (mum sayımı + SL kontrolü) ──
+            # ── 5m VERİ ÇEK (mum sayımı + SL kontrolü + 5m trigger) ──
             try:
-                df_ltf = data_fetcher.get_candles(symbol, WATCH_TIMEFRAME, 15)
+                df_ltf = data_fetcher.get_candles(symbol, WATCH_TIMEFRAME, 50)
             except Exception as e:
                 logger.debug(f"Watchlist veri hatası ({symbol}): {e}")
                 continue
@@ -770,11 +770,12 @@ class TradeManager:
                 logger.debug(f"{symbol} watchlist item expired: narrative/poi eksik")
                 continue
 
-            # ── TRIGGER KONTROLÜ — check_trigger_for_watch (hafif) ──
+            # ── TRIGGER KONTROLÜ — Dual TF (15m + 5m sniper) ──
             try:
                 df_15m = data_fetcher.get_candles(symbol, "15m", 100)
                 signal_result = strategy_engine.check_trigger_for_watch(
-                    symbol, df_15m, stored_narrative, stored_poi
+                    symbol, df_15m, stored_narrative, stored_poi,
+                    df_5m=df_ltf
                 )
             except Exception as e:
                 logger.debug(f"Watchlist trigger check hatası ({symbol}): {e}")

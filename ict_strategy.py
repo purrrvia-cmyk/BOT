@@ -1387,28 +1387,63 @@ class ICTStrategy:
         return None
 
     # =================================================================
-    #  BÖLÜM 5B — WATCHLIST TRIGGER KONTROLÜ (Hafif)
+    #  BÖLÜM 5B — WATCHLIST TRIGGER KONTROLÜ (Dual TF)
     # =================================================================
+
+    def _check_zone_touched(self, df, bias: str, poi: Dict,
+                            lookback: int = 12) -> bool:
+        """
+        Son N mum içinde herhangi birinin POI zone'a dokunup dokunmadığını kontrol et.
+
+        ICT Prensibi: Trigger'ın anlamlı olabilmesi için fiyatın zone'a
+        DOKUNMUŞ olması gerekir. Zone'a hiç ulaşmamış fiyatta sweep/MSS
+        tespit etmek false positive üretir.
+
+        LONG:  Mumun low'u <= zone_high (zone'a veya içine girdi)
+        SHORT: Mumun high'ı >= zone_low (zone'a veya içine girdi)
+        """
+        zone_high = poi.get("zone_high", 0)
+        zone_low = poi.get("zone_low", 0)
+
+        if not zone_high or not zone_low:
+            return False
+
+        recent = df.tail(min(lookback, len(df)))
+
+        for _, candle in recent.iterrows():
+            low = float(candle.get("low", 0))
+            high = float(candle.get("high", 0))
+
+            if bias == "LONG" and low <= zone_high:
+                return True
+            elif bias == "SHORT" and high >= zone_low:
+                return True
+
+        return False
 
     def check_trigger_for_watch(self, symbol: str, df_15m,
                                 stored_narrative: Dict,
-                                stored_poi: Dict) -> Optional[Dict]:
+                                stored_poi: Dict,
+                                df_5m=None) -> Optional[Dict]:
         """
-        Watchlist item'ı için hafif trigger kontrolü.
-        
-        generate_signal()'den FARKLI:
-          - Narrative tekrar hesaplanmaz (stored kullanılır)
-          - POI tekrar aranmaz (stored kullanılır)
-          - Sadece 15m data ile check_trigger() çağrılır
-          - 4H ve 1H API çağrısı YAPILMAZ → 2 API tasarrufu
-        
-        POI Invalidation:
-          - Fiyat POI zone'unu tamamen geçtiyse → None + "invalidated" flag
-          - CHoCH oluşmuşsa stored_narrative ile tutarsızlık → None
-        
+        Watchlist item'ı için dual-TF trigger kontrolü.
+
+        v4.1 — ICT Sniper Entry yaklaşımı:
+          1. Narrative tekrar hesaplanmaz (stored kullanılır, 4H/1H API tasarrufu)
+          2. POI tekrar aranmaz (stored kullanılır)
+          3. POI invalidation: 2 ardışık 15m close teyitli (%1.2 eşik)
+          4. 15m'de trigger ara (standart — proximity %2.5)
+          5. 15m bulamazsa + 5m zone'a dokunmuşsa → 5m sniper trigger ara
+
+        ICT Prensibi:
+          Institutional order flow POI zone'larda birikir. Fiyat zone'a dokunup
+          yapısal shift verdiğinde (5m MSS/displacement), bu en hassas giriş
+          noktasıdır. 15m'de henüz görünmeyen micro yapılar 5m'de tespit edilir.
+
         Returns:
-            None — trigger yok veya POI invalidate
-            Dict — generate_signal ile aynı SIGNAL formatı
+            None — trigger yok
+            {"_invalidated": True, ...} — POI geçersiz
+            {"action": "SIGNAL", ...} — trigger oluştu, işlem açılacak
         """
         if df_15m is None or len(df_15m) < 20:
             return None
@@ -1432,31 +1467,45 @@ class ICTStrategy:
         if self._is_volatile_candle(last_range, atr_15m):
             return None
 
-        # ── POI İNVALIDATION (%1.2 eşik — kripto noise koruması) ──
+        # ══════════════════════════════════════════════
+        #  POI İNVALIDATION — Close teyitli (%1.2 eşik)
+        # ══════════════════════════════════════════════
+        #
+        # ICT Prensibi: POI zone "kırıldı" demek için tek wick yetmez.
+        # Ardışık 2 mumun KAPANIŞI zone'un ötesinde olmalı.
+        # Tek wick = sweep (giriş fırsatı), ardışık close = zone öldü.
+
         zone_high = stored_poi.get("zone_high", 0)
         zone_low = stored_poi.get("zone_low", 0)
 
-        if bias == "LONG":
-            # Fiyat POI'nin altına düştüyse → zone sweep edildi, artık geçersiz
-            # %1.2 eşik: kriptoda %0.5 wick normal — erken expire engellemek için
-            if current_price < zone_low * 0.988:
-                logger.debug(f"{symbol} WATCH: POI invalidated (fiyat zone altına düştü)")
-                return {"_invalidated": True, "reason": "POI zone aşağı sweep edildi"}
-        elif bias == "SHORT":
-            # Fiyat POI'nin üstüne çıktıysa → zone sweep edildi
-            if current_price > zone_high * 1.012:
-                logger.debug(f"{symbol} WATCH: POI invalidated (fiyat zone üstüne çıktı)")
-                return {"_invalidated": True, "reason": "POI zone yukarı sweep edildi"}
+        recent_closes = [float(row["close"]) for _, row in df_15m.tail(2).iterrows()]
 
-# ── TRIGGER KONTROLÜ (watchlist: geniş proximity %2.5) ──
-            # generate_signal'da %1 proximity kullanılır (trigger henüz oluşuyor)
-            # Watchlist'te fiyat POI'den bounce etmiş olabilir → %2.5 ile kontrol
-            trigger = self.check_trigger(df_15m, bias, stored_poi, current_price, atr_15m,
-                                         proximity_pct=0.025)
+        if bias == "LONG":
+            invalidation_level = zone_low * 0.988
+            if len(recent_closes) >= 2 and all(c < invalidation_level for c in recent_closes):
+                logger.debug(f"{symbol} WATCH: POI invalidated (2 ardışık 15m close zone altında)")
+                return {"_invalidated": True, "reason": "POI aşağı kırıldı (2x close teyit)"}
+        elif bias == "SHORT":
+            invalidation_level = zone_high * 1.012
+            if len(recent_closes) >= 2 and all(c > invalidation_level for c in recent_closes):
+                logger.debug(f"{symbol} WATCH: POI invalidated (2 ardışık 15m close zone üstünde)")
+                return {"_invalidated": True, "reason": "POI yukarı kırıldı (2x close teyit)"}
+
+        # ══════════════════════════════════════════════
+        #  15M TRIGGER KONTROLÜ (Standart)
+        # ══════════════════════════════════════════════
+        #
+        # generate_signal: proximity %1 (trigger anlık oluşuyor)
+        # Watchlist: proximity %2.5 (fiyat bounce etmiş olabilir)
+
+        trigger = self.check_trigger(
+            df_15m, bias, stored_poi, current_price, atr_15m,
+            proximity_pct=0.025
+        )
 
         if trigger is not None:
             logger.info(
-                f"🎯 {symbol} WATCH→SIGNAL: {trigger['direction']} | "
+                f"🎯 {symbol} WATCH→SIGNAL (15m): {trigger['direction']} | "
                 f"Trigger: {trigger['trigger_type']} | "
                 f"Entry: {trigger['entry']:.5f} | "
                 f"SL: {trigger['sl']:.5f} | TP: {trigger['tp']:.5f} | "
@@ -1484,6 +1533,70 @@ class ICTStrategy:
                 "confluence_score": 100,
                 "timeframe": "15m",
             }
+
+        # ══════════════════════════════════════════════
+        #  5M SNİPER TRIGGER KONTROLÜ (ICT LTF Entry)
+        # ══════════════════════════════════════════════
+        #
+        # ICT Prensibi: En hassas giriş, fiyat POI zone'a dokunduktan sonra
+        # 5m (veya 1m) yapısal shift ile gelir. 15m'de henüz görünmeyen
+        # micro sweep veya MSS burada yakalanır.
+        #
+        # Koşullar:
+        #   1. 5m data mevcut ve yeterli
+        #   2. Son 12 adet 5m mum zone'a dokunmuş olmalı (zone_touched)
+        #   3. 5m volatilite filtresi
+        #   4. check_trigger ile 5m'de sweep/MSS/displacement ara
+
+        if df_5m is not None and len(df_5m) >= 15:
+            zone_touched = self._check_zone_touched(df_5m, bias, stored_poi, lookback=12)
+
+            if zone_touched:
+                atr_5m = self._calc_atr(df_5m, 14)
+                current_price_5m = float(df_5m.iloc[-1]["close"])
+
+                # 5m volatilite filtresi
+                last_5m = df_5m.iloc[-1]
+                range_5m = float(last_5m["high"]) - float(last_5m["low"])
+
+                if not self._is_volatile_candle(range_5m, atr_5m):
+                    trigger_5m = self.check_trigger(
+                        df_5m, bias, stored_poi, current_price_5m, atr_5m,
+                        proximity_pct=0.03
+                    )
+
+                    if trigger_5m is not None:
+                        logger.info(
+                            f"🎯 {symbol} WATCH→SIGNAL (5m SNIPER): "
+                            f"{trigger_5m['direction']} | "
+                            f"Trigger: {trigger_5m['trigger_type']} | "
+                            f"Entry: {trigger_5m['entry']:.5f} | "
+                            f"SL: {trigger_5m['sl']:.5f} | "
+                            f"TP: {trigger_5m['tp']:.5f} | "
+                            f"RR: {trigger_5m['rr']}"
+                        )
+
+                        return {
+                            "action": "SIGNAL",
+                            "symbol": symbol,
+                            "direction": trigger_5m["direction"],
+                            "entry_price": trigger_5m["entry"],
+                            "current_price": current_price_5m,
+                            "stop_loss": trigger_5m["sl"],
+                            "take_profit": trigger_5m["tp"],
+                            "rr_ratio": trigger_5m["rr"],
+                            "entry_mode": "MARKET",
+                            "trigger_type": trigger_5m["trigger_type"],
+                            "quality_tier": "SNIPER",
+                            "components": trigger_5m["components"] + ["5M_SNIPER"],
+                            "narrative": stored_narrative,
+                            "poi": stored_poi,
+                            "trigger_data": trigger_5m,
+                            "atr": atr_5m,
+                            "confidence": 100,
+                            "confluence_score": 100,
+                            "timeframe": "5m",
+                        }
 
         return None
 
