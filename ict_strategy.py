@@ -892,7 +892,7 @@ class ICTStrategy:
             result["obstacle_distance_pct"] = obstacles[0]["pct_of_tp_distance"]
 
             first_obstacle = obstacles[0]
-            if first_obstacle["pct_of_tp_distance"] < 30:
+            if first_obstacle["pct_of_tp_distance"] < 15:
                 buffer = tp_distance * 0.02
                 if bias == "LONG":
                     result["adjusted_tp"] = first_obstacle["price"] - buffer
@@ -1113,9 +1113,10 @@ class ICTStrategy:
                 "pd_zone": pd_zone,
             })
 
-        # Sıralama: RR >= 1.5 önce, sonra confluence, sonra fiyata yakınlık
+        # Sıralama: RR >= min_rr önce, sonra confluence, sonra fiyata yakınlık
+        _min_rr = self.params.get("min_rr_ratio", 1.5)
         pois.sort(key=lambda p: (
-            -(1 if p["rr"] >= 1.5 else 0),
+            -(1 if p["rr"] >= _min_rr else 0),
             -p["confluence_count"],
             p["distance_from_price_pct"],
         ))
@@ -1136,7 +1137,7 @@ class ICTStrategy:
           B) MSS (Micro Structure Shift)
           C) Displacement (2-3 ardışık güçlü mum)
         
-        RR >= 1.5 zorunlu. Tek dev mum (>3x ATR) = REDDET.
+        RR >= min_rr_ratio (config) zorunlu. Tek dev mum (>3x ATR) = REDDET.
         """
         if df_15m is None or len(df_15m) < 10 or poi is None:
             return None
@@ -1159,6 +1160,7 @@ class ICTStrategy:
 
         min_sl_pct = self.params.get("min_sl_distance_pct", 0.008)
         max_sl_pct = self.params.get("max_sl_distance_pct", 0.025)
+        min_rr = self.params.get("min_rr_ratio", 1.5)
 
         # === TRIGGER A: Sweep + Rejection ===
         sh_15m, sl_15m = self._find_swing_points(df_15m, lookback=3)
@@ -1180,7 +1182,7 @@ class ICTStrategy:
             reward = abs(tp - current_price)
             actual_rr = reward / risk if risk > 0 else 0
 
-            if actual_rr >= 1.5:
+            if actual_rr >= min_rr:
                 return {
                     "trigger_type": "SWEEP_REJECTION",
                     "direction": bias,
@@ -1204,7 +1206,7 @@ class ICTStrategy:
             reward = abs(tp - current_price)
             actual_rr = reward / risk if risk > 0 else 0
 
-            if actual_rr >= 1.5:
+            if actual_rr >= min_rr:
                 return {
                     "trigger_type": "MSS",
                     "direction": bias,
@@ -1238,7 +1240,7 @@ class ICTStrategy:
             reward = abs(tp - current_price)
             actual_rr = reward / risk if risk > 0 else 0
 
-            if actual_rr >= 1.5:
+            if actual_rr >= min_rr:
                 return {
                     "trigger_type": "DISPLACEMENT",
                     "direction": bias,
@@ -1307,8 +1309,9 @@ class ICTStrategy:
         if not pois:
             return None
 
-        # RR >= 1.5 filtresi
-        valid_pois = [p for p in pois if p["rr"] >= 1.5]
+        # RR filtresi (config'den)
+        _min_rr = self.params.get("min_rr_ratio", 1.5)
+        valid_pois = [p for p in pois if p["rr"] >= _min_rr]
         if not valid_pois:
             return None
 

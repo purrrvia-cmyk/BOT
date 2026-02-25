@@ -574,12 +574,12 @@ class TradeManager:
                 # Breakeven da aktif olmalı
                 if not state.get("breakeven_moved"):
                     state["breakeven_moved"] = True
-                    state["breakeven_sl"] = entry_price * 1.001
+                    state["breakeven_sl"] = entry_price * 1.002
 
-            # %50+ → Breakeven
-            elif progress_pct >= 0.50 and not state.get("breakeven_moved"):
+            # %60+ → Breakeven (v4.6: %50→%60, buffer %0.1→%0.2)
+            elif progress_pct >= 0.60 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
-                be_sl = entry_price * 1.001  # Entry + %0.1 buffer
+                be_sl = entry_price * 1.002  # Entry + %0.2 buffer
                 state["breakeven_sl"] = be_sl
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {be_sl:.6f} ({progress_pct:.0%})")
 
@@ -618,12 +618,12 @@ class TradeManager:
 
                 if not state.get("breakeven_moved"):
                     state["breakeven_moved"] = True
-                    state["breakeven_sl"] = entry_price * 0.999
+                    state["breakeven_sl"] = entry_price * 0.998
 
-            # %50+ → Breakeven
-            elif progress_pct >= 0.50 and not state.get("breakeven_moved"):
+            # %60+ → Breakeven (v4.6: %50→%60, buffer %0.1→%0.2)
+            elif progress_pct >= 0.60 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
-                be_sl = entry_price * 0.999  # Entry - %0.1 buffer
+                be_sl = entry_price * 0.998  # Entry - %0.2 buffer
                 state["breakeven_sl"] = be_sl
                 logger.info(f"🔒 #{signal_id} {symbol} BREAKEVEN: SL → {be_sl:.6f} ({progress_pct:.0%})")
 
