@@ -1352,6 +1352,14 @@ class ICTStrategy:
 
         if mss is not None and mss["candles_ago"] <= 4:
             sl = poi["sl"]
+
+            # Min/Max SL kontrolü (Trigger A ve C'de var, burada eksikti)
+            sl_dist = abs(current_price - sl) / current_price if current_price > 0 else 0
+            if sl_dist < min_sl_pct:
+                sl = current_price * (1 - min_sl_pct) if bias == "LONG" else current_price * (1 + min_sl_pct)
+            elif sl_dist > max_sl_pct:
+                sl = current_price * (1 - max_sl_pct) if bias == "LONG" else current_price * (1 + max_sl_pct)
+
             risk = abs(current_price - sl)
             reward = abs(tp - current_price)
             actual_rr = reward / risk if risk > 0 else 0
