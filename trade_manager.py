@@ -44,7 +44,7 @@ logger = logging.getLogger("ICT-Bot.TradeManager")
 
 # ─── SABITLER ────────────────────────────────────────
 MAX_TRADE_DURATION_HOURS = 4      # 15m TF sinyalleri için max yaşam süresi
-WATCH_MAX_CANDLES = 12            # Watchlist max izleme: 12 × 5m = 60dk
+WATCH_MAX_CANDLES = 36            # Watchlist max izleme: 36 × 5m = 3 saat
 WATCH_TIMEFRAME = "5m"            # Watchlist izleme TF'si
 WATCH_CHECK_INTERVAL_SEC = 60     # Watchlist kontrol aralığı
 
@@ -717,19 +717,26 @@ class TradeManager:
 
             candles_watched += 1
 
-            # ── SL İNVALIDATION ──
+            # ── SL İNVALIDATION (close bazlı — wick fakeout koruması) ──
             potential_sl = item.get("potential_sl")
             direction = item["direction"]
 
             if potential_sl and not df_ltf.empty:
-                last_candle = df_ltf.iloc[-1]
-                if direction == "LONG" and float(last_candle.get("low", 0)) <= potential_sl:
-                    expire_watchlist_item(item["id"], reason=f"SL kırıldı ({candles_watched}. mum)")
-                    logger.info(f"❌ WATCH SL KIRILDI: {symbol} LONG")
-                    continue
-                elif direction == "SHORT" and float(last_candle.get("high", 0)) >= potential_sl:
-                    expire_watchlist_item(item["id"], reason=f"SL kırıldı ({candles_watched}. mum)")
-                    logger.info(f"❌ WATCH SL KIRILDI: {symbol} SHORT")
+                # Son 3 mumun KAPANIŞ fiyatlarını kontrol et
+                # Tek wick SL'e dokunabilir ama close ile teyit gerekli
+                recent = df_ltf.tail(min(3, len(df_ltf)))
+                sl_broken = False
+                for _, candle in recent.iterrows():
+                    close_price = float(candle.get("close", 0))
+                    if direction == "LONG" and close_price <= potential_sl:
+                        sl_broken = True
+                        break
+                    elif direction == "SHORT" and close_price >= potential_sl:
+                        sl_broken = True
+                        break
+                if sl_broken:
+                    expire_watchlist_item(item["id"], reason=f"SL kırıldı - close teyitli ({candles_watched}. mum)")
+                    logger.info(f"❌ WATCH SL KIRILDI (close): {symbol} {direction}")
                     continue
 
             # ── TIMEOUT ──

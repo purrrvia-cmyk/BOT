@@ -1127,7 +1127,8 @@ class ICTStrategy:
     # =================================================================
 
     def check_trigger(self, df_15m, bias: str, poi: Dict,
-                      current_price: float, atr: float) -> Optional[Dict]:
+                      current_price: float, atr: float,
+                      proximity_pct: float = 0.01) -> Optional[Dict]:
         """
         POI bölgesinde trigger oluştu mu?
         
@@ -1137,6 +1138,11 @@ class ICTStrategy:
           C) Displacement (2-3 ardışık güçlü mum)
         
         RR >= 1.5 zorunlu. Tek dev mum (>3x ATR) = REDDET.
+        
+        Args:
+            proximity_pct: POI zone'a yakınlık eşiği.
+                           generate_signal: 0.01 (1%) — trigger henüz oluşuyor
+                           check_trigger_for_watch: 0.025 (2.5%) — fiyat bounce etmiş olabilir
         """
         if df_15m is None or len(df_15m) < 10 or poi is None:
             return None
@@ -1145,12 +1151,11 @@ class ICTStrategy:
         zone_low = poi["zone_low"]
         tp = poi["tp"]
 
-        # Fiyat POI'ye yeterince yakın mı? (< %1.0)
-        proximity_threshold = 0.01
+        # Fiyat POI'ye yeterince yakın mı?
         if bias == "LONG":
-            price_in_or_near_zone = current_price <= zone_high * (1 + proximity_threshold)
+            price_in_or_near_zone = current_price <= zone_high * (1 + proximity_pct)
         elif bias == "SHORT":
-            price_in_or_near_zone = current_price >= zone_low * (1 - proximity_threshold)
+            price_in_or_near_zone = current_price >= zone_low * (1 - proximity_pct)
         else:
             return None
 
@@ -1427,23 +1432,27 @@ class ICTStrategy:
         if self._is_volatile_candle(last_range, atr_15m):
             return None
 
-        # ── POI İNVALIDATION ──
+        # ── POI İNVALIDATION (%1.2 eşik — kripto noise koruması) ──
         zone_high = stored_poi.get("zone_high", 0)
         zone_low = stored_poi.get("zone_low", 0)
 
         if bias == "LONG":
             # Fiyat POI'nin altına düştüyse → zone sweep edildi, artık geçersiz
-            if current_price < zone_low * 0.995:
+            # %1.2 eşik: kriptoda %0.5 wick normal — erken expire engellemek için
+            if current_price < zone_low * 0.988:
                 logger.debug(f"{symbol} WATCH: POI invalidated (fiyat zone altına düştü)")
                 return {"_invalidated": True, "reason": "POI zone aşağı sweep edildi"}
         elif bias == "SHORT":
             # Fiyat POI'nin üstüne çıktıysa → zone sweep edildi
-            if current_price > zone_high * 1.005:
+            if current_price > zone_high * 1.012:
                 logger.debug(f"{symbol} WATCH: POI invalidated (fiyat zone üstüne çıktı)")
                 return {"_invalidated": True, "reason": "POI zone yukarı sweep edildi"}
 
-        # ── TRIGGER KONTROLÜ ──
-        trigger = self.check_trigger(df_15m, bias, stored_poi, current_price, atr_15m)
+# ── TRIGGER KONTROLÜ (watchlist: geniş proximity %2.5) ──
+            # generate_signal'da %1 proximity kullanılır (trigger henüz oluşuyor)
+            # Watchlist'te fiyat POI'den bounce etmiş olabilir → %2.5 ile kontrol
+            trigger = self.check_trigger(df_15m, bias, stored_poi, current_price, atr_15m,
+                                         proximity_pct=0.025)
 
         if trigger is not None:
             logger.info(

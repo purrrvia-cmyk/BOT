@@ -402,19 +402,19 @@ def add_to_watchlist(symbol, direction, potential_entry, potential_sl, potential
     if existing:
         return existing["id"]
 
-    # Son 15 dk içinde expire edilmişse tekrar ekleme (flip-flop engeli)
-    # 60dk → 15dk: Kripto hızlı hareket eder, uzun cooldown fırsatları kaçırır
+    # Son 5 dk içinde expire edilmişse tekrar ekleme (flip-flop engeli)
+    # 15dk → 5dk: ICT setup'lar hızlı gelişir, uzun cooldown fırsatları kaçırır
     if USE_POSTGRES:
         recent = _fetchone("""
             SELECT id FROM watchlist
             WHERE symbol=? AND direction=? AND status='EXPIRED'
-              AND updated_at > NOW() - INTERVAL '15 minutes'
+              AND updated_at > NOW() - INTERVAL '5 minutes'
         """, (symbol, direction))
     else:
         recent = _fetchone("""
             SELECT id FROM watchlist
             WHERE symbol=? AND direction=? AND status='EXPIRED'
-              AND updated_at > datetime('now', '-15 minutes')
+              AND updated_at > datetime('now', '-5 minutes')
         """, (symbol, direction))
 
     if recent:
