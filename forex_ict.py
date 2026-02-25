@@ -470,28 +470,28 @@ class ForexICTEngine:
         sweeps = []
 
         for i in range(5, len(df) - 1):
-            # Sell-side sweep (EQH uzerine cikip donus)
+            # Buy-side liquidity sweep (EQH üzerine çıkıp dönüş → alıcıların SL'leri süpürüldü → BEARISH)
             for j in range(max(0, i - 15), i - 3):
                 if abs(highs[j] - highs[i - 1]) / max(highs[j], 0.0001) < tolerance:
                     if highs[i] > highs[j] * 1.001 and closes[i] < highs[j]:
                         sweeps.append({
-                            "type": "SELL_SIDE_SWEEP",
+                            "type": "BSL_SWEEP",
                             "level": float(highs[j]),
                             "sweep_price": float(highs[i]),
                             "idx": i,
-                            "desc": "Ust likidite supuruldu (EQH) — fiyat zirveler uzerine cikip geri dondu, dusus donusu beklenir"
+                            "desc": "Buy-side likidite supuruldu (EQH) — fiyat zirveler uzerine cikip geri dondu, dusus donusu beklenir"
                         })
                         break
-            # Buy-side sweep (EQL altina inip donus)
+            # Sell-side liquidity sweep (EQL altına inip dönüş → satıcıların SL'leri süpürüldü → BULLISH)
             for j in range(max(0, i - 15), i - 3):
                 if abs(lows[j] - lows[i - 1]) / max(lows[j], 0.0001) < tolerance:
                     if lows[i] < lows[j] * 0.999 and closes[i] > lows[j]:
                         sweeps.append({
-                            "type": "BUY_SIDE_SWEEP",
+                            "type": "SSL_SWEEP",
                             "level": float(lows[j]),
                             "sweep_price": float(lows[i]),
                             "idx": i,
-                            "desc": "Alt likidite supuruldu (EQL) — fiyat dipler altina inip geri dondu, yukselis donusu beklenir"
+                            "desc": "Sell-side likidite supuruldu (EQL) — fiyat dipler altina inip geri dondu, yukselis donusu beklenir"
                         })
                         break
 
@@ -639,10 +639,20 @@ class ForexICTEngine:
             is_dst = True
         est_offset = 4 if is_dst else 5
 
+        # Kill Zone saatleri DST'ye göre kayar:
+        # Kış (EST, UTC-5): Asian 00-05, London 07-10, NY 12-15
+        # Yaz (EDT, UTC-4): Asian 23-04, London 06-09, NY 11-14
+        dst_shift = 1 if is_dst else 0
         kz_defs = [
-            ("Asian",     0,  3,  "00:00-03:00 UTC",  "Asya piyasalari acik, dusuk volatilite, range olusumu"),
-            ("London",    7, 10,  "07:00-10:00 UTC",   "En yuksek likidite, trend baslangici, buyuk hacimliler"),
-            ("New York", 12, 15,  "12:00-15:00 UTC",   "NY acilisi, London ile overlap, en volatil donem"),
+            ("Asian",     (0 - dst_shift) % 24,  (5 - dst_shift) % 24,
+             f"{(0 - dst_shift) % 24:02d}:00-{(5 - dst_shift) % 24:02d}:00 UTC",
+             "Asya piyasalari acik, dusuk volatilite, range olusumu"),
+            ("London",    (7 - dst_shift) % 24, (10 - dst_shift) % 24,
+             f"{(7 - dst_shift) % 24:02d}:00-{(10 - dst_shift) % 24:02d}:00 UTC",
+             "En yuksek likidite, trend baslangici, buyuk hacimliler"),
+            ("New York", (12 - dst_shift) % 24, (15 - dst_shift) % 24,
+             f"{(12 - dst_shift) % 24:02d}:00-{(15 - dst_shift) % 24:02d}:00 UTC",
+             "NY acilisi, London ile overlap, en volatil donem"),
         ]
 
         for name, start, end, hours_str, zone_desc in kz_defs:
@@ -1202,14 +1212,14 @@ class ForexICTEngine:
         # 6. Liquidity Sweeps (15 puan)
         recent_sweeps = [s for s in sweeps if s["idx"] >= len(df) - 5]
         for sw in recent_sweeps:
-            if sw["type"] == "BUY_SIDE_SWEEP":
+            if sw["type"] == "SSL_SWEEP":
                 bull_score += 15
                 confluence_count["bull"] += 1
-                reasons_bull.append("Buy-side likidite avi - donus beklentisi")
-            elif sw["type"] == "SELL_SIDE_SWEEP":
+                reasons_bull.append("Sell-side likidite avi (EQL) - yukselis donusu beklenir")
+            elif sw["type"] == "BSL_SWEEP":
                 bear_score += 15
                 confluence_count["bear"] += 1
-                reasons_bear.append("Sell-side likidite avi - dusus beklentisi")
+                reasons_bear.append("Buy-side likidite avi (EQH) - dusus donusu beklenir")
 
         # 7. Inducement (5 puan - tip başına tek seferlik)
         bull_ind_count = sum(1 for ind in inducements if ind["type"] == "BULLISH_INDUCEMENT")
@@ -1411,8 +1421,8 @@ class ForexICTEngine:
             active_obs = [o for o in obs if not o.get("mitigated", False)]
             if active_obs:
                 last_ob = active_obs[-1]
-                ob_top = last_ob.get("top")
-                ob_bottom = last_ob.get("bottom")
+                ob_top = last_ob.get("high")      # OB detektörü "high" key kullanıyor
+                ob_bottom = last_ob.get("low")     # OB detektörü "low" key kullanıyor
 
         if signal in ("STRONG_LONG", "LONG"):
             # LONG SL: en yakın swing low veya OB alt sınırının altı (v2: daha sıkı SL)
@@ -1634,13 +1644,13 @@ class ForexICTEngine:
         if sweeps:
             p5 = f"Son {len(sweeps)} likidite supurme hareketi tespit edildi. "
             last_sweep = sweeps[-1]
-            if last_sweep["type"] == "SELL_SIDE_SWEEP":
-                p5 += f"Son hareket: Ust likidite supuruldu (EQH) — {fp(last_sweep['sweep_price'])} seviyesine kadar cikip geri dondu. "
+            if last_sweep["type"] == "BSL_SWEEP":
+                p5 += f"Son hareket: Buy-side likidite supuruldu (EQH) — {fp(last_sweep['sweep_price'])} seviyesine kadar cikip geri dondu. "
                 p5 += f"Esit zirve seviyesi {fp(last_sweep['level'])} idi. "
                 p5 += "Bu, kurumsallarin yukaridaki stop-loss'lari supurdugunu ve dusus yonu icin pozisyon aldigini gosterebilir. "
                 p5 += f"Fiyat {fp(last_sweep['level'])} altinda kalirsa dusus devam edebilir. "
             else:
-                p5 += f"Son hareket: Alt likidite supuruldu (EQL) — {fp(last_sweep['sweep_price'])} seviyesine kadar inip geri dondu. "
+                p5 += f"Son hareket: Sell-side likidite supuruldu (EQL) — {fp(last_sweep['sweep_price'])} seviyesine kadar inip geri dondu. "
                 p5 += f"Esit dip seviyesi {fp(last_sweep['level'])} idi. "
                 p5 += "Bu, kurumsallarin asagidaki stop-loss'lari supurdugunu ve yukselis yonu icin pozisyon aldigini gosterebilir. "
                 p5 += f"Fiyat {fp(last_sweep['level'])} uzerinde kalirsa yukselis devam edebilir. "
