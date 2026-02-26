@@ -20,12 +20,35 @@
 #
 # SL YÖNETİMİ (2 Aşama — progresif değil, yapısal):
 #   %50 TP mesafesi → SL entry'ye taşı (breakeven)
-#   %75 TP mesafesi → Trailing SL (kârın %50'sinde kilitle)
+#   %60 TP mesafesi → Trailing SL (kârın %65'inde kilitle)
 #
 # EARLY EXIT:
 #   Max süre aşımı (4h — 15m TF için)
 #   Yapısal bozulma (TP vs SL ters)
 # =====================================================
+#
+# ═══════════════════════════════════════════════════════
+# v4.7 DEĞİŞİKLİK NOTU (26 Şubat 2026)
+# ═══════════════════════════════════════════════════════
+# SORUN: 26 trade, %69.2 WR, +%13.44 PnL — ama kazananların
+#        %78'i BE/trailing ile kapandı, sadece %22'si tam TP.
+#        Kâr az çıkıyor çünkü trailing kârı erken bırakıyor.
+#
+# DEĞİŞİKLİKLER (sadece _manage_long_sl ve _manage_short_sl):
+#   1. BE tetikleme:      %60 → %50  (daha erken koruma)
+#   2. Trailing tetikleme: %75 → %60  (daha erken trailing)
+#   3. Trailing kâr kilidi: %50 → %65  (kârın daha çoğunu koru)
+#
+# ESKİ DEĞERLER (geri dönmek için):
+#   - BE tetikleme:       progress_pct >= 0.60
+#   - Trailing tetikleme:  progress_pct >= 0.75
+#   - Trailing kâr kilidi: current_progress * 0.50
+#
+# YENİ DEĞERLER:
+#   - BE tetikleme:       progress_pct >= 0.50
+#   - Trailing tetikleme:  progress_pct >= 0.60
+#   - Trailing kâr kilidi: current_progress * 0.65
+# ═══════════════════════════════════════════════════════
 
 import json
 import logging
@@ -561,9 +584,9 @@ class TradeManager:
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %75+ → Trailing SL (kârın %50'si)
-            if progress_pct >= 0.75:
-                trailing = entry_price + (current_progress * 0.50)
+            # %60+ → Trailing SL (kârın %65'i) [v4.7: eski %75/%50]
+            if progress_pct >= 0.60:
+                trailing = entry_price + (current_progress * 0.65)
                 prev_trailing = state.get("trailing_sl")
                 if prev_trailing is None or trailing > prev_trailing:
                     state["trailing_sl"] = trailing
@@ -576,8 +599,8 @@ class TradeManager:
                     state["breakeven_moved"] = True
                     state["breakeven_sl"] = entry_price * 1.002
 
-            # %60+ → Breakeven (v4.6: %50→%60, buffer %0.1→%0.2)
-            elif progress_pct >= 0.60 and not state.get("breakeven_moved"):
+            # %50+ → Breakeven [v4.7: eski %60]
+            elif progress_pct >= 0.50 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
                 be_sl = entry_price * 1.002  # Entry + %0.2 buffer
                 state["breakeven_sl"] = be_sl
@@ -606,9 +629,9 @@ class TradeManager:
         if total_distance > 0 and current_progress > 0:
             progress_pct = current_progress / total_distance
 
-            # %75+ → Trailing SL
-            if progress_pct >= 0.75:
-                trailing = entry_price - (current_progress * 0.50)
+            # %60+ → Trailing SL (kârın %65'i) [v4.7: eski %75/%50]
+            if progress_pct >= 0.60:
+                trailing = entry_price - (current_progress * 0.65)
                 prev_trailing = state.get("trailing_sl")
                 if prev_trailing is None or trailing < prev_trailing:
                     state["trailing_sl"] = trailing
@@ -620,8 +643,8 @@ class TradeManager:
                     state["breakeven_moved"] = True
                     state["breakeven_sl"] = entry_price * 0.998
 
-            # %60+ → Breakeven (v4.6: %50→%60, buffer %0.1→%0.2)
-            elif progress_pct >= 0.60 and not state.get("breakeven_moved"):
+            # %50+ → Breakeven [v4.7: eski %60]
+            elif progress_pct >= 0.50 and not state.get("breakeven_moved"):
                 state["breakeven_moved"] = True
                 be_sl = entry_price * 0.998  # Entry - %0.2 buffer
                 state["breakeven_sl"] = be_sl
